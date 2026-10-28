@@ -105,7 +105,77 @@ print(result.report)
 
 ## AI integration
 
-<!-- AI-SECTION -->
+Every studio operation is a tool with a JSON Schema and a description written
+as the AI's manual. One tool layer (`synth2/ai/tools.py`) backs the MCP
+server, the Claude Director, the web studio's REST API and the demo scripts.
+Anything a person can do in the editor, an AI can do through the tools.
+
+| Group | Tools |
+|---|---|
+| Inspect | `get_project` (summary, full JSON or score text), `get_notes`, `list_voices`, `list_styles`, `list_phonemes`, `list_parameters`, `phonemize`, `check_project` (lints for overlaps, out-of-range notes, guessed pronunciations, bad word splits) |
+| Project | `new_project` (optionally from a whole score), `update_project`, `set_tempo`, `save_project`, `load_project`, `export`, `undo`, `redo` |
+| Tracks | `add_track`, `update_track`, `remove_track`, `duplicate_track` |
+| Notes | `write_melody` (score snippet), `add_notes`, `edit_notes`, `delete_notes`, `set_lyrics`, `transpose`, `quantize` |
+| Performance | `apply_expression` (style plus overrides plus per-note attributes), `set_curve`, `clear_curve`, `add_harmony` (diatonic, key-aware, range-fitted) |
+| Output | `render` (WAV, beat range, track subset, stems), `analyze_render` (pitch accuracy per note in cents, levels, clipping, voicing) |
+
+The intended AI workflow is the producer's loop:
+
+1. Plan the structure.
+2. Write the melody with `write_melody` and the lyrics.
+3. Pick the voice and style.
+4. `check_project`.
+5. `render`.
+6. `analyze_render`.
+7. Fix what the numbers say, then render again.
+
+### MCP server (Claude Desktop, Claude Code and other MCP clients)
+
+```bash
+claude mcp add synth2 -- synth2 mcp --project ~/songs/my_song.s2p.json --autosave   # Claude Code
+```
+
+For Claude Desktop, put this in `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "synth2": { "command": "synth2", "args": ["mcp", "--project", "/path/to/song.s2p.json", "--autosave"] }
+  }
+}
+```
+
+The server is dependency-free JSON-RPC over stdio. Then just ask: *"Write a
+melancholic synth-pop chorus about city lights for Aurora, add a third-below
+harmony with Atlas, render it and make sure every note is within 25 cents."*
+
+### AI Director (built-in Claude agent)
+
+```bash
+pip install -e ".[ai]" && export ANTHROPIC_API_KEY=...
+synth2 director "Compose a 16-bar upbeat J-pop chorus in A major for Nova, double it an octave lower with Pixel" --project song.s2p.json
+synth2 director --project song.s2p.json          # interactive session
+```
+
+The Director runs an agentic tool-use loop over the same tools, with a
+system prompt covering vocal-production practice: singable ranges, phrase
+breathing, syllable-to-note mapping, and the render-and-check loop. The same
+assistant is available in the web studio's **AI Director** panel. It
+defaults to the latest Claude model; override it with `SYNTH2_MODEL`.
+
+### Python
+
+```python
+from synth2.ai.tools import Session, call_tool
+
+s = Session()
+call_tool(s, "new_project", {"title": "Demo", "bpm": 96, "voice": "seraph", "key": "D major"})
+call_tool(s, "write_melody", {"track": 0, "score": "r w  D4 q hello D4 q +  F#4 h world  A4 h. tonight"})
+call_tool(s, "apply_expression", {"track": 0, "style": "ballad"})
+call_tool(s, "add_harmony", {"source_track": 0, "steps": -2, "voice": "ember"})
+print(call_tool(s, "render", {"path": "out/demo.wav"})["report"])
+print(call_tool(s, "analyze_render", {}))
+```
 
 ## Architecture
 
