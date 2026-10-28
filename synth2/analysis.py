@@ -17,8 +17,13 @@ def _frames(x: np.ndarray, size: int, hop: int) -> np.ndarray:
 
 
 def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 60.0, fmax: float = 1200.0,
-                threshold: float = 0.15) -> tuple[np.ndarray, np.ndarray]:
-    """YIN pitch tracker. Returns (frame centre times in s, f0 in Hz with 0 for unvoiced)."""
+                threshold: float = 0.15, return_confidence: bool = False):
+    """YIN pitch tracker.
+
+    Returns ``(times_s, f0_hz)`` with 0 for unvoiced frames, or
+    ``(times_s, f0_hz, confidence)`` when ``return_confidence`` is set
+    (confidence = 1 - YIN aperiodicity at the chosen lag).
+    """
     x = np.asarray(mono, dtype=np.float64)
     if x.ndim == 2:
         x = x.mean(axis=1)
@@ -45,6 +50,7 @@ def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 6
     cmnd = np.ones_like(d)
     cmnd[:, 1:] = d[:, 1:] / np.maximum(cum, 1e-12)
     f0 = np.zeros(len(fr))
+    conf = np.zeros(len(fr))
     energy = e0[:, 0] / half
     silent = energy < 1e-7
     for i in range(len(fr)):
@@ -64,6 +70,17 @@ def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 6
             t = below[0] + tau_min
         while t + 1 < tau_max and c[t + 1] < c[t]:
             t += 1
+        # sub-period check: noisy signals make period multiples look best; prefer the
+        # shortest period whose dip is (nearly) as deep
+        for k in (5, 4, 3, 2):
+            tk = t / k
+            if tk < tau_min + 1:
+                continue
+            lo_k, hi_k = int(np.floor(tk - 0.06 * tk)) - 1, int(np.ceil(tk + 0.06 * tk)) + 2
+            j = lo_k + int(np.argmin(c[lo_k:hi_k]))
+            if c[j] < min(c[t] + 0.12, 0.45):
+                t = j
+                break
         if 1 <= t < tau_max - 1:
             a, b, cc = c[t - 1], c[t], c[t + 1]
             den = a - 2 * b + cc
@@ -71,7 +88,10 @@ def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 6
         else:
             shift = 0.0
         f0[i] = sr / (t + shift)
+        conf[i] = 1.0 - float(c[t])
     times = (np.arange(len(fr)) * hop + half / 2) / sr
+    if return_confidence:
+        return times, f0, conf
     return times, f0
 
 
@@ -124,7 +144,8 @@ def pitch_accuracy(project, result, max_list: int = 10) -> dict:
         stem = result.stems.get(tr.id)
         if stem is None:
             continue
-        times, f0 = estimate_f0(stem.mean(axis=1), sr)
+        times, f0, conf = estimate_f0(stem.mean(axis=1), sr, return_confidence=True)
+        f0 = np.where(conf >= 0.8, f0, 0.0)  # only trust clearly periodic frames
         times = times + result.start_seconds
         errors = []
         missing = []
@@ -141,7 +162,7 @@ def pitch_accuracy(project, result, max_list: int = 10) -> dict:
                 continue
             seg = f0[m]
             v = seg[seg > 0]
-            if len(v) < max(3, 0.3 * m.sum()):
+            if len(v) < max(3, 0.2 * m.sum()):
                 missing.append({"id": n.id, "beat": n.onset, "note": midi_to_note(n.pitch), "lyric": n.lyric})
                 continue
             target = n.pitch + float(n.attrs.get("detune", 0) or 0) / 100.0
