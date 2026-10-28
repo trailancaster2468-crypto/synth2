@@ -76,7 +76,8 @@ class FormantBackend:
                      note_range: tuple[float, float] | None = None) -> tuple[np.ndarray, dict]:
         sr = sample_rate
         voice = get_voice(track.voice).with_params(track.voice_params)
-        style = get_style(track.style or voice.default_style)
+        overrides = {k[6:]: v for k, v in track.voice_params.items() if k.startswith("style.")}
+        style = get_style(track.style or voice.default_style, overrides)
         rng = np.random.default_rng(track.seed)
         notes = track.notes
         if note_range is not None:

@@ -140,6 +140,8 @@ def pitch_accuracy(project, result, max_list: int = 10) -> dict:
     sr = result.sample_rate
     out = {"tracks": []}
     b2s = project.tempo.beat_to_sec
+    span0 = result.start_seconds
+    span1 = result.start_seconds + len(result.audio) / sr
     for tr in project.tracks:
         stem = result.stems.get(tr.id)
         if stem is None:
@@ -153,8 +155,8 @@ def pitch_accuracy(project, result, max_list: int = 10) -> dict:
             if (n.lyric or "").strip().lower() in ("br", "breath", "", "r"):
                 continue
             a, b = b2s(n.onset), b2s(n.end)
-            if b - a < 0.12:
-                continue
+            if b - a < 0.12 or a < span0 or b > span1:
+                continue  # too short to judge, or outside a partial render
             # skip the transition into the note; keep the rest (short notes end in consonants)
             lo, hi = a + min(0.25 * (b - a), 0.12), b - 0.1 * (b - a)
             m = (times >= lo) & (times <= hi)

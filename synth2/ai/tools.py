@@ -7,7 +7,7 @@ render and check vocals at the same level a human uses the GUI::
     from synth2.ai.tools import Session, TOOLS, call_tool, ToolError
 
     s = Session()
-    call_tool(s, "write_melody", {"track": 0, "score": "C4 q twin C4 q + G4 q twin G4 q +"})
+    call_tool(s, "write_melody", {"track": 0, "score": "@ 4 C4 q twinkle C4 q + G4 q twinkle G4 q +"})
     call_tool(s, "render", {})
 
 Conventions: time is in **beats** (quarter notes, beat 0 = song start), pitch is
@@ -415,10 +415,10 @@ VOICE_PARAM_FIELDS = [f.name for f in fields(Voice)
                       if f.name not in ("id", "name", "description", "tags", "gender", "default_style")]
 
 LYRIC_CONVENTIONS = (
-    "Lyric conventions (one token per note): a word or syllable ('love', 'twin'); '+' = next syllable of the "
-    "previous word (word 'hello' on one note then '+' on the next sings hel-lo); '-' = melisma, keep singing the "
-    "previous vowel on a new pitch; 'br' = breath intake; '[s t aa r]' = explicit phonemes; Japanese kana or "
-    "romaji one mora per note ('さ', 'ku').")
+    "Lyric conventions (one token per note): a word ('love', 'star'); '+' = next syllable of the previous word "
+    "(the WHOLE word goes on the first note: 'hello' then '+' sings hel-lo; 'hel' then '+' would not); '-' = "
+    "melisma, keep singing the previous vowel on a new pitch; 'br' = breath intake; '[s t aa r]' = explicit "
+    "phonemes; Japanese kana or romaji, one mora per note ('さ', 'ku').")
 
 
 def _track(session: Session, ref, required: bool = True) -> Track:
@@ -1169,7 +1169,7 @@ Add notes to a track. Each note: pitch (MIDI number or note name 'C4'), onset (b
 (beats, or a note value 'q', 'e.', 'h+q'), lyric (default 'la'), optional phonemes override and attrs. A track is
 one singer, so notes should not overlap: overwrite=true first deletes existing notes that overlap the new ones.
 {LYRIC_CONVENTIONS}
-Example: notes=[{{"pitch":"E4","onset":0,"duration":1,"lyric":"hel"}},{{"pitch":"G4","onset":1,"duration":2,"lyric":"+"}}].
+Example: notes=[{{"pitch":"E4","onset":4,"duration":1,"lyric":"hello"}},{{"pitch":"G4","onset":5,"duration":2,"lyric":"+"}}].
 For whole melodies write_melody (score notation) is usually faster.
 """, {"track": _TRACK_REF, "notes": {"type": "array", "items": _NOTE_SPEC, "minItems": 1},
       "overwrite": {"type": "boolean", "description": "Delete existing notes that overlap the new notes."}},
@@ -1214,7 +1214,8 @@ track's last note, i.e. append; beat 0 for an empty track).
 - '|' bar lines are optional (warned if not on a bar boundary - a cheap rhythm check); '@ 16' jumps to absolute
   beat 16 ('@ bar 5' to bar 5); new lines are just for readability; '#' starts a comment.
 - 'curve: loudness 0:0 4:-3 (linear)' lines add automation (absolute beats); 'tempo: 90' adds a tempo change here.
-Example: "E4 q twin  E4 q +  B4 q twin  B4 q +  | C#5 q lit  C#5 q +  B4 h star | r q  A4 e br ..."
+Example: "@ bar 2  E4 q twinkle  E4 q +  B4 q twinkle  B4 q +  | C#5 q little  C#5 q +  B4 h star | r q ..."
+('twinkle' then '+' spreads the word over two notes - always write the whole word on its first note).
 replace=true first deletes existing notes overlapping the written span. Returns the new note ids, the span and
 end_beat (where the next phrase would start), plus warnings to check.
 """, {"track": _TRACK_REF,

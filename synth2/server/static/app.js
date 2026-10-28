@@ -989,7 +989,7 @@ class PianoRoll {
     App.closeMenus();
     const { x, y } = this.local(e);
     this.mouse = { x, y };
-    if (e.button === 1 || (e.button === 0 && App.spaceHeld)) {
+    if (e.button === 1) {
       e.preventDefault();
       this.startDrag(e, { type: 'pan', x0: x, y0: y, sx: this.scrollX, sy: this.scrollY });
       return;
@@ -1230,7 +1230,6 @@ class PianoRoll {
     if (y < RULER_H && x > KEYS_W) cur = this.loopEdgeAt(x) ? 'ew-resize' : 'pointer';
     else if (x < KEYS_W) cur = 'pointer';
     else if (x > KEYS_W + this.gridW || y > RULER_H + this.gridH) cur = 'default';
-    else if (App.spaceHeld) cur = 'grab';
     else {
       const hit = this.hitNote(x, y);
       if (hit) cur = hit.edge ? 'ew-resize' : 'move';
@@ -1646,9 +1645,10 @@ class ParamLane {
       for (const n of t.notes) {
         const x = this.xOf(n.onset), w = n.duration * this.roll.ppb;
         if (x + w < KEYS_W || x > KEYS_W + this.gridW) continue;
-        c.fillStyle = rgba(ncol, this.s.selection.has(n.id) ? 0.10 : 0.035);
-        c.fillRect(x, 0, w, H);
-        c.fillStyle = rgba(ncol, 0.45);
+        if (this.s.selection.has(n.id)) { c.fillStyle = rgba(ncol, 0.08); c.fillRect(x, 0, w, H); }
+        c.fillStyle = rgba(ncol, 0.10);
+        c.fillRect(Math.round(x), 0, 1, H);
+        c.fillStyle = rgba(ncol, 0.5);
         c.fillRect(x + 1, H - 3, Math.max(1, w - 2), 2);
       }
     }
@@ -2554,7 +2554,6 @@ class Chat {
 /* ==================================================================== App */
 const App = {
   store: null, roll: null, lane: null, tracks: null, inspector: null, transport: null, chat: null,
-  spaceHeld: false,
   connected: true,
 
   async init() {
@@ -2578,6 +2577,8 @@ const App = {
     s.on('notes', () => { this.updateSelInfo(); this.transport.invalidateCache(); });
     s.on('project', () => { this.syncSongProps(); this.updateSelInfo(); });
     s.on('song', () => this.syncSongProps());
+    // ResizeObserver misses devicePixelRatio changes (moving between monitors, browser zoom).
+    window.addEventListener('resize', () => { this.roll.resize(); this.lane.resize(); });
     window.addEventListener('beforeunload', () => {
       if (s.pending) navigator.sendBeacon('/api/project', new Blob([JSON.stringify(s.project)], { type: 'application/json' }));
     });
@@ -2627,6 +2628,7 @@ const App = {
   },
   setBusy(on, text) {
     this.store.busy = on;
+    document.body.classList.toggle('busy', on); // blocks every editing panel while the AI edits the project
     $('#busy-overlay').hidden = !on;
     if (text) $('#busy-text').textContent = text;
   },
@@ -2739,8 +2741,6 @@ const App = {
     document.addEventListener('change', (e) => {
       if (e.target.matches && e.target.matches('select, input[type=range], input[type=checkbox]') && !e.target.closest('.insp-body')) e.target.blur();
     });
-    window.addEventListener('keyup', (e) => { if (e.code === 'Space') this.spaceHeld = false; });
-    window.addEventListener('blur', () => { this.spaceHeld = false; });
   },
   onKey(e) {
     const s = this.store, roll = this.roll;
@@ -2850,7 +2850,11 @@ const App = {
     await this.store.flush();
     try {
       const r = await Api.newProject({ title: 'Untitled', bpm: 120 });
+      this.store.playhead = 0;
+      this.store.loop = { on: false, start: 0, end: 0 };
+      this.store.view.scrollX = 0;
       this.store.setProject(r.project, { keepView: false });
+      this.transport.updateButtons();
       this.store.setHistory(r.history || {});
       this.store.dirty = false;
       this.store.emit('dirty');

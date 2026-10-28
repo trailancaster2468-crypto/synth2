@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import copy
 import re
-from typing import Iterable, NamedTuple
+from typing import Iterable
 
 from ..project import Note, _new_id
 from ..timing import NOTE_NAMES, midi_to_note, note_to_midi, parse_duration
@@ -54,11 +54,28 @@ _LETTERS = "CDEFGAB"
 _FLAT_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
 
-class KeyInfo(NamedTuple):
-    tonic: int  # pitch class 0..11 (C = 0)
-    mode: str  # normalised mode name, e.g. "major", "minor", "dorian"
-    scale: tuple[int, ...]  # absolute pitch classes of the scale, starting at the tonic
-    tonic_name: str = "C"
+class KeyInfo(tuple):
+    """``(tonic_pc, mode, scale_pcs)`` - a plain 3-tuple with named accessors and the spelled tonic."""
+
+    def __new__(cls, tonic: int, mode: str, scale: tuple[int, ...], tonic_name: str = "C"):
+        obj = super().__new__(cls, (tonic, mode, tuple(scale)))
+        obj.tonic_name = tonic_name
+        return obj
+
+    def __getnewargs__(self):
+        return (self[0], self[1], self[2], self.tonic_name)
+
+    @property
+    def tonic(self) -> int:  # pitch class 0..11 (C = 0)
+        return self[0]
+
+    @property
+    def mode(self) -> str:  # normalised mode name, e.g. "major", "minor", "dorian"
+        return self[1]
+
+    @property
+    def scale(self) -> tuple[int, ...]:  # absolute pitch classes of the scale, starting at the tonic
+        return self[2]
 
     @property
     def intervals(self) -> tuple[int, ...]:

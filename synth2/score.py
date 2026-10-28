@@ -746,7 +746,7 @@ def parse_snippet(text: str, start_beat: float = 0.0, language: str = "en", beat
 
 
 def parse_notes(text: str, start_beat: float = 0.0, language: str = "en") -> list[Note]:
-    """Parse note lines such as ``"C4 q twin C4 q + G4 h star"`` into notes starting at ``start_beat``."""
+    """Parse note lines such as ``"C4 q twinkle C4 q + G4 h star"`` into notes starting at ``start_beat``."""
     return parse_snippet(text, start_beat, language).notes
 
 

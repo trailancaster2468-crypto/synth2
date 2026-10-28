@@ -44,7 +44,6 @@ import traceback
 import urllib.parse
 import webbrowser
 from dataclasses import fields as dc_fields
-from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -215,7 +214,8 @@ def _history_lists(session) -> tuple[list | None, list | None]:
 
 def push_undo(session, label: str = "edit") -> None:
     """Push an undo snapshot of the session's current project (before a mutation)."""
-    for name in ("push_undo", "snapshot", "push_snapshot", "checkpoint", "save_undo", "record_undo", "_push_undo", "_snapshot"):
+    # synth2.ai.tools.Session.push_undo(label) is the contract; the other names are defensive fallbacks.
+    for name in ("push_undo", "push_snapshot", "save_undo", "record_undo", "_push_undo"):
         fn = getattr(session, name, None)
         if callable(fn):
             try:
@@ -301,17 +301,25 @@ class StudioState:
 # Helpers used by handlers
 # --------------------------------------------------------------------------
 def director_status() -> dict:
+    """Whether the AI Director can run (``anthropic`` installed and API credentials present)."""
+    try:
+        from ..ai.director import director_available  # type: ignore[attr-defined]
+    except ImportError:
+        director_available = None
+    except Exception as exc:  # pragma: no cover - broken module
+        return {"available": False, "reason": f"AI Director module unavailable: {exc}"}
+    if director_available is not None:
+        ok, reason = director_available()
+        if not ok and "ANTHROPIC_API_KEY" not in reason:
+            reason = f"{reason}. Set ANTHROPIC_API_KEY to enable the AI Director."
+        return {"available": bool(ok), "reason": reason or ""}
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return {"available": False, "reason": "Set ANTHROPIC_API_KEY to enable the AI Director."}
     try:
         import anthropic  # noqa: F401
     except ImportError:
         return {"available": False, "reason": "Install the 'anthropic' package (pip install anthropic) to enable the AI Director."}
-    try:
-        from ..ai import director  # noqa: F401
-    except Exception as exc:
-        return {"available": False, "reason": f"AI Director module unavailable: {exc}"}
-    return {"available": True, "reason": ""}
+    return {"available": False, "reason": "AI Director module (synth2.ai.director) is not available."}
 
 
 def build_meta() -> dict:
@@ -369,8 +377,13 @@ def build_meta() -> dict:
 
 
 def compute_phonemes(project: Project) -> dict:
-    """Automatic phonemes of every note, ``{"tracks": {tid: {nid: str}}, "errors": {tid: {nid: msg}}}``."""
-    from ..phonemes import lyric_phonemes, parse_phoneme_string, resolve_notes
+    """Automatic phonemes of every note, ``{"tracks": {tid: {nid: str}}, "errors": {tid: {nid: msg}}}``.
+
+    A melisma note maps to ``"-"`` and a rest to ``""``.  Notes with invalid explicit
+    phonemes are reported in ``errors`` and treated as automatic, so one bad note
+    never hides the phonemes of the rest of the track.
+    """
+    from ..phonemes import explicit_phones, lyric_phonemes, parse_phoneme_string, resolve_notes
 
     out: dict[str, dict[str, str]] = {}
     errors: dict[str, dict[str, str]] = {}
@@ -378,26 +391,33 @@ def compute_phonemes(project: Project) -> dict:
         notes = sorted(t.notes, key=lambda n: (n.onset, n.pitch))
         per: dict[str, str] = {}
         errs: dict[str, str] = {}
-        try:
-            sylls = resolve_notes(notes, t.language)
-            for n, s in zip(notes, sylls):
-                if s.melisma:
-                    per[n.id] = "-"
-                elif s.rest:
-                    per[n.id] = ""
-                else:
-                    per[n.id] = " ".join(s.phones)
-        except Exception:
-            for n in notes:
+        clean = []
+        for n in notes:
+            m = n
+            if n.phonemes:
                 try:
-                    if n.phonemes:
-                        per[n.id] = " ".join(parse_phoneme_string(n.phonemes))
-                    else:
-                        lang = n.attrs.get("language") or t.language
-                        per[n.id] = " ".join(lyric_phonemes(n.lyric, lang))
+                    parse_phoneme_string(n.phonemes)
+                except Exception as exc:
+                    errs[n.id] = str(exc)
+                    m = copy.copy(n)
+                    m.phonemes = None
+            try:
+                explicit_phones(m.lyric or "")
+            except Exception as exc:
+                errs[n.id] = str(exc)
+                m = copy.copy(m)
+                m.lyric = "la"
+            clean.append(m)
+        try:
+            for n, syl in zip(notes, resolve_notes(clean, t.language)):
+                per[n.id] = "-" if syl.melisma else ("" if syl.rest else " ".join(syl.phones))
+        except Exception:
+            for n, m in zip(notes, clean):
+                try:
+                    per[n.id] = " ".join(lyric_phonemes(m.lyric, m.attrs.get("language") or t.language))
                 except Exception as exc:
                     per[n.id] = ""
-                    errs[n.id] = str(exc)
+                    errs.setdefault(n.id, str(exc))
         out[t.id] = per
         if errs:
             errors[t.id] = errs
@@ -713,6 +733,8 @@ class StudioHandler(BaseHTTPRequestHandler):
         with st.lock:
             push_undo(st.session, "new project")
             st.session.project = project
+            if hasattr(st.session, "path"):
+                st.session.path = None  # a new project has no file yet: Save asks for one
             st.touch()
             out = {"ok": True, "project": project.to_dict(), "history": st.history()}
         self.send_json(out)
@@ -845,10 +867,18 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise HttpError(400, "missing 'message'")
         st = self.state
         with st.lock:
-            if body.get("reset") or st.director is None:
-                from ..ai.director import Director
+            try:
+                if st.director is None or getattr(st.director, "session", st.session) is not st.session:
+                    from ..ai.director import Director
 
-                st.director = Director(st.session)
+                    st.director = Director(st.session)
+                elif body.get("reset") and hasattr(st.director, "reset"):
+                    st.director.reset()
+            except Exception as exc:  # DirectorUnavailable, missing SDK, bad credentials...
+                if exc.__class__.__name__ == "DirectorUnavailable" or isinstance(exc, ImportError):
+                    self.send_error_json(501, str(exc), available=False)
+                    return
+                raise HttpError(500, f"AI Director could not start: {exc.__class__.__name__}: {exc}")
             try:
                 out = st.director.chat(message)
             except Exception as exc:
@@ -889,6 +919,8 @@ class StudioHandler(BaseHTTPRequestHandler):
         with st.lock:
             push_undo(st.session, f"import {filename}")
             st.session.project = project
+            if hasattr(st.session, "path"):
+                st.session.path = None  # the upload came from the browser; Save asks where to write
             st.touch()
             out = {"ok": True, "project": project.to_dict(), "history": st.history()}
         self.send_json(out)

@@ -114,9 +114,17 @@ def cmd_mcp(a):
 
 
 def cmd_director(a):
-    from .ai.director import Director
+    from .ai.director import Director, DirectorUnavailable
     from .ai.tools import Session
 
+    try:
+        _director_main(a, Director, Session)
+    except DirectorUnavailable as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _director_main(a, Director, Session):
     session = Session()
     if a.project and Path(a.project).exists():
         from .ai.tools import call_tool

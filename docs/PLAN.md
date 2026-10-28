@@ -229,8 +229,8 @@ time: 4/4
 key: C major
 
 track: Lead voice=aurora style=pop lang=en gain=0 pan=0
-C4 q twin  C4 q +  G4 q twin  G4 q +  |  A4 q lit  A4 q +  G4 h star
-F4 q how   F4 q I  E4 q won  E4 q der | D4 q what D4 q you C4 h are
+C4 q twinkle  C4 q +  G4 q twinkle  G4 q +  |  A4 q little  A4 q +  G4 h star
+F4 q how   F4 q I  E4 q wonder  E4 q + | D4 q what D4 q you C4 h are
 r q            # rest
 E4 e. la  F4 s -   # dotted eighth, then a melisma sixteenth
 G4 h+q oh{vibrato_depth=0.5,tension=0.3}   # tied duration, per-note attrs
@@ -240,6 +240,8 @@ track: Harmony voice=atlas style=pop
 ...
 ```
 Rules:
+* Multi-syllable words go on their FIRST note with `+` on each following note
+  (`twinkle +`), never as fragments (`twin kle`), so the dictionary pronunciation is used.
 * A note is `PITCH DURATION LYRIC` separated by whitespace. `PITCH` is a note
   name or a MIDI number, `r` is a rest (`r DURATION`, no lyric). `DURATION`
   is any `timing.parse_duration` token (`w h q e s t`, dots, `3` triplets,
