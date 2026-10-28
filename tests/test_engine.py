@@ -149,3 +149,79 @@ def test_overlapping_notes_warn():
     p.tracks[0].notes[0].duration = 1.5
     res = render_project(p)
     assert any("overlap" in w for w in res.report["warnings"])
+
+
+# --------------------------------------------------------------------------- voice quality (DSP)
+def _sustain(phones, pitch=64, voice="aurora", sr=SR, dur=1.5, style="flat"):
+    """Render one sustained note and return its steady middle part (mono float64)."""
+    p = Project.new("q", bpm=60, voice=voice)
+    p.sample_rate = sr
+    t = p.tracks[0]
+    t.style = style
+    t.add_note(1, dur, pitch, f"[{phones}]")
+    mono, _ = render_track(p, 0, sample_rate=sr)
+    a, b = p.tempo.beat_to_sec(1) + 0.3, p.tempo.beat_to_sec(1 + dur) - 0.3
+    return mono[int(a * sr):int(b * sr)].astype(float)
+
+
+def _band_db(x, sr, lo, hi):
+    spec = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
+    f = np.fft.rfftfreq(len(x), 1 / sr)
+    return 10 * np.log10(spec[(f >= lo) & (f < hi)].sum() + 1e-30)
+
+
+def test_glottal_source_follows_tension():
+    """Pressed phonation weakens H1 and brightens the top; lax phonation does the opposite."""
+    from synth2.engine.vocoder import glottal_spectrum, rd_glottal
+
+    voice = get_voice("aurora")
+    f0 = np.array([220.0, 220.0, 220.0])
+    oq, fa = rd_glottal(f0, np.array([-0.8, 0.0, 0.8]), np.zeros(3), voice)
+    assert oq[0] > oq[1] > oq[2] and fa[0] < fa[1] < fa[2]
+    harm = 220.0 * np.arange(1, 15)
+    g = 20 * np.log10(np.abs(glottal_spectrum(harm, f0, oq)) + 1e-12)
+    g -= 10 * np.log10(1 + (harm[None, :] / fa[:, None]) ** 2)
+    h1_h2 = g[:, 0] - g[:, 1]
+    h1_hf = g[:, 0] - g[:, 13]  # ~3 kHz
+    assert h1_h2[0] > h1_h2[1] > h1_h2[2]
+    assert h1_hf[0] > h1_hf[1] + 5 > h1_hf[2] + 10
+
+
+def test_voiced_signal_has_no_dc_and_no_hf_brickwall():
+    sr = 44100
+    x = _sustain("aa", sr=sr)
+    rms = np.sqrt(np.mean(x ** 2))
+    assert abs(x.mean()) < 1e-3 * rms
+    # the vocal tract keeps resonating above F5: the 7-10 kHz band must not vanish
+    assert _band_db(x, sr, 7000, 10000) > _band_db(x, sr, 300, 2000) - 55
+
+
+def test_nasal_murmur_duller_than_vowel():
+    sr = 44100
+    vowel, nasal = _sustain("aa", sr=sr), _sustain("m", sr=sr)
+    tilt = lambda x: _band_db(x, sr, 5000, 16000) - _band_db(x, sr, 100, 1000)  # noqa: E731
+    assert tilt(nasal) < tilt(vowel) - 6
+
+
+def test_vowel_loudness_is_consistent():
+    """Vowels at the same pitch and level stay within a few dB of each other (loudness-weighted)."""
+    from synth2.engine.vocoder import loudness_weight
+
+    for pitch in (57, 64):
+        levels = []
+        for v in ("iy", "ih", "eh", "aa", "ao", "uw", "er"):
+            x = _sustain(v, pitch=pitch, dur=1.2)
+            S = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
+            levels.append(10 * np.log10(np.sum(S * loudness_weight(np.fft.rfftfreq(len(x), 1 / SR)))))
+        assert max(levels) - min(levels) < 5.0, (pitch, np.round(levels, 1))
+
+
+def test_phrase_start_scoop_has_no_pitch_step():
+    """The scoop must already be in place when the (voiced) onset consonants start."""
+    voice = get_voice("aurora")
+    t = np.arange(0, 2.0, 0.0029)
+    notes = [NoteTiming(0, 0.2, 0.6, 60, {}, True, True),
+             NoteTiming(1, 1.2, 1.8, 67, {}, True, True, lead=0.2)]
+    pitch = build_pitch(t, notes, get_style("rock"), voice, np.random.default_rng(0))
+    m = (t > 1.2 - 0.2) & (t < 1.3)  # onset consonants + start of the vowel
+    assert np.max(np.abs(np.diff(pitch[m]))) < 0.15

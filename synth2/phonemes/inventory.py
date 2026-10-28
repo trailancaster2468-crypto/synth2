@@ -74,19 +74,19 @@ _add(
     _P("u", "vowel", (330, 1350, 2300), description="JA u (unrounded)"),
     _P("e", "vowel", (470, 1900, 2550), description="JA e"),
     _P("o", "vowel", (470, 860, 2450), description="JA o"),
-    _P("N", "nasal", (260, 1500, 2550), amp_db=-6, dur=0.12, nasal_zero=1600, description="JA moraic nasal"),
+    _P("N", "nasal", (260, 1500, 2550), amp_db=-8, dur=0.12, nasal_zero=1600, description="JA moraic nasal"),
 )
 
 # --- nasals, liquids, glides ------------------------------------------------------
 _add(
-    _P("m", "nasal", (260, 1050, 2250), amp_db=-7, dur=0.07, nasal_zero=900, place="labial"),
-    _P("n", "nasal", (260, 1600, 2600), amp_db=-7, dur=0.065, nasal_zero=1700, place="alveolar"),
-    _P("ng", "nasal", (260, 2050, 2700), amp_db=-8, dur=0.075, nasal_zero=3000, place="velar"),
-    _P("l", "liquid", (360, 1050, 2800), amp_db=-4, dur=0.06),
-    _P("r", "liquid", (360, 1250, 1650), amp_db=-3, dur=0.065),
+    _P("m", "nasal", (260, 1050, 2250), amp_db=-9, dur=0.07, nasal_zero=900, place="labial"),
+    _P("n", "nasal", (260, 1600, 2600), amp_db=-9, dur=0.065, nasal_zero=1700, place="alveolar"),
+    _P("ng", "nasal", (260, 2050, 2700), amp_db=-10, dur=0.075, nasal_zero=3000, place="velar"),
+    _P("l", "liquid", (360, 1050, 2800), amp_db=-6, dur=0.06),
+    _P("r", "liquid", (360, 1250, 1650), amp_db=-5, dur=0.065),
     _P("dx", "flap", (330, 1600, 2600), amp_db=-9, dur=0.028, place="alveolar", description="flap / JA r"),
-    _P("w", "glide", (300, 680, 2200), amp_db=-3, dur=0.055),
-    _P("y", "glide", (260, 2250, 3000), amp_db=-3, dur=0.05),
+    _P("w", "glide", (300, 680, 2200), amp_db=-5, dur=0.055),
+    _P("y", "glide", (260, 2250, 3000), amp_db=-5, dur=0.05),
 )
 
 # --- fricatives ------------------------------------------------------------------

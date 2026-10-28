@@ -68,6 +68,10 @@ def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 6
             t = int(np.nonzero(c[tau_min:] <= cmin + 0.06)[0][0]) + tau_min
         else:
             t = below[0] + tau_min
+            # H1-dominant vowels (e.g. /iy/) show a shallow ripple dip just before the true
+            # period: take the deepest minimum within ~12% of the first sub-threshold lag
+            hi_t = min(tau_max, int(t * 1.12) + 2)
+            t = t + int(np.argmin(c[t:hi_t]))
         while t + 1 < tau_max and c[t + 1] < c[t]:
             t += 1
         # sub-period check: noisy signals make period multiples look best; prefer the

@@ -65,49 +65,49 @@ def register(voice: Voice) -> Voice:
 
 register(Voice(
     "aurora", "Aurora", "Bright, clear female pop lead with a modern polished tone.",
-    gender="female", formant_scale=1.17, range_low=55, range_high=86, source_tilt=10.0,
-    tension=0.1, singer_formant_db=5.0, brightness_db=1.5, vibrato_rate=5.7, vibrato_depth=0.3,
+    gender="female", formant_scale=1.17, f4=4400.0, f5=5400.0, range_low=55, range_high=86, source_tilt=11.0,
+    tension=0.1, singer_formant_db=2.5, brightness_db=2.0, vibrato_rate=5.7, vibrato_depth=0.3,
     default_style="pop", tags=("female", "pop", "bright", "lead"),
 ))
 register(Voice(
     "seraph", "Seraph", "Soft, airy female voice for ballads, lullabies and intimate tracks.",
-    gender="female", formant_scale=1.15, range_low=53, range_high=84, source_corner=380.0,
-    source_tilt=13.5, aspiration_db=-24.0, tension=-0.35, breathiness=0.35, singer_formant_db=1.5,
+    gender="female", formant_scale=1.15, f4=4350.0, f5=5350.0, range_low=53, range_high=84, source_corner=380.0,
+    source_tilt=12.0, aspiration_db=-24.0, tension=-0.35, breathiness=0.35, singer_formant_db=1.5,
     brightness_db=-1.0, vibrato_rate=5.3, vibrato_depth=0.26, default_style="ballad",
     tags=("female", "soft", "breathy", "ballad"),
 ))
 register(Voice(
     "atlas", "Atlas", "Powerful male tenor for pop and rock, strong mid-range presence.",
-    gender="male", formant_scale=1.0, f4=3500.0, f5=4500.0, range_low=45, range_high=72,
-    source_corner=300.0, source_tilt=10.0, tension=0.2, singer_formant_db=6.0, vibrato_rate=5.5,
+    gender="male", formant_scale=1.0, f4=3800.0, f5=4800.0, range_low=45, range_high=72,
+    source_corner=300.0, source_tilt=10.0, tension=0.2, singer_formant_db=4.0, vibrato_rate=5.5,
     vibrato_depth=0.3, default_style="rock", tags=("male", "tenor", "rock", "pop"),
 ))
 register(Voice(
     "ember", "Ember", "Warm, dark male baritone suited to soul, jazz and low ballads.",
-    gender="male", formant_scale=0.95, f4=3300.0, f5=4300.0, range_low=40, range_high=67,
-    source_corner=260.0, source_tilt=12.0, aspiration_db=-27.0, tension=-0.1, breathiness=0.1,
+    gender="male", formant_scale=0.95, f4=3650.0, f5=4600.0, range_low=40, range_high=67,
+    source_corner=260.0, source_tilt=11.5, aspiration_db=-27.0, tension=-0.1, breathiness=0.1,
     singer_formant_db=4.0, brightness_db=-1.5, vibrato_rate=5.2, vibrato_depth=0.35,
     default_style="jazz", tags=("male", "baritone", "warm", "jazz"),
 ))
 register(Voice(
     "nova", "Nova", "Crisp synthetic idol voice with the classic machine-tuned vocaloid character.",
-    gender="female", formant_scale=1.22, f4=4300.0, f5=5300.0, range_low=57, range_high=89,
+    gender="female", formant_scale=1.22, f4=4800.0, f5=5800.0, range_low=57, range_high=89,
     source_tilt=9.0, aspiration_db=-36.0, jitter=0.0005, shimmer_db=0.05, tension=0.25,
     singer_formant_db=5.0, brightness_db=3.0, vibrato_rate=6.2, vibrato_depth=0.22, robotic=0.85,
     default_style="robotic", tags=("female", "synthetic", "vocaloid", "edm", "jpop"),
 ))
 register(Voice(
     "pixel", "Pixel", "Light, youthful high voice with a small vocal tract; cute and agile.",
-    gender="neutral", formant_scale=1.3, f4=4600.0, f5=5600.0, range_low=60, range_high=91,
+    gender="neutral", formant_scale=1.3, f4=4900.0, f5=5900.0, range_low=60, range_high=91,
     source_corner=520.0, source_tilt=11.0, aspiration_db=-29.0, tension=0.0, breathiness=0.1,
     singer_formant_db=2.0, brightness_db=1.0, vibrato_rate=6.0, vibrato_depth=0.25, robotic=0.2,
     default_style="pop", tags=("young", "high", "cute", "jpop"),
 ))
 register(Voice(
     "basso", "Basso", "Deep, resonant bass voice for low harmonies and choir foundations.",
-    gender="male", formant_scale=0.9, f4=3100.0, f5=4100.0, range_low=36, range_high=62,
-    source_corner=220.0, source_tilt=12.5, aspiration_db=-28.0, tension=0.0,
-    singer_formant_db=5.0, brightness_db=-2.0, vibrato_rate=5.0, vibrato_depth=0.3,
+    gender="male", formant_scale=0.9, f4=3450.0, f5=4400.0, range_low=36, range_high=62,
+    source_corner=220.0, source_tilt=11.5, aspiration_db=-28.0, tension=0.0,
+    singer_formant_db=7.0, brightness_db=-2.0, vibrato_rate=5.0, vibrato_depth=0.3,
     default_style="classical", tags=("male", "bass", "choir", "low"),
 ))
 
