@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synth2"
+version = "0.1.0"
+description = "Synth2 Vocal Studio - an AI-native singing voice synthesizer and vocal production studio"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "cmudict>=1.0",
+]
+
+[project.optional-dependencies]
+ai = ["anthropic>=0.40"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+synth2 = "synth2.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["synth2*"]
+
+[tool.setuptools.package-data]
+"synth2.server" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
