@@ -174,66 +174,79 @@ def synthesize(fp: FrameParams, voice, sr: int, rng: np.random.Generator) -> np.
         _ola(out, ip, pulses)
 
     # ---------------------------------------------------------------- noise
-    out[:n_samples] += _noise(fp, voice, sr, rng, gain, phase, hop, n_samples)
+    out[:n_samples] += _noise(fp, voice, sr, rng, gain, v_amp, phase, hop, n_samples)
     return out[:n_samples]
 
 
-def _noise(fp: FrameParams, voice, sr, rng, gain, phase, hop, n_samples) -> np.ndarray:
-    """Aspiration (formant-shaped) + frication (resonance-shaped) noise via STFT overlap-add."""
+def _noise(fp: FrameParams, voice, sr, rng, gain, v_amp, phase, hop, n_samples) -> np.ndarray:
+    """Breath + aspiration + frication noise via short-time inverse FFT overlap-add.
+
+    * air: breath noise riding on the voice.  Its spectrum is the voiced spectrum
+      minus a harmonics-to-noise ratio (HNR) that falls with frequency, so a
+      breathy voice is airy at the top while the low harmonics stay clean.
+    * aspiration: h / stop release / breath intake / whisper, shaped by the vocal tract.
+    * frication: resonance-shaped noise for s, sh, f, bursts...
+    """
     N = NOISE_FFT
     H = int(round(hop))
     freqs = np.fft.rfftfreq(N, 1.0 / sr)
     n = fp.n
     breath = np.clip(fp.breath, -1, 1)
-    base_air = 10 ** (voice.aspiration_db / 20.0)
-    # aspiration riding on voicing (breathiness)
-    air = fp.voiced * base_air * (10 ** (1.0 * breath)) * (1.0 + 0.0 * fp.tension)
     whisper = fp.voiced * (1.0 - np.clip(fp.voicing, 0, 1)) * 0.35
-    asp_unvoiced = fp.asp + whisper
-    asp_total = asp_unvoiced + air
-    fric = fp.fric
-    active = (asp_total > 1e-5) | (fric > 1e-5)
+    asp = (fp.asp + whisper) * gain
+    air = v_amp
+    fric = fp.fric * gain
+    active = (asp > 1e-6) | (air > 1e-6) | (fric > 1e-6)
     noise = np.zeros(max(n * H, n_samples) + 3 * N)
+    air_out = np.zeros_like(noise)
     if not active.any():
         return noise[:n_samples]
     win = np.hanning(N + 1)[:-1]
     scale = np.sqrt(N / 1.5)
     hp_asp = -10 * np.log10(1 + (400.0 / np.maximum(freqs, 1.0)) ** 4)
     rad = 10 * np.log10(1 + (freqs / 350.0) ** 2) - 6.0
+    octs = np.log2(np.maximum(freqs, 250.0) / 250.0)
+    # HNR at 250 Hz: ~27 dB for a modal voice, lower when breathy / for airy voices
+    hnr0 = 30.0 - 13.0 * np.clip(breath, 0, 1) - 4.0 * np.clip(breath, -1, 0) \
+        + 4.0 * np.clip(fp.tension, -1, 1) - (voice.aspiration_db + 30.0)
+    hnr_slope = 4.2  # dB per octave
     frames = np.nonzero(active)[0]
     CH = 512
     for c0 in range(0, len(frames), CH):
         fi = frames[c0:c0 + CH]
         k = len(fi)
-        vt = vocal_tract_db(freqs, fp.formants[fi], fp.bandwidths[fi] * 1.6, fp.nasal[fi], fp.nasal_zero[fi], sr)
+        vt = vocal_tract_db(freqs, fp.formants[fi], fp.bandwidths[fi], fp.nasal[fi], fp.nasal_zero[fi], sr)
+        # aspiration: vocal-tract shaped, power-normalised
         asp_db = vt + rad[None, :] + hp_asp[None, :]
         asp_db -= 10 * np.log10(np.mean(10 ** (asp_db / 10.0), axis=1))[:, None]
-        asp_mag = 10 ** (asp_db / 20.0) * (asp_total[fi] * gain[fi])[:, None]
-        # frication: resonance around fc
+        mag = 10 ** (asp_db / 20.0) * asp[fi][:, None]
+        # air: voiced spectrum (normalised exactly like the pulses) minus the HNR curve
+        vdb = vt + source_db(freqs, fp.f0[fi], fp.tension[fi], breath[fi], voice)
+        vdb -= VOICED_NORM * 10 * np.log10(np.mean(10 ** (vdb / 10.0), axis=1))[:, None]
+        air_db = vdb - (hnr0[fi][:, None] - hnr_slope * octs[None, :])
+        air_mag = 10 ** (air_db / 20.0) * air[fi][:, None]
+        # frication: resonance around fc with a place-dependent high-pass
         fc = fp.fric_fc[fi][:, None]
         bw = fp.fric_bw[fi][:, None]
         x = (freqs[None, :] - fc) / (0.5 * bw)
         res = 1.0 / np.sqrt(1.0 + x ** 4)
-        # place-dependent high-pass: sibilants have almost nothing below ~half their peak
         hp = 1.0 / np.sqrt(1.0 + (np.minimum(0.45 * fc, 2600.0) / np.maximum(freqs[None, :], 1.0)) ** 6)
         fric_shape = (res + 0.06) * hp
         fric_shape /= np.sqrt(np.mean(fric_shape ** 2, axis=1))[:, None]
-        fric_mag = fric_shape * (fric[fi] * gain[fi])[:, None]
-        X = (rng.standard_normal((k, len(freqs))) + 1j * rng.standard_normal((k, len(freqs)))) / np.sqrt(2)
-        # asp and fric are generated from independent noise to avoid comb-like correlation
-        Y = (rng.standard_normal((k, len(freqs))) + 1j * rng.standard_normal((k, len(freqs)))) / np.sqrt(2)
-        spec = X * asp_mag + Y * fric_mag
-        seg = np.fft.irfft(spec, n=N, axis=1) * win[None, :] * scale
+        fric_mag = fric_shape * fric[fi][:, None]
+        shape = (k, len(freqs))
+        X = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) / np.sqrt(2)
+        Y = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) / np.sqrt(2)
+        Z = (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)) / np.sqrt(2)
         starts = fi * H - N // 2 + H // 2 + N  # offset by N so indices stay positive
+        seg = np.fft.irfft(X * mag + Y * fric_mag, n=N, axis=1) * win[None, :] * scale
         _ola(noise, starts, seg)
+        seg = np.fft.irfft(Z * air_mag, n=N, axis=1) * win[None, :] * scale
+        _ola(air_out, starts, seg)
     noise = noise[N:N + n_samples]  # power-normalised: E[noise^2] = amplitude^2
-
-    # glottal-cycle modulation of the breath component
-    samp_frames = np.arange(n_samples) / hop
-    air_s = np.interp(samp_frames, np.arange(n), air)
-    tot_s = np.interp(samp_frames, np.arange(n), asp_total + fric) + 1e-9
-    share = np.clip(air_s / tot_s, 0, 1)
+    air_out = air_out[N:N + n_samples]
+    # breath noise is pulsed by the glottal cycle (open phase)
     ph = phase[:n_samples] - np.floor(phase[:n_samples])
     gate = 0.3 + 1.4 * (0.5 - 0.5 * np.cos(2 * np.pi * ph)) ** 2
-    gate /= 0.3 + 1.4 * 0.375
-    return noise * (1.0 - share + share * gate)
+    gate /= np.sqrt(np.mean(gate ** 2))
+    return noise + air_out * gate

@@ -353,18 +353,10 @@ class Project:
 
     @classmethod
     def load(cls, path: str | Path) -> "Project":
-        path = Path(path)
-        suffix = path.suffix.lower()
-        if suffix == ".svp":
-            from .io.svp import read_svp
-            return read_svp(path)
-        if suffix in (".mid", ".midi"):
-            from .io.midi import read_midi
-            return read_midi(path)
-        if suffix in (".s2s", ".txt"):
-            from .score import parse_score
-            return parse_score(path.read_text(encoding="utf-8"))
-        return cls.from_json(path.read_text(encoding="utf-8"))
+        """Load any supported format: .json/.s2p, .s2s score, .svp, .mid, .musicxml/.mxl, .ust."""
+        from .io import load_any
+
+        return load_any(path)
 
     def summary(self) -> dict:
         """Compact description of the project, useful for AI agents."""

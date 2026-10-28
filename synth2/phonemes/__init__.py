@@ -96,11 +96,23 @@ def resolve_notes(notes, default_language: str = "en") -> list[Syllable]:
             out[i] = Syllable(exp)
             i += 1
             continue
-        # count following "+" notes
+        # collect the following "+" notes of this word; "-" melisma notes may sit in between
+        plus_idx: list[int] = []
         j = i + 1
-        while j < n and (notes[j].lyric or "").strip() in CONTINUATION and not notes[j].phonemes:
+        while j < n and not notes[j].phonemes:
+            lj = (notes[j].lyric or "").strip()
+            if lj in CONTINUATION:
+                plus_idx.append(j)
+            elif lj not in MELISMA:
+                break
             j += 1
-        group = j - i
+        if plus_idx:
+            j = plus_idx[-1] + 1  # trailing melismas are handled as ordinary notes
+        slots = [i] + plus_idx
+        for k in range(i + 1, j):
+            if k not in plus_idx:
+                out[k] = Syllable(melisma=True)
+        group = len(slots)
         phones = word_to_phones(lyric, lang)
         if group == 1:
             out[i] = Syllable(phones)
@@ -113,11 +125,11 @@ def resolve_notes(notes, default_language: str = "en") -> list[Syllable]:
                 sylls = [phones]
             if len(sylls) > group:
                 sylls = sylls[: group - 1] + [sum(sylls[group - 1:], [])]
-            for k in range(group):
+            for k, slot in enumerate(slots):
                 if k < len(sylls):
-                    out[i + k] = Syllable(sylls[k])
+                    out[slot] = Syllable(sylls[k])
                 else:
-                    out[i + k] = Syllable(melisma=True)
+                    out[slot] = Syllable(melisma=True)
         i = j
     return out
 

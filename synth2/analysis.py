@@ -53,8 +53,15 @@ def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 6
         c = cmnd[i]
         below = np.nonzero(c[tau_min:] < threshold)[0]
         if len(below) == 0:
-            continue
-        t = below[0] + tau_min
+            # YIN fallback: accept the global minimum when it is still clearly periodic
+            # (breathy voices rarely dip below the strict threshold)
+            cmin = float(np.min(c[tau_min:]))
+            if cmin > 0.35:
+                continue
+            # first dip that comes close to the global minimum (avoids period multiples)
+            t = int(np.nonzero(c[tau_min:] <= cmin + 0.06)[0][0]) + tau_min
+        else:
+            t = below[0] + tau_min
         while t + 1 < tau_max and c[t + 1] < c[t]:
             t += 1
         if 1 <= t < tau_max - 1:
@@ -127,13 +134,14 @@ def pitch_accuracy(project, result, max_list: int = 10) -> dict:
             a, b = b2s(n.onset), b2s(n.end)
             if b - a < 0.12:
                 continue
-            lo, hi = a + 0.3 * (b - a), b - 0.25 * (b - a)
+            # skip the transition into the note; keep the rest (short notes end in consonants)
+            lo, hi = a + min(0.25 * (b - a), 0.12), b - 0.1 * (b - a)
             m = (times >= lo) & (times <= hi)
             if not m.any():
                 continue
             seg = f0[m]
             v = seg[seg > 0]
-            if len(v) < max(3, 0.4 * m.sum()):
+            if len(v) < max(3, 0.3 * m.sum()):
                 missing.append({"id": n.id, "beat": n.onset, "note": midi_to_note(n.pitch), "lyric": n.lyric})
                 continue
             target = n.pitch + float(n.attrs.get("detune", 0) or 0) / 100.0

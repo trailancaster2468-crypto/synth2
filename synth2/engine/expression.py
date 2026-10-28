@@ -140,24 +140,14 @@ def build_pitch(t: np.ndarray, notes: list[NoteTiming], style: Style, voice, rng
     frame_rate = 1.0 / (t[1] - t[0]) if n > 1 else 200.0
     robotic = float(voice.robotic)
 
-    # 1) step curve: each note's pitch from (start - lead) until the next note takes over
+    # 1) base curve, built note by note in time order so each note owns the frames
+    #    from its transition onwards (later notes overwrite earlier ones)
     pitch = np.full(n, notes[0].pitch, dtype=float)
-    switch_times = []
-    for i, nt in enumerate(notes):
-        if i == 0:
-            continue
-        prev = notes[i - 1]
-        legato = nt.start - prev.end < 0.08
-        if legato:
-            switch_times.append(None)
-        else:
-            sw = nt.start - nt.lead - 0.015
-            switch_times.append(sw)
-            pitch[t >= sw] = nt.pitch
-    # legato transitions (smooth)
     for i in range(1, len(notes)):
         nt, prev = notes[i], notes[i - 1]
-        if switch_times[i - 1] is not None:
+        if nt.start - prev.end >= 0.08:
+            # separated by a rest: switch while silent, just before the onset consonants
+            pitch[t >= nt.start - nt.lead - 0.015] = nt.pitch
             continue
         interval = nt.pitch - prev.pitch
         T = nt.attrs.get("transition")
@@ -167,10 +157,8 @@ def build_pitch(t: np.ndarray, notes: list[NoteTiming], style: Style, voice, rng
         T = min(T, 0.6 * (prev.end - prev.start) + 0.02, 0.8 * (nt.end - nt.start) + 0.02)
         centre = nt.start + style.transition_offset * T
         a, b = centre - T / 2, centre + T / 2
-        x = (t - a) / max(T, 1e-4)
         mask = t >= a
-        # remove the old step (pitch currently = prev.pitch before switch) then add the smooth move
-        pitch[mask] = prev.pitch + interval * _smoothstep(x[mask])
+        pitch[mask] = prev.pitch + interval * _smoothstep((t[mask] - a) / max(T, 1e-4))
         if interval == 0:
             continue
         # preparation: a small movement away from the target just before the transition
