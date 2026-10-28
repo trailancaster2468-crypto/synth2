@@ -1004,6 +1004,15 @@ ROUTES = {
 }
 
 
+def _warm_up() -> None:
+    try:
+        from ..phonemes import lyric_phonemes
+
+        lyric_phonemes("hello", "en")
+    except Exception:  # pragma: no cover - best effort
+        pass
+
+
 class StudioServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -1012,6 +1021,8 @@ class StudioServer(ThreadingHTTPServer):
         super().__init__(addr, StudioHandler)
         self.state = state
         self.quiet = quiet
+        # Load the pronunciation dictionary in the background so the first lyric edit is instant.
+        threading.Thread(target=_warm_up, name="synth2-warmup", daemon=True).start()
 
     @property
     def url(self) -> str:

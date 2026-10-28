@@ -31,6 +31,8 @@ check its own output with built-in audio analysis.
 > example an ONNX DiffSinger-style voicebank on `onnxruntime`) can be added
 > later without changing projects, tools or the GUI.
 
+![Synth2 web studio: piano roll with lyrics and phonemes, parameter lanes, mixer, inspector and AI Director chat](docs/studio.png)
+
 ## Features
 
 | Area | What you get |
