@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synth2 Vocal Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314b8a6'/%3E%3Cpath d='M6 20c3 0 3-8 6-8s3 12 6 12 3-16 6-16 2 6 2 6' stroke='%23071513' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12.5-7.5z" fill="currentColor"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor"/></symbol>
+    <symbol id="i-start" viewBox="0 0 24 24"><path d="M6 5h2.5v14H6zM20 5v14L9.5 12z" fill="currentColor"/></symbol>
+    <symbol id="i-loop" viewBox="0 0 24 24"><path d="M17 4l3 3-3 3M4 11V9.5A2.5 2.5 0 0 1 6.5 7H20M7 20l-3-3 3-3M20 13v1.5a2.5 2.5 0 0 1-2.5 2.5H4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5M20 9H9.5a5.5 5.5 0 0 0 0 11H13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-save" viewBox="0 0 24 24"><path d="M5 4h11l3 3v12a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1zM8 4v5h7V4M8 20v-6h8v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M4 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-pen" viewBox="0 0 24 24"><path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19z M14 7l3 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-pointer" viewBox="0 0 24 24"><path d="M6 3l12 8.5-5.2 1.2 3 6-2.4 1.2-3-6L6 18z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-line" viewBox="0 0 24 24"><path d="M4 19L20 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="4.5" cy="18.5" r="2" fill="currentColor"/><circle cx="19.5" cy="5.5" r="2" fill="currentColor"/></symbol>
+    <symbol id="i-eraser" viewBox="0 0 24 24"><path d="M8.5 19.5L3.8 14.8a1.5 1.5 0 0 1 0-2.1l8.9-8.9a1.5 1.5 0 0 1 2.1 0l5.4 5.4a1.5 1.5 0 0 1 0 2.1L12 19.5zM8 9l7 7M8.5 19.5H20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2.5-6.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8zM18.5 15l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z" fill="currentColor"/></symbol>
+    <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .9-1 1.6V14M12 17.2v.1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15 15l5 5M8 10.5h5M10.5 8v5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15 15l5 5M8 10.5h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    <symbol id="i-fit" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-metro" viewBox="0 0 24 24"><path d="M9 3h6l4 18H5zM12 15l5-9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/></symbol>
+  </defs>
+</svg>
+
+<div id="app" class="app">
+  <!-- ======================= Top bar ======================= -->
+  <header class="topbar">
+    <div class="brand" title="Synth2 Vocal Studio">
+      <div class="logo"><svg viewBox="0 0 32 32"><path d="M5 19c3 0 3-8 6-8s3 12 6 12 3-16 6-16 3 7 4 7" stroke="currentColor" stroke-width="2.6" fill="none" stroke-linecap="round"/></svg></div>
+      <div class="brand-text"><span class="brand-name">Synth2</span><span class="brand-sub">Vocal Studio</span></div>
+    </div>
+
+    <div class="menu-group">
+      <div class="menu" id="file-menu">
+        <button class="tb-btn menu-btn" data-menu="file" title="File"><svg><use href="#i-file"/></svg><span>File</span></button>
+        <div class="menu-pop" role="menu">
+          <button data-action="new">New project</button>
+          <button data-action="import">Import file&hellip; <kbd>Ctrl+O</kbd></button>
+          <div class="menu-sep"></div>
+          <button data-action="save">Save <kbd>Ctrl+S</kbd></button>
+          <button data-action="save-as">Save as&hellip;</button>
+          <div class="menu-sep"></div>
+          <div class="menu-label">Export</div>
+          <button data-export="svp">Synthesizer V (.svp)</button>
+          <button data-export="mid">MIDI (.mid)</button>
+          <button data-export="musicxml">MusicXML (.musicxml)</button>
+          <button data-export="ust">UTAU (.ust)</button>
+          <button data-export="s2s">Score text (.s2s)</button>
+          <button data-export="json">Project JSON (.s2p.json)</button>
+          <div class="menu-sep"></div>
+          <button data-action="bounce">Render full song to WAV&hellip;</button>
+          <button data-action="download-wav">Download last render (.wav)</button>
+        </div>
+      </div>
+      <button class="tb-btn icon" id="btn-undo" title="Undo (Ctrl+Z)"><svg><use href="#i-undo"/></svg></button>
+      <button class="tb-btn icon" id="btn-redo" title="Redo (Ctrl+Y)"><svg><use href="#i-redo"/></svg></button>
+      <button class="tb-btn icon" id="btn-save" title="Save (Ctrl+S)"><svg><use href="#i-save"/></svg></button>
+    </div>
+
+    <div class="transport">
+      <button class="tp-btn" id="btn-start" title="Return to start (Home)"><svg><use href="#i-start"/></svg></button>
+      <button class="tp-btn play" id="btn-play" title="Render &amp; play (Space)"><svg class="ic-play"><use href="#i-play"/></svg><span class="spinner"></span></button>
+      <button class="tp-btn" id="btn-stop" title="Stop (Space / Esc)"><svg><use href="#i-stop"/></svg></button>
+      <button class="tp-btn toggle" id="btn-loop" title="Loop region (L) - drag on the ruler to set"><svg><use href="#i-loop"/></svg></button>
+    </div>
+
+    <div class="lcd" title="Playhead position">
+      <div class="lcd-main" id="lcd-bars">001 . 1 . 000</div>
+      <div class="lcd-sub" id="lcd-time">00:00.000</div>
+    </div>
+
+    <div class="song-props">
+      <label class="prop" title="Tempo (BPM)"><span>Tempo</span><input id="in-tempo" type="number" min="20" max="400" step="0.1"></label>
+      <label class="prop" title="Time signature"><span>Meter</span>
+        <select id="in-timesig">
+          <option>2/4</option><option>3/4</option><option selected>4/4</option><option>5/4</option><option>6/4</option><option>3/8</option><option>6/8</option><option>7/8</option><option>9/8</option><option>12/8</option>
+        </select>
+      </label>
+      <label class="prop" title="Key"><span>Key</span><select id="in-key"></select></label>
+    </div>
+
+    <div class="title-box">
+      <input id="in-title" class="title-input" spellcheck="false" title="Project title">
+      <span id="dirty-dot" class="dirty-dot" title="Unsaved changes"></span>
+    </div>
+
+    <div class="topbar-right">
+      <button class="tb-btn icon" id="btn-help" title="Keyboard shortcuts (?)"><svg><use href="#i-help"/></svg></button>
+    </div>
+  </header>
+
+  <!-- ======================= Left: tracks ======================= -->
+  <aside class="panel tracks-panel">
+    <div class="panel-head">
+      <span class="panel-title">Tracks</span>
+      <button class="mini-btn" id="btn-add-track" title="Add track"><svg><use href="#i-plus"/></svg>Add</button>
+    </div>
+    <div class="track-list" id="track-list"></div>
+    <div class="master" id="master-strip"></div>
+  </aside>
+
+  <!-- ======================= Center: editor ======================= -->
+  <main class="editor">
+    <div class="editor-toolbar">
+      <div class="seg" id="tool-seg">
+        <button data-tool="draw" class="active" title="Draw tool (D): drag on empty space to create notes"><svg><use href="#i-pen"/></svg></button>
+        <button data-tool="select" title="Select tool (V): drag to box-select"><svg><use href="#i-pointer"/></svg></button>
+      </div>
+      <label class="tb-field" title="Snap grid"><span>Snap</span>
+        <select id="in-snap">
+          <option value="4">1 bar</option>
+          <option value="2">1/2</option>
+          <option value="1">1/4</option>
+          <option value="0.5" selected>1/8</option>
+          <option value="0.25">1/16</option>
+          <option value="0.125">1/32</option>
+          <option value="0.6666666667">1/4 T</option>
+          <option value="0.3333333333">1/8 T</option>
+          <option value="0.1666666667">1/16 T</option>
+          <option value="0">Off</option>
+        </select>
+      </label>
+      <label class="tb-field" title="Length for new notes"><span>Note</span>
+        <select id="in-notelen">
+          <option value="auto" selected>Last</option>
+          <option value="4">1/1</option>
+          <option value="2">1/2</option>
+          <option value="1">1/4</option>
+          <option value="0.5">1/8</option>
+          <option value="0.25">1/16</option>
+        </select>
+      </label>
+      <label class="tb-check" title="Show other tracks' notes as ghosts"><input type="checkbox" id="chk-ghost" checked><span>Ghosts</span></label>
+      <label class="tb-check" title="Show phonemes above notes"><input type="checkbox" id="chk-phon" checked><span>Phonemes</span></label>
+      <div class="tb-spacer"></div>
+      <span class="hint" id="roll-hint">Double-click a note to type lyrics &middot; Tab to the next note</span>
+      <div class="seg">
+        <button id="btn-zoom-out" title="Zoom out (Ctrl+wheel)"><svg><use href="#i-zoom-out"/></svg></button>
+        <button id="btn-zoom-fit" title="Zoom to fit (F)"><svg><use href="#i-fit"/></svg></button>
+        <button id="btn-zoom-in" title="Zoom in (Ctrl+wheel)"><svg><use href="#i-zoom-in"/></svg></button>
+      </div>
+    </div>
+    <div class="roll-wrap" id="roll-wrap">
+      <canvas id="roll"></canvas>
+      <input id="lyric-input" class="lyric-input" spellcheck="false" autocomplete="off" hidden>
+      <div class="busy-overlay" id="busy-overlay" hidden><div class="busy-card"><span class="spinner big"></span><span id="busy-text">AI Director is working&hellip;</span></div></div>
+    </div>
+    <div class="splitter" id="splitter" title="Drag to resize"></div>
+    <div class="lane-panel" id="lane-panel">
+      <div class="lane-head">
+        <div class="lane-tabs" id="lane-tabs"></div>
+        <div class="tb-spacer"></div>
+        <span class="lane-readout" id="lane-readout"></span>
+        <div class="seg" id="lane-tools">
+          <button data-ltool="draw" class="active" title="Freehand draw (right-drag or Alt erases)"><svg><use href="#i-pen"/></svg></button>
+          <button data-ltool="line" title="Line tool (or Shift+drag)"><svg><use href="#i-line"/></svg></button>
+          <button data-ltool="erase" title="Erase points"><svg><use href="#i-eraser"/></svg></button>
+        </div>
+        <select id="lane-interp" class="lane-select" title="Interpolation">
+          <option value="cubic">Smooth</option>
+          <option value="linear">Linear</option>
+          <option value="step">Step</option>
+        </select>
+        <button class="mini-btn" id="lane-clear" title="Clear this curve on the selected track">Clear</button>
+      </div>
+      <div class="lane-wrap" id="lane-wrap"><canvas id="lane"></canvas></div>
+    </div>
+  </main>
+
+  <!-- ======================= Right: inspector + AI ======================= -->
+  <aside class="panel right-panel">
+    <div class="inspector">
+      <div class="tabs" id="insp-tabs">
+        <button data-tab="note" class="active">Note</button>
+        <button data-tab="track">Track</button>
+        <button data-tab="project">Project</button>
+      </div>
+      <div class="insp-body" id="insp-body"></div>
+    </div>
+    <div class="chat" id="chat">
+      <div class="panel-head">
+        <span class="panel-title"><svg class="spark"><use href="#i-spark"/></svg>AI Director</span>
+        <span class="ai-status" id="ai-status"><span class="dot"></span><span class="txt">checking</span></span>
+        <button class="mini-btn ghost" id="chat-reset" title="Start a new conversation">New chat</button>
+      </div>
+      <div class="chat-log" id="chat-log"></div>
+      <form class="chat-input" id="chat-form">
+        <textarea id="chat-text" rows="2" placeholder="Ask the director: &ldquo;write a chorus melody in bar 5 with lyrics about the ocean&rdquo;" spellcheck="true"></textarea>
+        <button type="submit" class="send-btn" id="chat-send" title="Send (Enter)"><svg><use href="#i-send"/></svg></button>
+      </form>
+    </div>
+  </aside>
+
+  <!-- ======================= Status bar ======================= -->
+  <footer class="statusbar">
+    <span class="sb-item sb-msg" id="sb-msg">Ready</span>
+    <span class="sb-item sb-report" id="sb-report" title="Last render report"></span>
+    <span class="sb-flex"></span>
+    <span class="sb-item mono" id="sb-cursor"></span>
+    <span class="sb-item" id="sb-sel"></span>
+    <span class="sb-item" id="sb-path"></span>
+    <span class="sb-item sb-conn" id="sb-conn"><span class="dot"></span>server</span>
+  </footer>
+</div>
+
+<input type="file" id="file-input" hidden accept=".svp,.mid,.midi,.musicxml,.xml,.mxl,.ust,.s2s,.txt,.json,.s2p">
+<input type="color" id="color-input" hidden>
+<div class="ctx-menu" id="ctx-menu" hidden></div>
+<div class="toast-host" id="toasts"></div>
+
+<div class="modal" id="help-modal" hidden>
+  <div class="modal-card">
+    <div class="modal-head"><span>Keyboard &amp; mouse</span><button class="mini-btn ghost" data-close><svg><use href="#i-x"/></svg></button></div>
+    <div class="help-grid">
+      <div><kbd>Space</kbd></div><div>Render &amp; play / stop</div>
+      <div><kbd>Home</kbd></div><div>Playhead to start</div>
+      <div><kbd>L</kbd></div><div>Toggle loop (drag on the ruler to set the region)</div>
+      <div><kbd>D</kbd> / <kbd>V</kbd></div><div>Draw tool / select tool</div>
+      <div>Drag empty grid</div><div>Create a note (draw tool) or box-select (select tool / Shift)</div>
+      <div>Drag note / edge</div><div>Move (time + pitch) / resize. Alt disables snap, Ctrl+drag duplicates. Right-click for more</div>
+      <div>Double-click note</div><div>Edit lyric. <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> moves to the next / previous note. Type several words to fill following notes</div>
+      <div><kbd>Enter</kbd></div><div>Edit lyric of the selected note</div>
+      <div><kbd>&uarr;</kbd> <kbd>&darr;</kbd></div><div>Transpose a semitone (Shift: octave)</div>
+      <div><kbd>&larr;</kbd> <kbd>&rarr;</kbd></div><div>Move by the snap grid (Shift: resize)</div>
+      <div><kbd>Del</kbd></div><div>Delete selected notes</div>
+      <div><kbd>Ctrl+A</kbd> <kbd>Ctrl+C</kbd> <kbd>Ctrl+X</kbd> <kbd>Ctrl+V</kbd> <kbd>Ctrl+D</kbd></div><div>Select all, copy, cut, paste at playhead, duplicate</div>
+      <div><kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Y</kbd></div><div>Undo / redo (shared with the AI Director)</div>
+      <div>Wheel</div><div>Scroll (Shift: horizontal). Ctrl+wheel zooms time, Alt+wheel zooms pitch</div>
+      <div>Middle-drag</div><div>Pan the view</div>
+      <div>Parameter lane</div><div>Drag to draw, Shift+drag for a line, right-drag or Alt+drag to erase, Alt+wheel (or wheel over the value axis) zooms the value range, double-click the axis to reset</div>
+      <div><kbd>F</kbd> / <kbd>Q</kbd></div><div>Zoom to fit the selected track / quantize selected notes to the grid</div>
+      <div>Ruler</div><div>Click to move the playhead, drag to set the loop region, drag the loop edges to adjust</div>
+      <div>Files</div><div>Drop a .svp, .mid, .musicxml, .ust, .s2s or .json file anywhere to import it</div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
