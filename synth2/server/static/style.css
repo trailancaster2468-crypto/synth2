@@ -213,7 +213,9 @@ input[type=range]::-moz-range-thumb { width: 11px; height: 11px; border-radius: 
 .lane-tab:hover { color: var(--text); background: var(--elev); }
 .lane-tab.active { color: #fff; background: var(--elev-2); border-bottom-color: var(--cc, var(--accent)); }
 .lane-tab.has-data::after { content: ""; position: absolute; right: 2px; top: 3px; width: 4px; height: 4px; border-radius: 50%; background: var(--cc, var(--amber)); }
-.lane-readout { font: 11px var(--mono); color: var(--text-2); white-space: nowrap; min-width: 0; overflow: hidden; }
+.lane-readout { position: absolute; top: 5px; right: 18px; z-index: 2; pointer-events: none; font: 11px var(--mono); color: var(--text); white-space: nowrap;
+  padding: 2px 7px; border-radius: 4px; background: rgba(15,17,21,.82); border: 1px solid var(--border-2); }
+.lane-readout:empty { display: none; }
 .lane-select { height: 24px; background: var(--elev); border: 1px solid var(--border-2); border-radius: 5px; font-size: 11.5px; outline: none; }
 .lane-wrap { position: relative; flex: 1; min-height: 0; }
 

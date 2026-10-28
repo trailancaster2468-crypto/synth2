@@ -2467,7 +2467,11 @@ class Chat {
       box.append(el('button', { class: 'sugg', onclick: () => { this.text.value = s; this.text.focus(); } }, s));
     }
     this.log.append(box);
-    if (!this.available) this.add('system', `AI Director is offline. ${this.reason || 'Set ANTHROPIC_API_KEY to enable.'}\nRestart the studio with ANTHROPIC_API_KEY set (and the anthropic package installed) to chat with it.`);
+    if (!this.available) this.add('system', this.offlineText());
+  }
+  offlineText() {
+    const r = String(this.reason || 'set ANTHROPIC_API_KEY to enable it.');
+    return `AI Director is offline: ${r.charAt(0).toLowerCase() + r.slice(1)}\nRestart the studio with the key set to chat with the director.`;
   }
   add(role, text, actions) {
     const m = el('div', { class: 'msg ' + role });
@@ -2515,7 +2519,7 @@ class Chat {
       try { const m = await Api.meta(); this.available = !!(m.director && m.director.available); this.reason = m.director && m.director.reason; } catch { /* ignore */ }
       if (!this.available) {
         typing.remove();
-        this.add('system', `AI Director is offline: ${this.reason || 'set ANTHROPIC_API_KEY to enable.'}`);
+        this.add('system', this.offlineText());
         this.sending = false;
         $('#chat-send').disabled = false;
         return;
@@ -2538,7 +2542,7 @@ class Chat {
       typing.remove();
       if (e.status === 501) {
         this.setStatus({ available: false, reason: e.message });
-        this.add('system', `AI Director is offline: ${e.message}`);
+        this.add('system', this.offlineText());
       } else {
         this.add('error', `Director error: ${e.message}`);
       }
