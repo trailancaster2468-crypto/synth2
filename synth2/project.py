@@ -263,6 +263,7 @@ class MasterSettings:
     vocal_delay: float = 0.0  # ping-pong delay return level for the vocals (0 = off, 0.1-0.3 typical)
     delay_beats: float = 0.5  # delay time in beats (0.5 = eighth notes)
     delay_feedback: float = 0.35
+    delay_duck_db: float = 6.0  # the delay return dips this much while the vocals sing (repeats bloom in the gaps)
     # ---- band (backing stems from synth2.arranger)
     vocal_balance_db: float | None = 4.0  # band gain is set so vocals sit this far above it in 1-5 kHz; None = off
     backing_gain_db: float = 0.0  # band trim after the vocal balance

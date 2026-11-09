@@ -14,11 +14,13 @@ carries over to its double and harmony:
    chorus), with the raised leading tone over the V chord. Notes on the "and" of beat 4 belong to the
    next bar's chord, because they anticipate it. Choruses 1 and 2 are harmonized only on the hook
    lines (1, 3, 5, 7) and the tag line 8. The deadpan joke lines 2, 4 and 6 stay solo. The final
-   chorus is harmonized throughout.
+   chorus is harmonized throughout, except its line 6 ("Funny... neither can you"): the pronoun-arc
+   payoff stays as bare as in choruses 1 and 2 (the band also stops for "can").
 3. **Crowd 2 / Crowd 3** (``duplicate_track``): the gang shouts in unison.
    - Crowd 2 is ember at the same pitch: -9 cents, +0.035 beats late, panned right (+0.6).
    - Crowd 3 is aurora an octave up: +6 cents, +0.018 beats late, panned +0.25, at -7 dB.
    - The written Crowd track (atlas) sits on the left (-0.6).
+   - The breakdown's whispered "hurry" is not doubled an octave up (an octave-up whisper is only hiss).
 4. **Fan voice**: the classic ワレワレハ ウチュウジン ダ effect, a voice speaking into a fan. Over every
    kana note of ``Aliens`` and ``Aliens 2``, an 11 Hz loudness chop (0 / -9 dB) is added to the
    loudness curve. It goes on top of any curve already there, such as the outro fade. The pitch warble
@@ -70,6 +72,8 @@ assert len(CHORDS) == 134
 
 CHORUS_STARTS = (128.0, 304.0, 448.0)  # bars 33, 77, 113
 FINAL_CHORUS = (447.5, 512.0)
+FINAL_LINE_6 = (488.0, 495.5)  # bars 123-124, "Funny... neither can you": left without harmony
+WHISPER = (446.0, 447.4)       # bar 112, the crowd's whispered "hurry"
 # chorus-relative beat ranges harmonized in choruses 1 and 2: hook lines 1, 3, 5, 7 (with pickups) and line 8
 HOOK_LINES = ((-0.5, 6.0), (15.5, 22.0), (32.0, 38.0), (47.5, 54.0), (55.0, 64.0))
 
@@ -129,7 +133,7 @@ def chorus_ranges() -> list[tuple[float, float]]:
 
 def harmony_ranges() -> list[tuple[float, float]]:
     out = [(c + a, c + b) for c in CHORUS_STARTS[:2] for a, b in HOOK_LINES]
-    return out + [FINAL_CHORUS]
+    return out + [(FINAL_CHORUS[0], FINAL_LINE_6[0]), (FINAL_LINE_6[1], FINAL_CHORUS[1])]
 
 
 def _track(session: Session, name: str) -> Track:
@@ -219,6 +223,8 @@ def apply_vocal_production(session: Session) -> dict:
     call_tool(session, "duplicate_track", {"track": crowd.id, "name": "Crowd 3", "voice": "aurora",
                                            "transpose": 12, "detune_cents": 6.0, "delay_beats": 0.018,
                                            "gain_db": -7.0, "pan": 0.25})
+    c3 = _track(session, "Crowd 3")
+    c3.notes = [n for n in c3.notes if not WHISPER[0] <= n.onset < WHISPER[1]]
 
     # 4) fan voice on the alien chants
     chops = {name: _fan_chop(_track(session, name)) for name in ("Aliens", "Aliens 2")}

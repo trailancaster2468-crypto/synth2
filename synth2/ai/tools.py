@@ -1001,7 +1001,8 @@ time_signature ('3/4'), sample_rate (Hz) and master settings {gain_db, reverb_ro
 0..2 (scales all reverb sends), normalize (peak-normalise to -1 dBFS), limiter}. Tempo is set with set_tempo.
 Mixing / mastering (songs with a backing band, see docs/PLAN.md): loudness_target (integrated LUFS, null = auto
 -11), ceiling_db (true-peak ceiling), glue (master glue 0..1), master_eq (EQ band list, null = preset),
-vocal_chain, vocal_delay (ping-pong delay return 0..1, 0 = off), delay_beats, delay_feedback, vocal_balance_db
+vocal_chain, vocal_delay (ping-pong delay return 0..1, 0 = off), delay_beats, delay_feedback, delay_duck_db (the
+delay return dips this much while the vocals sing), vocal_balance_db
 (vocals over the band in 1-5 kHz, null = off), backing_gain_db, band_duck_db, vocal_carve_db, sidechain_db,
 sidechain_release (s), band_width, band_glue, band_reverb, sub_max_db, mix_overrides ({track id/name, backing
 stem name or role: {gain_db, pan, reverb, delay, eq_add, chain, comp, sidechain_db, duck, carve, width,
@@ -1025,6 +1026,7 @@ key, mix_overrides=null clears them all).
         "vocal_delay": {"type": "number", "minimum": 0, "maximum": 1},
         "delay_beats": {"type": "number", "minimum": 0.0625, "maximum": 4},
         "delay_feedback": {"type": "number", "minimum": 0, "maximum": 0.9},
+        "delay_duck_db": {"type": "number", "minimum": 0, "maximum": 24},
         "vocal_balance_db": {"type": ["number", "null"], "minimum": -12, "maximum": 18},
         "backing_gain_db": {"type": "number", "minimum": -24, "maximum": 12},
         "band_duck_db": {"type": "number", "minimum": 0, "maximum": 12},

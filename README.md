@@ -42,10 +42,25 @@ check its own output with built-in audio analysis.
 | **Automatic expression** | "AI tuning" styles (`pop`, `ballad`, `rock`, `jazz`, `rnb`, `soft`, `classical`, `robotic`, `flat`). Portamento with preparation and overshoot, phrase scoops and falls, delayed natural vibrato, pitch drift, phrase dynamics, pitch-dependent tension, automatic breaths. |
 | **Parameter lanes** | `pitchDelta` (cents), `loudness` (dB), `tension`, `breathiness`, `gender`, `voicing`, `toneShift`, `vibratoEnv`, with linear, cubic or step interpolation. |
 | **Voices** | `aurora` (bright female pop), `seraph` (soft breathy female), `atlas` (male tenor), `ember` (warm baritone), `nova` (synthetic vocaloid-style idol), `pixel` (young, high), `basso` (bass). Each can be tweaked per track, and custom voices can be loaded from JSON. |
-| **Mixer** | Gain, pan, mute and solo per track. Reverb send to a synthetic stereo hall. Master gain, normalization and limiter. Per-track stems. |
+| **Backing band** | `synth2/arranger`: a numpy instrument engine (drum kits, basses, power-saw "guitars", chiptune and supersaw leads, plucks, pads, bells, sci-fi FX) driven by a JSON arrangement of sections, chords per bar, step patterns, riffs, fills, events and stops. Stored in the project and editable through the `set_backing`, `get_backing` and `clear_backing` tools. See `synth2/arranger/FORMAT.md`. |
+| **Mixing and mastering** | `synth2/engine/mixing.py`: vocal chain (HPF, presence, compression, reverb, tempo-synced delay), role-based band EQ, kick sidechain ducking, vocal-aware band ducking, glue compression, BS.1770 loudness metering, true-peak limiter with a LUFS target. Gain, pan, mute and solo per track, with per-track and per-instrument stems. |
 | **AI** | A tool layer with JSON schemas, an MCP server for Claude Desktop, Claude Code and other clients, a Claude-powered **Director** that turns natural language into productions, a compact score language for writing songs, harmony generation, and objective render checks (pitch accuracy in cents, levels, clipping, voicing). |
 | **Interop** | Import and export of Synthesizer V `.svp`, MIDI (with lyric events), MusicXML and `.mxl`, UTAU `.ust`, Synth2 JSON and score text. |
 | **Studio GUI** | A browser studio with a canvas piano roll, parameter lane drawing, inspector, mixer, transport with playback, and an AI chat panel. |
+
+## Showcase: SELECT ALL INVADERS
+
+`examples/select_all_invaders/` is a complete 3:11 song made entirely in the studio by a team of AI agents. It is a Pinocchio-P-style vocaloid track about an AI defending Earth from aliens with CAPTCHAs, cookie banners and terms of service. It has:
+- 20 vocal tracks: the AI lead (Nova), alien voices, a human crowd, doubles and harmonies
+- a full synthesized band with a key change and a glitch bridge
+- a master at -11.5 LUFS
+
+```bash
+python examples/select_all_invaders/build.py            # full song -> out/select_all_invaders/
+python examples/select_all_invaders/build.py --start-bar 33 --end-bar 49   # just chorus 1
+```
+
+It includes the spec (`SPEC.md`), the lyrics, the vocal score (`vocals.s2s`), the band arrangement (`backing.json`) and the production script.
 
 ## Install
 

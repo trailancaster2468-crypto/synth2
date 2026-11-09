@@ -7,19 +7,22 @@ The project is put together through the studio's tool layer, the way an AI produ
 2. ``vocals.apply_vocal_production``: AI Double, Harmony, Crowd 2 / 3 and the aliens' fan voice,
 3. ``set_backing`` with ``backing.json`` (the arranger's band), then ``set_backing(merge=true)`` for the
    section tweaks of the mix (:data:`BAND_TWEAKS`),
-4. ``duplicate_track`` / ``add_notes`` / ``delete_notes`` to put the verse and breakdown lead and the
-   aliens' final-chorus hook on their own mixer channels (:data:`SPLITS`),
+4. ``duplicate_track`` / ``add_notes`` / ``delete_notes`` to put section parts (the lead in the verses,
+   pre-choruses, bridge, breakdown and final chorus, the aliens' verse, bridge and final-chorus hook, the crowd's
+   final-chorus hook, the final-chorus harmony) on their own mixer channels (:data:`SPLITS`),
 5. ``update_track`` for every vocal fader, pan and reverb send (:data:`TRACK_MIX`),
 6. ``update_project`` for the master: loudness, delay, width, master EQ, band balance and the
    per-track / per-stem overrides (:data:`MASTER`),
 7. ``save_project``, then ``render_project`` at 44.1 kHz.
 
 The mix decisions are documented next to the settings below; every one of them came from a measurement
-(section loudness, 1-5 kHz balance of each element against the lead, long-term spectrum, limiter activity).
+(section loudness, 1-5 kHz balance of each element against the lead, long-term spectrum, limiter activity,
+the 1-5 kHz margin of every call-and-response joke line over the band).
 
 It writes ``out/select_all_invaders/``: ``select_all_invaders.wav`` (24-bit), ``stems/`` (one
 24-bit WAV per vocal track and band stem; post-fader, pre-reverb), ``select_all_invaders.s2p.json``,
-``select_all_invaders.mp3`` (320 kbps, when ffmpeg is installed) and ``select_all_invaders.report.json``
+``select_all_invaders.mp3`` (320 kbps, when ffmpeg is installed; trimmed so its decoded true peak stays
+under the ceiling) and ``select_all_invaders.report.json``
 (the render report plus the analysis printed at the end: loudness per section, true peak, the
 vocal-to-band balance per section, the low-end balance, the long-term spectrum slope and the
 pitch accuracy of every vocal track).
@@ -74,93 +77,190 @@ SECTIONS = [
 
 # ------------------------------------------------------------------------------------------- the mix
 # Some parts get their own mixer channel for a section (a "track split", as in any DAW), so they can sit
-# differently there without fader automation:
-# * "AI Verses": the lead rides 2 dB lower in the two verses, where the half-time band is thin (it stuck
+# differently there without fader automation. A split channel inherits its source's channel settings
+# (pan, reverb send, mix_overrides) unless TRACK_MIX / mix_overrides name it.
+# * "AI Verses": the lead rides 2.5 dB lower in the two verses, where the half-time band is thin (it stuck
 #   out of it by ~9 dB in 1-5 kHz), which also gives the choruses more lift. In verse 2 the AI and the
-#   aliens then trade lines at about the same level.
+#   aliens then trade lines at about the same level ("Aliens Verse" keeps the aliens' verse-2 level).
+# * "AI Pre": the pre-choruses' call-and-response sits 1 dB under the chorus lead, so the hook entries lift
+#   (the second half of each pre-chorus was as loud as the chorus). The pickup "select" stays on the AI.
+# * "AI Bridge": the bridge is the densest run of lyric gags over the loudest, most crushed band, so the
+#   lead comes up 2.5 dB there (it sat only +2-3 dB over the band in 1-5 kHz).
+# * "AI Final": the final chorus has the biggest band and the most support vocals, so the lead rides 2.5 dB
+#   higher there (it was the section where the lead was least clear).
 # * "AI Breakdown": the AI's unguarded "loading humanity..." moment (bars 109-112) sits lower, in more
 #   reverb, so the breakdown drops away before the final chorus. The pickup "select" stays on the AI.
+# * "Aliens Bridge": the aliens' half of the bridge dialogue ("have you tried turning your planet...", "no, you
+#   are. Respectfully.") sits 1.5 dB over their other calls, against the crushed chaos band.
 # * "Aliens Hook": in the final chorus the aliens sing the hook two octaves under the AI; on its own
 #   channel it supports the lead instead of competing with it. Their answers ("click!", ワレワレハ) stay
 #   on the main Aliens channel, at full level.
+# * "Crowd Hook" (and its doubles): the crowd sings the final-chorus hook an octave under the AI, and
+#   whispers "hurry" in the breakdown; their shouts ("click!", "hey!") stay on the main crowd channels.
+# * "Harmony Final": the final chorus is harmonized throughout, so its harmony sits 2 dB lower there.
 SPLITS: list[dict] = [
     {"source": "AI", "name": "AI Verses", "start": 32.0, "end": 96.0, "skip_lyrics": ()},
     {"source": "AI", "name": "AI Verses", "start": 208.0, "end": 272.0, "skip_lyrics": ()},
+    {"source": "AI", "name": "AI Pre", "start": 96.0, "end": 127.5, "skip_lyrics": ()},
+    {"source": "AI", "name": "AI Pre", "start": 272.0, "end": 303.5, "skip_lyrics": ()},
+    {"source": "AI", "name": "AI Bridge", "start": 368.0, "end": 432.0, "skip_lyrics": ()},
     {"source": "AI", "name": "AI Breakdown", "start": 432.0, "end": 447.25, "skip_lyrics": ()},
+    {"source": "AI", "name": "AI Final", "start": 447.25, "end": 512.0, "skip_lyrics": ()},
+    {"source": "Aliens", "name": "Aliens Verse", "start": 208.0, "end": 272.0, "skip_lyrics": ()},
+    {"source": "Aliens", "name": "Aliens Bridge", "start": 368.0, "end": 416.0, "skip_lyrics": ()},
     {"source": "Aliens", "name": "Aliens Hook", "start": 447.0, "end": 500.0, "skip_lyrics": ("click",)},
+    {"source": "Crowd", "name": "Crowd Hook", "start": 446.0, "end": 512.0, "skip_lyrics": ("click", "hey")},
+    {"source": "Crowd 2", "name": "Crowd 2 Hook", "start": 446.0, "end": 512.0, "skip_lyrics": ("click", "hey")},
+    {"source": "Crowd 3", "name": "Crowd 3 Hook", "start": 446.0, "end": 512.0, "skip_lyrics": ("click", "hey")},
+    {"source": "Harmony", "name": "Harmony Final", "start": 447.0, "end": 512.0, "skip_lyrics": ()},
 ]
 
 # Vocal faders (dB), pans and reverb sends. The AI lead is the anchor at 0 dB, dead centre; everything
-# else supports it from the sides.
+# else supports it from the sides. The aliens and the crowd carry most of the jokes in the call-and-response
+# gaps (post-chorus, bridge, outro), so their main channels sit 2.5-5 dB higher than their supporting parts
+# (the verse-2 dialogue, the final-chorus hook); the second, bigger alien is loud enough that its slower
+# warble beats against the first alien in the ワレワレハ chants.
 TRACK_MIX: dict[str, dict] = {
-    "AI":           {"gain_db": 0.0, "pan": 0.0, "reverb_send": 0.22},
-    "AI Verses":    {"gain_db": -2.0, "pan": 0.0, "reverb_send": 0.26},
-    "AI Breakdown": {"gain_db": -2.5, "pan": 0.0, "reverb_send": 0.38},
-    "AI Double":    {"gain_db": -6.5, "pan": -0.35, "reverb_send": 0.22},
-    "Harmony":      {"gain_db": -6.5, "pan": 0.35, "reverb_send": 0.30},
-    "Aliens":       {"gain_db": -1.0, "pan": 0.25, "reverb_send": 0.30},
-    "Aliens Hook":  {"gain_db": -2.5, "pan": 0.25, "reverb_send": 0.30},
-    "Aliens 2":     {"gain_db": -7.0, "pan": -0.35, "reverb_send": 0.40},
-    "Crowd":        {"gain_db": -6.0, "pan": -0.60, "reverb_send": 0.35},
-    "Crowd 2":      {"gain_db": -6.0, "pan": 0.60, "reverb_send": 0.35},
-    "Crowd 3":      {"gain_db": -8.0, "pan": 0.25, "reverb_send": 0.35},
+    "AI":            {"gain_db": 0.0, "pan": 0.0, "reverb_send": 0.22},
+    "AI Verses":     {"gain_db": -2.5, "pan": 0.0, "reverb_send": 0.26},
+    "AI Pre":        {"gain_db": -1.0, "pan": 0.0, "reverb_send": 0.22},
+    "AI Bridge":     {"gain_db": 2.5, "pan": 0.0, "reverb_send": 0.22},
+    "AI Breakdown":  {"gain_db": -2.5, "pan": 0.0, "reverb_send": 0.38},
+    "AI Final":      {"gain_db": 2.5, "pan": 0.0, "reverb_send": 0.22},
+    "AI Double":     {"gain_db": -6.5, "pan": -0.35, "reverb_send": 0.22},
+    "Harmony":       {"gain_db": -6.5, "pan": 0.35, "reverb_send": 0.30},
+    "Harmony Final": {"gain_db": -8.0, "pan": 0.35, "reverb_send": 0.30},
+    "Aliens":        {"gain_db": 1.5, "pan": 0.25, "reverb_send": 0.30},
+    "Aliens Verse":  {"gain_db": -1.0, "pan": 0.25, "reverb_send": 0.30},
+    "Aliens Bridge": {"gain_db": 3.0, "pan": 0.3, "reverb_send": 0.30},
+    "Aliens Hook":   {"gain_db": -4.0, "pan": 0.25, "reverb_send": 0.30},
+    "Aliens 2":      {"gain_db": 0.5, "pan": -0.35, "reverb_send": 0.40},
+    "Crowd":         {"gain_db": -2.0, "pan": -0.60, "reverb_send": 0.35},
+    "Crowd 2":       {"gain_db": -2.0, "pan": 0.60, "reverb_send": 0.35},
+    "Crowd 3":       {"gain_db": -4.0, "pan": 0.25, "reverb_send": 0.35},
+    "Crowd Hook":    {"gain_db": -7.0, "pan": -0.60, "reverb_send": 0.35},
+    "Crowd 2 Hook":  {"gain_db": -7.0, "pan": 0.60, "reverb_send": 0.35},
+    "Crowd 3 Hook":  {"gain_db": -9.0, "pan": 0.25, "reverb_send": 0.35},
 }
 
 # Master / mix settings (MasterSettings fields, set with update_project). mix_overrides are keyed by
 # vocal track name or backing stem name ("drums snare" is the snare sub-stem of the "drums" kit).
-LEAD_EQ = [["peak", 600, -4.0, 0.9], ["peak", 3150, -2.5, 1.4], ["highshelf", 4500, 2.0, 0.7]]
+# lead EQ on top of the channel strip: its fundamental (A4-E5 = 440-660 Hz) piled up as a honky bump in the
+# long-term spectrum, the strip's 3.2 kHz presence bell stuck out of it as a narrow peak, and the voice fell
+# off a cliff above 3.8 kHz (5-8 dB under the band from 4 to 9 kHz), so: less 600 Hz, a softer 3.2 kHz, a
+# broad 4.8 kHz presence lift and a little air
+LEAD_EQ = [["peak", 600, -4.0, 0.9], ["peak", 3150, -2.5, 1.4], ["peak", 4800, 3.5, 0.9], ["highshelf", 9000, 2.0, 0.7]]
+# the lead's strip: the EQ above, a firmer de-harsher for the bright F5 vowels and a transient limiter for
+# the needle-like 't' / 'k' release bursts of the verse patter
+LEAD_STRIP = {"eq_add": LEAD_EQ, "deharsh": {"rel_db": -6.0, "max_cut_db": 5.0}, "crest_db": 12.0}
+# the aliens' low voice was the main source of 200-400 Hz mud (up to 47 % of the master there) and its
+# consonant band sat under the band in the bridge: less 280 Hz, more 2.6 kHz, and a tighter transient limit
+# (its buzzy pulse train peaks 16 dB over its loud level and set off the master limiter)
+ALIEN_EQ = [["peak", 280, -3.0, 1.0], ["peak", 2600, 2.0, 1.0]]
 MASTER: dict = {
-    "loudness_target": -11.0,
+    "loudness_target": -11.5,  # (-11 kept the master limiter over 1 dB for ~20 % of the final chorus)
     "ceiling_db": -1.0,
-    "glue": 0.45,              # a little lighter master glue keeps the verse / chorus contrast
-    "vocal_balance_db": 4.5,
+    "glue": 0.35,              # lighter master glue: at 0.45 it ate most of the final chorus' extra level (and
+                               # pumped); under 0.3 the limiter took over (over 1 dB for 13 % of the final chorus)
+    "vocal_balance_db": 5.2,   # the lead's 1-5 kHz level over the band in the choruses stays at about +4.7 dB
     "band_width": 1.3,         # the band was narrow (side 9-11 dB under mid): open the L/R guitars and synths
-    # master EQ (folded into every source): the default subsonic high-pass, a little 250 Hz warmth (every role
-    # preset scoops 250-450 Hz, which left a 4 dB hole in the long-term spectrum) and a softer air shelf
-    "master_eq": [["hp", 25, 0, 0.7071, 2], ["peak", 250, 1.5, 1.2], ["highshelf", 12000, 0.5, 0.7]],
-    "vocal_delay": 0.15,       # dotted-8th ping-pong on the vocals, ducked while they sing
+    # master EQ (folded into every source): the default subsonic high-pass, some 250 Hz warmth (every role
+    # preset scoops 250-450 Hz, which left a 3-4 dB hole in the long-term spectrum), a little less of the
+    # 630 Hz honk of the vocal fundamentals and a softer air shelf
+    "master_eq": [["hp", 25, 0, 0.7071, 2], ["peak", 250, 2.0, 1.2], ["peak", 630, -1.0, 1.4],
+                  ["highshelf", 12000, 0.5, 0.7]],
+    "vocal_delay": 0.3,        # dotted-8th ping-pong on the vocals: it blooms in the gaps and stops ...
+    "delay_duck_db": 8.0,      # ... and steps back while they sing
     "delay_beats": 0.75,
     "delay_feedback": 0.3,
     "mix_overrides": {
-        # lead EQ on top of the channel strip: its fundamental (A4-E5 = 440-660 Hz) piled up as a honky
-        # bump in the long-term spectrum, the strip's 3.2 kHz presence bell stuck out of it as a narrow
-        # peak, and the voice falls off a cliff above 4 kHz, so: less 600 Hz, a softer 3.2 kHz, more sheen
-        "AI": {"eq_add": LEAD_EQ}, "AI Verses": {"eq_add": LEAD_EQ},
+        "AI": LEAD_STRIP,  # (the split lead channels inherit it)
         "AI Breakdown": {"eq_add": LEAD_EQ, "delay": 1.4},
         "AI Double": {"eq_add": LEAD_EQ, "delay": 0.4},
         # delay sends (1 = default): the lead gets the full send, the gang shouts stay dry and punchy.
         # crest_db: the aliens' buzzy low pulse train peaks 16 dB over its loud level (the AI: 10 dB), and those
-        # spikes made the master limiter duck the whole mix by up to 5 dB; the shouts are peaky too
-        "Harmony": {"delay": 0.5}, "Aliens 2": {"delay": 0.8},
-        "Aliens": {"delay": 0.6, "crest_db": 10.0}, "Aliens Hook": {"delay": 0.3, "crest_db": 10.0},
+        # spikes made the master limiter duck the whole mix by up to 5 dB; the shouts are peaky too.
+        # Harmony: the 600 Hz cut of the lead EQ (its fundamentals were part of the 500-630 Hz honk)
+        "Harmony": {"delay": 0.5, "eq_add": [["peak", 600, -3.0, 0.9]]},
+        "Aliens": {"delay": 0.6, "crest_db": 8.0, "eq_add": ALIEN_EQ},
+        "Aliens 2": {"delay": 0.8, "eq_add": [["peak", 280, -3.0, 1.0]]},
+        # the final-chorus hook two octaves under the lead: out of the lead's 300 Hz body and 2.8 kHz bite
+        "Aliens Hook": {"delay": 0.3, "crest_db": 8.0, "eq_add": [["peak", 300, -2.5, 1.0], ["peak", 2800, -3.0, 1.0]]},
         "Crowd": {"delay": 0.0, "crest_db": 12.0}, "Crowd 2": {"delay": 0.0, "crest_db": 12.0},
         "Crowd 3": {"delay": 0.0, "crest_db": 12.0},
-        # band balance: the snare was the main competitor of the lead in 1-5 kHz and the brightest thing in
-        # the top octave; the half-time verses were thin, so their plucks, slap bass and chugs come up
-        "drums snare": {"gain_db": -2.0, "eq_add": [["peak", 3000, -2.0, 0.8], ["highshelf", 8000, -2.0, 0.7]]},
-        "pluck": {"gain_db": 6.0, "crest_db": 11.0},
-        "slap": {"gain_db": 1.5},
+        # band balance. The snare was the brightest, hissiest element of every section (45-70 % of the master's
+        # 5-9 kHz) and the lead's main rival in the presence band: less level and top (its spectrum rose
+        # 8-10 dB from 4 to 11 kHz), and a deeper vocal-keyed 2.6 kHz carve (3 dB instead of 1.2)
+        "drums snare": {"gain_db": -2.0, "carve": 1.0,
+                        "eq_add": [["peak", 3000, -2.0, 0.8], ["highshelf", 5500, -4.5, 0.7]]},
+        # the kick's 50-60 Hz was a bit boomy against the 80-250 Hz body of the mix, its beater click was the
+        # loudest high-frequency event of the verses, and the kick and the bass set off most of the master
+        # limiter's gain reduction: a little less of both, and the kick's transients held within 7 dB
+        "drums kick": {"gain_db": -1.0, "eq_add": [["lowshelf", 60, -1.5, 0.7], ["highshelf", 6000, -3.0, 0.7]],
+                       "crest_db": 7.0},
+        "bass": {"gain_db": -1.0, "crest_db": 10.0},
+        # the anti-phase (mostly side) cymbals and pad fell away in mono: narrower
+        "drums cymbals": {"width": 0.7},
+        # the half-time verses were thin, so their plucks, slap bass and chugs come up; the pluck's 200-800 Hz
+        # sat in the lead's fundamental range and its peaks (and the slap's pops) set off the limiter
+        "pluck": {"gain_db": 3.5, "crest_db": 9.0, "eq_add": [["peak", 550, -3.0, 1.0]]},
+        "slap": {"gain_db": 1.5, "crest_db": 12.0},
         "mute": {"gain_db": 2.0},
         # the chip-lead riff was level with the voices in the riff sections (the aliens' spam in the intro, the
-        # post-chorus calls, the aliens' one-star review in the outro), and the intro's radio static with it
-        "lead": {"gain_db": -3.5},
+        # post-chorus calls, the aliens' one-star review in the outro), and the intro's radio static with it.
+        # The chorus hook tags (chip lead, bell) overlapped the AI's phrase-end notes: they duck under the
+        # vocals (vocal-keyed, x 1.5 dB) and get out of the way as soon as the vocal stops; the power chords
+        # leave a little room at 1 kHz for the lead's held low notes
+        "lead": {"gain_db": -3.5, "duck": 3.0},
+        "bell": {"duck": 2.5},
+        "gtrL": {"eq_add": [["peak", 1000, -1.5, 1.0]]},
+        "gtrR": {"eq_add": [["peak", 1000, -1.5, 1.0]]},
         "fx": {"gain_db": -1.5},
         "mbox": {"gain_db": -2.0},
         # the final chorus is the only chorus with the pad and the low chip lead: a little more of both
-        "pad": {"gain_db": 3.0},
+        "pad": {"gain_db": 3.0, "width": 0.75},
         "leadlo": {"gain_db": 2.0},
-        # the kick's 50-60 Hz was a bit boomy against the 80-250 Hz body of the mix
-        "drums kick": {"eq_add": [["lowshelf", 60, -1.5, 0.7]]},
     },
 }
 
 
 # Section-level band tweaks, applied with set_backing(merge=true) on top of backing.json: velocity
-# multipliers for the parts of a section. The final chorus used the same band levels as choruses 1 and 2,
-# so it was barely louder after the master chain; its guitars, supersaws, drums and bass dig in harder.
+# multipliers for the parts of a section. (The drums and the bass have channel compressors, which undo about
+# two thirds of a velocity change; the keys, pads and guitars follow it.)
+# * The choruses barely lifted: the second half of the intro and of each pre-chorus were as loud and bright
+#   as the chorus, with more low end, so the band steps back there and the hook entries land (with the "AI Pre"
+#   split, and the intro's drums and bass now entering at bar 7, see backing.json).
+# * The final chorus used the same band levels as choruses 1 and 2, so it was barely louder after the master
+#   chain; its guitars, supersaws, chugs, pad, drums and bass dig in harder.
+# * The breakdown's pad and music box sat over the AI's "don't close the window".
+# * The joke sections (post-chorus calls, the bridge, the outro review) had their calls masked by the riff,
+#   the chaos drums and the crushed guitars.
 BAND_TWEAKS: dict[str, dict[str, float]] = {
-    "Final chorus": {"gtrL": 1.12, "gtrR": 1.12, "saws": 1.15, "drums": 1.06, "bass": 1.06},
+    "Intro": {"lead": 0.85, "bass": 0.85, "gtrL": 0.75, "gtrR": 0.75, "saws": 0.7},
+    "Pre-chorus 1": {"drums": 0.7, "bass": 0.75, "gtrL": 0.75, "gtrR": 0.75, "mute": 0.7, "pad": 0.75, "arp": 0.8},
+    "Post-chorus": {"lead": 0.7, "bell": 0.7, "drums": 0.8, "gtrL": 0.8, "gtrR": 0.8},
+    "Pre-chorus 2": {"drums": 0.7, "bass": 0.75, "gtrL": 0.75, "gtrR": 0.75, "mute": 0.7, "pad": 0.75, "arp": 0.8},
+    "Bridge": {"drums": 0.8, "gtrL": 0.75, "gtrR": 0.75, "chip": 0.75, "growl": 0.8, "saws": 0.8, "arp": 0.8},
+    "Breakdown": {"pad": 0.75, "mbox": 0.8},
+    "Final chorus": {"gtrL": 1.25, "gtrR": 1.25, "saws": 1.5, "mute": 1.15, "pad": 1.2, "drums": 1.12, "bass": 1.12},
+    "Outro": {"lead": 0.7, "leadlo": 0.8, "drums": 0.85, "gtrL": 0.85, "gtrR": 0.85},
 }
+
+
+def split_sources() -> dict[str, str]:
+    """Split channel name -> the track it was split from (resolved to the original track)."""
+    src = {sp["name"]: sp["source"] for sp in SPLITS}
+    return {name: (src[s] if s in src else s) for name, s in src.items()}
+
+
+def master_settings() -> dict:
+    """MASTER with every split channel inheriting its source's mix_overrides entry (unless it has its own)."""
+    m = json.loads(json.dumps(MASTER))
+    mo = m["mix_overrides"]
+    for name, source in split_sources().items():
+        if name not in mo and source in mo:
+            mo[name] = json.loads(json.dumps(mo[source]))
+    return m
 
 
 def tweak_sections(arrangement: dict, tweaks: dict[str, dict[str, float]]) -> list[dict]:
@@ -202,9 +302,13 @@ def split_track(s: Session, source: str, name: str, start: float, end: float, sk
         keep = {(n.onset, n.pitch) for n in moved}
         call_tool(s, "delete_notes", {"track": name, "ids": [n.id for n in dst.notes
                                                              if (n.onset, n.pitch) not in keep]})
-        tracks = s.project.tracks  # put the split channel right after its source in the mixer
+        tracks = s.project.tracks  # put the split channel after its source (and its earlier splits) in the mixer
         tracks.remove(dst)
-        tracks.insert(tracks.index(src) + 1, dst)
+        splits = {sp["name"] for sp in SPLITS}
+        pos = tracks.index(src) + 1
+        while pos < len(tracks) and tracks[pos].name in splits:
+            pos += 1
+        tracks.insert(pos, dst)
     call_tool(s, "delete_notes", {"track": source, "ids": [n.id for n in moved]})
     return len(moved)
 
@@ -232,9 +336,11 @@ def build_session(log=print) -> Session:
     for sp in SPLITS:
         moved = split_track(s, sp["source"], sp["name"], sp["start"], sp["end"], sp["skip_lyrics"])
         log(f"  split {moved} notes of {sp['source']} (beats {sp['start']:g}-{sp['end']:g}) to {sp['name']}")
+    names = {t.name for t in s.project.tracks}
     for name, mix in TRACK_MIX.items():
-        call_tool(s, "update_track", {"track": name, **mix})
-    call_tool(s, "update_project", {"master": MASTER})
+        if name in names:
+            call_tool(s, "update_track", {"track": name, **mix})
+    call_tool(s, "update_project", {"master": master_settings()})
     return s
 
 
@@ -325,7 +431,7 @@ def ltas(x: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray, float]:
     return centres, psd, slope
 
 
-LEAD_TRACKS = ("AI", "AI Verses", "AI Breakdown")  # the lead vocal (on two mixer channels)
+LEAD_TRACKS = ("AI", "AI Verses", "AI Pre", "AI Bridge", "AI Breakdown", "AI Final")  # the lead vocal (on several mixer channels)
 
 
 def analyse(project, res, start_bar: int, end_bar: int, with_pitch: bool = True) -> dict:
@@ -438,6 +544,30 @@ def print_summary(rep: dict, ana: dict, wall: float) -> None:
         print(f"\n{len(rep['warnings'])} engine warnings, e.g.: " + "; ".join(rep["warnings"][:3]))
 
 
+def _decoded_true_peak_db(path: Path, sr: int) -> float:
+    """True peak (dBTP) of an encoded file, decoded by ffmpeg."""
+    raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", str(path), "-f", "f32le", "-ac", "2", "-ar", str(sr),
+                          "-"], check=True, capture_output=True).stdout
+    return float(mixing.true_peak_db(np.frombuffer(raw, dtype=np.float32).reshape(-1, 2)))
+
+
+def write_mp3(wav: Path, mp3: Path, sr: int, ceiling_db: float) -> dict:
+    """Encode a 320 kbps MP3. The encoder's filtering adds inter-sample overshoot (the -1 dBTP WAV decoded at
+    -0.4 dBTP), so the MP3 is re-encoded with a small trim until its decoded true peak is under the ceiling."""
+    trim = 0.0
+    for _ in range(3):
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav)]
+        if trim < 0:
+            cmd += ["-af", f"volume={trim:.2f}dB"]
+        subprocess.run(cmd + ["-codec:a", "libmp3lame", "-b:a", "320k", "-metadata", "title=SELECT ALL INVADERS",
+                              "-metadata", "artist=Synth2 Vocal Studio", str(mp3)], check=True)
+        tp = _decoded_true_peak_db(mp3, sr)
+        if tp <= ceiling_db:
+            break
+        trim -= tp - ceiling_db + 0.1
+    return {"path": str(mp3), "true_peak_db": round(tp, 2), "trim_db": round(trim, 2)}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--sr", type=int, default=44100, help="sample rate (default 44100)")
@@ -498,13 +628,12 @@ def main(argv=None) -> int:
             shutil.rmtree(sd)
         res.save_stems(sd, bits=24)
         print(f"  wrote {len(res.stems)} stems to {sd}/")
+    mp3_info = None
     if not args.no_mp3 and not partial:
         if shutil.which("ffmpeg"):
-            mp3 = wav.with_suffix(".mp3")
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav), "-codec:a", "libmp3lame",
-                            "-b:a", "320k", "-metadata", "title=SELECT ALL INVADERS",
-                            "-metadata", "artist=Synth2 Vocal Studio", str(mp3)], check=True)
-            print(f"  wrote {mp3}")
+            mp3_info = write_mp3(wav, wav.with_suffix(".mp3"), res.sample_rate, project.master.ceiling_db)
+            print(f"  wrote {mp3_info['path']} (decoded true peak {mp3_info['true_peak_db']} dBTP, "
+                  f"trim {mp3_info['trim_db']} dB)")
         else:
             print("  ffmpeg not found: no mp3")
 
@@ -513,6 +642,8 @@ def main(argv=None) -> int:
     wall = time.perf_counter() - t_wall
     rep_out = {k: v for k, v in rep.items() if k != "tracks"}
     rep_out["tracks"] = [{k: v for k, v in t.items() if k != "phonemes"} for t in rep.get("tracks", [])]
+    if mp3_info:
+        rep_out["mp3"] = mp3_info
     (wav.with_suffix(".report.json")).write_text(json.dumps({"report": rep_out, "analysis": ana,
                                                              "wall_time_s": round(wall, 1)},
                                                             indent=1, ensure_ascii=False, default=str))

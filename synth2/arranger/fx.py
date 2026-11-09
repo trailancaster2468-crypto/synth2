@@ -71,7 +71,10 @@ def _env_ad(n, sr, attack, decay_tau):
 
 def render_fx(sound: str, dur: float, pitch: int | None, sr: int, rng: np.random.Generator,
               params: dict | None = None, beat_s: float = 0.357) -> np.ndarray:
-    """Render an FX one-shot of about ``dur`` seconds (tails may run longer) as stereo float32."""
+    """Render an FX one-shot of about ``dur`` seconds (tails may run longer) as stereo float32.
+
+    ``params`` may hold ``fade_in`` (s, default 0.001): a longer fade-in for a sound that starts the song
+    from digital silence (a 1 ms edge on noise reads as a click)."""
     p = params or {}
     if pitch is None:
         pitch = FX_SOUNDS[sound][1] or 72
@@ -86,7 +89,8 @@ def render_fx(sound: str, dur: float, pitch: int | None, sr: int, rng: np.random
     rms = float(np.sqrt(np.mean(out.astype(np.float64) ** 2)))
     if pk > 0:  # calibrated by loudness (with a peak cap): an FX at gain_db 0 sits just under the band
         out *= min(FX_RMS / max(rms, 1e-9), FX_PEAK / pk) * 10 ** (FX_TRIM_DB.get(sound, 0.0) / 20)
-    return fade_edges(out, sr, 0.001, 0.01)
+    fade_in = float(np.clip(float(p.get("fade_in", 0.001) or 0.001), 0.001, 0.5 * dur))
+    return fade_edges(out, sr, fade_in, 0.01)
 
 
 def _laser(dur, f0, sr, rng, p, beat_s):

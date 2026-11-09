@@ -199,9 +199,11 @@ def test_new_project_from_score_and_summary():
 
 def test_update_project_mix_settings(s):
     r = call_tool(s, "update_project", {"master": {"loudness_target": -10.5, "vocal_delay": 0.2, "band_width": 1.2,
+                                                   "delay_duck_db": 9.0,
                                                    "mix_overrides": {"Lead": {"gain_db": 1.0}, "bass": {"gain_db": -2}}}})
     m = r["master"]
     assert m["loudness_target"] == -10.5 and m["vocal_delay"] == 0.2 and m["band_width"] == 1.2
+    assert m["delay_duck_db"] == 9.0 and s.project.master.delay_duck_db == 9.0
     # mix_overrides merge per key; a null entry removes it; null for the whole dict clears it
     r = call_tool(s, "update_project", {"master": {"loudness_target": None,
                                                    "mix_overrides": {"bass": None, "drums snare": {"crest_db": 9}}}})

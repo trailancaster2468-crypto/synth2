@@ -137,6 +137,17 @@ def test_every_preset_renders_cleanly():
         assert np.abs(y[-1]).max() < 1e-3 and np.abs(y[0]).max() < 0.05, name
 
 
+def test_fx_fade_in_param():
+    """``params.fade_in`` gives a sound that starts the song from silence a longer fade-in (default 1 ms)."""
+    hard = render_fx("radio", 1.0, None, SR, np.random.default_rng(4), {}, 0.36)
+    soft = render_fx("radio", 1.0, None, SR, np.random.default_rng(4), {"fade_in": 0.02}, 0.36)
+    head = slice(0, int(0.005 * SR))
+    rms = lambda x: float(np.sqrt(np.mean(np.square(x[head], dtype=np.float64))))  # noqa: E731
+    assert rms(soft) < 0.2 * rms(hard)
+    tail = slice(int(0.1 * SR), int(0.5 * SR))
+    assert np.allclose(soft[tail], hard[tail])
+
+
 def test_fx_sounds_and_processing_effects():
     rng = np.random.default_rng(3)
     for sound in FX_SOUNDS:

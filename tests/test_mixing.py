@@ -359,6 +359,23 @@ def test_band_ducks_and_carves_under_the_vocals(monkeypatch):
     assert abs(rms(0.3, 0.9) - rms(2.75, 2.95)) < 0.5  # back to normal after the hold and release
 
 
+def test_delay_duck_depth_setting():
+    """MasterSettings.delay_duck_db: the vocal delay return dips while the vocals sing, and only then."""
+    n = SR * 2
+    vox = _sine(330, 2, SR, 0.2) * (np.arange(n) < SR)  # sings for 1 s, then a gap
+    srcs = [M.Source("v", "Vox", "vocal", vox.astype(np.float32), lowest_hz=300.0, delay_send=1.0),
+            M.Source("b", "keys", "backing", (np.random.default_rng(2).standard_normal((n, 2)) * 0.05).astype(np.float32),
+                     role="keys")]
+    wet = {}
+    for d in (0.0, 12.0):
+        st = MasterSettings(vocal_delay=0.3, delay_duck_db=d)
+        wet[d] = M.mix_sources(srcs, SR, band_mode=True, settings=st, bpm=120, reverb_wet=0.0).wet.astype(np.float64)
+    sing, gap = slice(int(0.5 * SR), int(0.9 * SR)), slice(int(1.4 * SR), int(1.8 * SR))
+    e = lambda x, sl: float(np.sum(x[sl] ** 2))  # noqa: E731
+    assert e(wet[12.0], sing) < 0.25 * e(wet[0.0], sing)
+    assert e(wet[12.0], gap) > 0.5 * e(wet[0.0], gap)
+
+
 def test_mix_is_independent_of_thread_count():
     rng = np.random.default_rng(5)
     n = SR * 2

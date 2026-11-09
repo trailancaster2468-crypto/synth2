@@ -91,7 +91,7 @@ Each line in this section is one bar.
 
 ## Bridge (bars 93-108)
 [AI] Re-re-re-reboot! (ALIENS: Re-re-re-reply all!)
-[ALIENS] Have you tried turning your planet off and on again? (AI, at the same time, same rhythm: Have you tried turning your spaceship off and on again?)
+[ALIENS] Have you tried turning your planet off and on again? (AI, cutting in on the noun at the same moment: ...your SPACESHIP off and on again?)
 [AI] Patch notes: Earth is now in beta. Known issue: everyone
 [HUMANS] Who is the invader? Who is the invader? (ALIENS: ナンデ? ナンデ?)
 [AI] You're the invader! (ALIENS: No, you are. Respectfully.)
@@ -153,7 +153,7 @@ Line 1 is bars 129-130 and line 2 is bars 131-132, fading. Line 3 is the bar 133
 5. **Pre-chorus 2:** the aliens turn IT tactics back on Earth ("your planet will restart in five minutes"). The AI hits snooze with "ハイハイ... remind me tomorrow". The aliens claim ワレワレハ ニンゲン ダ, "we are human".
 6. **Bridge:** total confusion.
    - Both sides stutter, reboot and hit reply-all.
-   - Both read the same IT-support script at each other at the same moment (planet / spaceship). It is a callback to the AI's own "Have you tried..." in verse 2.
+   - Both read the same IT-support script at each other: the aliens start it, and the AI cuts in on the noun at the same moment (planet / SPACESHIP), then finishes the line with them. It is a callback to the AI's own "Have you tried..." in verse 2.
    - Earth goes into beta, with "known issue: everyone".
    - "Select all humans" finds no squares, and the AI's search ends on itself: "select all... me?"
 7. **Breakdown:** the AI's one unguarded moment: "Loading humanity... ninety nine percent... don't close the window".

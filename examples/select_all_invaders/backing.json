@@ -20,14 +20,14 @@
     "kick": {
      "pitch": 54,
      "decay": 0.28,
-     "click": 0.75,
+     "click": 0.55,
      "drive": 0.45,
      "level": 0.43
     },
     "snare": {
      "tone": 205,
-     "snappy": 0.8,
-     "crack": 0.7,
+     "snappy": 0.6,
+     "crack": 0.5,
      "noise_decay": 0.13,
      "drive": 0.35,
      "brightness": 0.5
@@ -128,7 +128,7 @@
   "mute": {
    "preset": "gtr_mute",
    "gain_db": -5,
-   "pan": 0.35
+   "pan": -0.35
   },
   "saws": {
    "preset": "supersaw",
@@ -507,12 +507,18 @@
   "hook_tags": {
    "kind": "notes",
    "bars": 16,
-   "score": "r w r w r w r w | r w r w r w r h A5 s A5 s r s A6 s r s A5 s C6 e | r w r w r w r h A5 s A5 s r s A6 s r s A5 s C6 e | r w r w r w r h A5 s B5 s C6 s D6 s E6 s G6 s A6 e"
+   "score": "r w r w r w r w | r w r w r w r h. A5 s A6 s A5 s C6 s | r w r w r w r h. A5 s A6 s A5 s C6 s | r w r w r w r h A5 s B5 s C6 s D6 s E6 s G6 s A6 e"
   },
   "loading_box": {
    "kind": "notes",
    "bars": 4,
    "score": "A6 q E6 q C6 q E6 q | A6 q F6 q C6 q F6 q | G6 q D6 q B5 q D6 q | G#6 q E6 q B5 e B5 e B5 s B5 s B5 s B5 s"
+  },
+  "riff_post_calls": {
+   "kind": "notes",
+   "bars": 4,
+   "comment": "riff_post with the second half of every bar left open for the post-chorus calls",
+   "score": "A5 e. E6 e. D6 e  r h | A5 s A5 s r s A6 s r s A5 s C6 e  r h | B5 e. G6 e. E6 e  r h | G#5 s G#5 s r s G#6 s r s G#5 s B5 e  r h"
   }
  },
  "sections": [
@@ -575,14 +581,14 @@
     "drums": {
      "pattern": "four",
      "bars": [
-      5,
+      7,
       8
      ]
     },
     "bass": {
      "pattern": "b_bounce",
      "bars": [
-      5,
+      7,
       8
      ]
     },
@@ -625,7 +631,10 @@
      "bar": 1,
      "beat": 1,
      "beats": 16,
-     "gain_db": -3
+     "gain_db": -3,
+     "params": {
+      "fade_in": 0.02
+     }
     },
     {
      "type": "filter",
@@ -767,7 +776,7 @@
     "mute": {
      "pattern": "mute_off",
      "bars": [
-      17,
+      9,
       24
      ],
      "velocity": 0.8
@@ -1216,10 +1225,10 @@
     "bass": "b_post",
     "gtrL": "ch_post",
     "gtrR": "ch_post",
-    "lead": "riff_post",
-    "leadlo": "riff_post",
+    "lead": "riff_post_calls",
+    "leadlo": "riff_post_calls",
     "bell": {
-     "pattern": "riff_post",
+     "pattern": "riff_post_calls",
      "velocity": 0.6
     }
    },
@@ -1840,7 +1849,8 @@
       "bars": [
        107,
        107
-      ]
+      ],
+      "velocity": 0.85
      },
      {
       "pattern": "four",
@@ -2126,6 +2136,15 @@
      "except": [
       "fx"
      ]
+    },
+    {
+     "bar": 108,
+     "beat": 4.9,
+     "beats": 0.0625,
+     "parts": "all",
+     "except": [
+      "fx"
+     ]
     }
    ]
   },
@@ -2179,7 +2198,7 @@
      "bar": 111,
      "beat": 1,
      "beats": 8,
-     "gain_db": -3
+     "gain_db": -6
     },
     {
      "type": "fx",
@@ -2188,6 +2207,17 @@
      "beat": 3,
      "beats": 2,
      "gain_db": -3
+    }
+   ],
+   "stops": [
+    {
+     "bar": 112,
+     "beat": 4.5,
+     "beats": 0.5,
+     "parts": "all",
+     "except": [
+      "fx"
+     ]
     }
    ]
   },
@@ -2220,16 +2250,9 @@
    "parts": {
     "drums": [
      {
-      "pattern": "four",
-      "bars": [
-       113,
-       120
-      ]
-     },
-     {
       "pattern": "four_big",
       "bars": [
-       121,
+       113,
        128
       ]
      }
@@ -2258,7 +2281,7 @@
     "mute": {
      "pattern": "mute16",
      "bars": [
-      121,
+      113,
       128
      ],
      "velocity": 0.85
@@ -2381,6 +2404,28 @@
      "bar": 121,
      "beat": 1,
      "gain_db": -9
+    }
+   ],
+   "stops": [
+    {
+     "bar": 124,
+     "beat": 1,
+     "beats": 1,
+     "parts": "all"
+    },
+    {
+     "bar": 128,
+     "beat": 3,
+     "beats": 2,
+     "parts": [
+      "gtrL",
+      "gtrR",
+      "saws",
+      "mute",
+      "pad",
+      "bass",
+      "arp"
+     ]
     }
    ]
   },

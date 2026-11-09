@@ -31,7 +31,7 @@ B4 e typing{consonant_length=0.55}  G#4 e +  B4 e what  B4 e is  B4 e going  D5 
 A4 e the  C5 q mothership  C5 e +  A4 e +  A4 e is  E5 e beaming  D5 e +  |
 C5 e down  C5 e a  E5 e message  D5 e +  C5 e from  B4 e the  E5 e sky  r e  |
 C5 e I  C5 e sent  C5 e it  C5 s to{consonant_length=0.55}  C5 s the  F5 q spam  C5 e folder  A4 e +  |
-B4 e unread  B4 q +  G#4 e and  B4 e said  E5 e goodbye  B4 e +  r e  |
+B4 e unread  B4 q +  G#4 e and  B4 e said  B4 e goodbye  E5 e +  r e  |
 C5 e they  C5 e knocked  C5 e politely{consonant_length=0.55}  E5 q +  D5 e +  C5 e so  B4 e I  |
 C5 e built  C5 e a  E5 e cookie  D5 e +  C5 e banner  B4 e +  A4 e wall  r e  |
 C5 e accept  C5 e +{consonant_length=0.55}  F5 q all  C5 e reject  C5 e +  A4 q all  |
@@ -56,12 +56,12 @@ B4 e verify  C5 e +  D5 e +  E5 e you're  G5 e human  D5 e +  r e  A4 e select  
 # ----- Chorus 1 (bars 33-48: (F G Em Am) x3 | Dm E Am Am)
 @ 128    # bar 33: hook "se-LECT ALL in-VA-ders!"
 C5 q. +  F5 q. all  E5 e invaders  D5 q +  B4 q +  r e  r q  B4 e [eh v]  B4 e [r iy]  |
-E5 q square  D5 e with  B4 e a  E5 q UFO  D5 q +  |  C5 h +  r q  r e  A4 e select  |
+E5 q square  D5 e with  B4 e a  E5 q [y uw]  D5 q [eh f]  |  C5 h [ow]  r q  r e  A4 e select  |
 C5 q. +  F5 q. all  E5 e invaders  D5 q +  B4 q +  r e  r q  B4 e does  B4 e the  |
 E5 e corner  E5 e +  E5 e of  D5 e the  B4 q saucer  D5 q +  |  E5 h. count  r q  |
 C5 q prove  C5 e you're  F5 q. not  E5 e a  D5 q robot  B4 q +  r e  r h  |
 E5 q funny  B4 q +  r q  B4 e neither  B4 e +  |  B4 q can  A4 h I{vibrato_depth=0}  r e  A4 e select  |
-D5 q. +  F5 q. all  E5 e invaders  E5 q +  B4 q +  r e  r q  C5 e have  D5 e a  |
+D5 q. +  F5 q. all  E5 e invaders  E5 q +  B4 q +  r e  r q  B4 e have  D5 e a  |
 E5 q nice  C5 e apocalypse  E5 q +  D5 e +  A4 q+h +  r h  |
 
 # ----- Post-chorus (bars 49-52: Am F G E): the crowd clicks, everyone calls the buttons
@@ -101,14 +101,15 @@ C5 q. +  F5 q. all  E5 e invaders  D5 q +  B4 q +  r e  r q  B4 e does  B4 e the
 E5 q guy  E5 e who  E5 e never  D5 e +  B4 q. blinks  |  E5 h. count  r q  |
 C5 q prove  C5 e you're  F5 q. not  E5 e a  D5 q robot  B4 q +  r e  r h  |
 E5 q funny  B4 q +  r q  B4 e neither  B4 e +  |  B4 q can  A4 h they{vibrato_depth=0}  r e  A4 e select  |
-D5 q. +  F5 q. all  E5 e invaders  E5 q +  B4 q +  r e  r q  C5 e have  D5 e a  |
+D5 q. +  F5 q. all  E5 e invaders  E5 q +  B4 q +  r e  r q  B4 e have  D5 e a  |
 E5 q nice  C5 e apocalypse  E5 q +  D5 e +  A4 q+h +  r h  |
 
 # ----- Bridge (bars 93-108: Bb Am Bb Am | Gm A Dm E | F F#dim G G#dim | Am Bb B E): chaos
 @ 368    # bar 93 (Bb): stutter
 D5 e [r iy]  D5 e [r iy]  D5 e [r iy]  D5 e reboot  F5 q +  r q  |
-@ 376    # bar 95 (Bb) - bar 96 (Am): same rhythm as the aliens, who sing "planet"
-D5 e have  D5 e you  D5 e tried  F5 e turning{consonant_length=0.55}  D5 e +  D5 e your  Bb4 e spaceship  D5 e +{consonant_length=0.55}  |
+@ 376    # bar 95 (Bb) - bar 96 (Am): the aliens read the IT script solo; the AI cuts in on the noun
+#          ("your SPACESHIP" over their "your planet") and finishes the line with them
+r h  r e  D5 e your  Bb4 e spaceship{velocity=1.15}  D5 e +{consonant_length=0.55}  |
 C5 e off  C5 e and  E5 e on  D5 e again  C5 q +  r q  |
 D5 e patch  D5 q notes  Bb4 e earth  Bb4 e is  D5 e now  D5 e in  D5 e beta  |
 E5 e +  E5 e known  C#5 e issue  C#5 e +  E5 e everyone  E5 e +  A4 q +  |
@@ -119,7 +120,7 @@ D5 e who  D5 e is  D5 e who  D5 e and  D5 e who  D5 e is  G5 e you  D5 e and  |
 D5 e who  D5 e is  F5 e human  F5 e +  r e  F5 q. who  |
 A4 e select  C5 q +  E5 q all  D5 e humans  C5 q +  |
 @ 424    # bar 107 (B) - bar 108 (E)
-F#5 e no  F#5 e squares  B4 q found  F#5 e no  F#5 e squares  B4 q found  |
+F#5 e no  F#5 q squares{consonant_length=0.6}  B4 e found  F#5 e no  F#5 q squares{consonant_length=0.6}  B4 e found  |
 G#4 e select  B4 e +  E5 q all  r e  E5 q. me{velocity=0.8}  |
 
 # ----- Breakdown (bars 109-112: Am F G E): near silence, soft (see the curves below)
@@ -137,13 +138,13 @@ C#5 e the  F#5 q one  E5 e that's  C#5 e just{consonant_length=0.55}  C#5 e a  F
 D5 q prove  D5 e you're  G5 q. not  F#5 e a  E5 q robot  C#5 q +  r e  r h  |
 F#5 q funny  C#5 q +  r q  C#5 e neither  C#5 e +  |  C#5 q can  B4 h you{vibrato_depth=0}  r e  B4 e select  |
 # the climax: B5 on "ALL"
-E5 q. +  B5 q. all{vibrato_depth=0.25}  G5 e invaders  F#5 q +  C#5 q +  r e  r q  D5 e so  D5 e I  |
+E5 q. +  B5 q. all{vibrato_depth=0.25}  G5 e invaders  F#5 q +  C#5 q +  r e  r q  C#5 e so  D5 e I  |
 F#5 q ticked  E5 e the  D5 q. box  C#5 e for  B4 q+h. you  r e  |
 
 # ----- Outro (bars 129-134: Bm G A F# | Bm hit | silence)
 @ 512    # bar 129 (Bm) - bar 130 (G)
 D5 e thank  D5 e you  D5 e for  F#5 e choosing  F#5 e +  D5 q earth  B4 e please  |
-B4 e rate  B4 e your  B4 e apocalypse  D5 e +  B4 e +  D5 e +  r q  |
+B4 e rate  B4 s your  B4 s apocalypse  D5 s +  B4 s +  D5 e +  r h  |
 @ 528    # bar 133 (Bm hit): the last word
 F#5 e sorry  D5 e +  r e  B4 e your  B4 e war  B4 s auto  B4 s +  B4 e renews  B4 e +  |
 
@@ -322,8 +323,8 @@ D4 q prove  D4 e you're  G4 q. not  F#4 e a  E4 q robot  C#4 q +  r e  E4 e. hey
 @ 495.5
 B3 e select  |  E4 q. +  G4 q. all  E4 e invaders  F#4 q +  C#4 q +  r e  F#4 e. click
 # outro
-@ 518.75 # bar 130, beat 3.75 (G)
-D4 e. five  G4 e stars{consonant_length=0.55}  |
+@ 518.5  # bar 130, beat 3.5 (G): in the gap after "apocalypse"
+D4 e five  G4 q stars{consonant_length=0.55}  |
 curve: pitchDelta 318.05:0 318.2:0 318.7:350 318.8:0 (linear)
 curve: voicing 446.4:1 446.5:0 447.4:0 447.5:1 (linear)
-curve: loudness 446.4:0 446.5:5 447.4:5 447.5:0 (linear)
+curve: loudness 446.4:0 446.5:-4 447.4:-4 447.5:0 (linear)
