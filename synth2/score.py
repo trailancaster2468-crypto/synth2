@@ -21,12 +21,18 @@ Example::
 Grammar summary
 ---------------
 * Header lines ``title:``, ``tempo:``/``bpm:``, ``time:``, ``key:``,
-  ``sample_rate:`` and ``master: gain=0 room=0.55 wet=1 normalize=true limiter=true``.
+  ``sample_rate:``, ``engine:`` (the singing engine of the whole project:
+  ``formant``, ``neural`` or ``neural:<voicebank id>``; ``auto`` or no line =
+  the best installed engine) and
+  ``master: gain=0 room=0.55 wet=1 normalize=true limiter=true``.
 * ``track: NAME key=value ...`` starts a track.  Options: ``voice``, ``style``
   (defaults to the voice's own style), ``lang``, ``gain`` (dB), ``pan`` (-1..1),
-  ``reverb`` (send 0..1), ``mute``, ``solo``, ``seed``, ``voice.<field>=v``
-  (voice tweaks such as ``voice.breathiness=0.3``) and ``style.<field>=v``
-  (expression-style overrides such as ``style.vibrato_depth=1.3``).
+  ``reverb`` (send 0..1), ``mute``, ``solo``, ``seed``, ``engine`` (this track's
+  engine, same values as the header), ``voice.<field>=v`` (voice tweaks such as
+  ``voice.breathiness=0.3``; ``voice.neural.<name>=v`` tunes the neural engine,
+  e.g. ``voice.neural.gender=0.2`` or ``voice.neural.fx.alien=0.6``) and
+  ``style.<field>=v`` (expression-style overrides such as
+  ``style.vibrato_depth=1.3``).
 * A note is ``PITCH DURATION LYRIC``.  ``PITCH``: note name (``C4``, ``F#3``,
   ``Bb5``) or MIDI number; ``r`` is a rest (``r DURATION``).  ``DURATION``: any
   :func:`synth2.timing.parse_duration` token (``w h q e s t``, dots ``q.``,
@@ -61,9 +67,9 @@ __all__ = [
     "parse_snippet", "notes_to_score", "duration_token",
 ]
 
-HEADER_KEYS = ("title", "tempo", "bpm", "time", "meter", "key", "sample_rate", "master")
+HEADER_KEYS = ("title", "tempo", "bpm", "time", "meter", "key", "sample_rate", "engine", "master")
 TRACK_OPTIONS = ("voice", "style", "lang", "language", "gain", "gain_db", "pan", "reverb", "reverb_send",
-                 "mute", "solo", "seed", "voice.<field>", "style.<field>")
+                 "mute", "solo", "seed", "engine", "voice.<field>", "voice.neural.<name>", "style.<field>")
 INTERPOLATIONS = ("linear", "cubic", "step")
 DEFAULT_LYRIC = "la"
 
@@ -74,6 +80,10 @@ _BAR_RE = re.compile(r"^[|:]*\|[|:]*$")
 _SAFE_WORD_RE = re.compile(r"^[^\s\"\[\]{}#@|]+$")
 _SAFE_NAME_RE = re.compile(r"^[\w.\-'()!?,&/+]+(?: [\w.\-'()!?,&/+]+)*$")
 _SAFE_VALUE_RE = re.compile(r"^[A-Za-z_][\w.\-]*$")
+# an engine spec that needs no quotes: formant, neural, neural:<voicebank id>
+_SAFE_ENGINE_RE = re.compile(r"^[A-Za-z]+(?::[\w.\-]+)?$")
+# voice parameters of the neural engine: neural.gender, neural.fx.alien, ...
+_NEURAL_PARAM_RE = re.compile(r"^neural(?:\.[A-Za-z_][\w\-]*)+$")
 _EPS = 1e-7
 
 
@@ -244,6 +254,17 @@ def _parse_number(tok: str, what: str, lineno, raw) -> float:
     return v
 
 
+def _parse_engine(v: str, lineno, tok, raw) -> str:
+    """The canonical engine spec for a header or track value (``""`` for auto)."""
+    from .engine.backend import normalize_engine
+
+    spec = _unquote(v, lineno, raw)
+    try:
+        return normalize_engine(spec)
+    except ValueError as exc:
+        raise ScoreError(str(exc), lineno, tok, raw) from None
+
+
 def _parse_bool(v: str, what: str, lineno, raw) -> bool:
     low = v.lower()
     if low in ("1", "true", "yes", "on"):
@@ -384,7 +405,7 @@ class _Parser:
         if key in ("tempo", "bpm"):
             self.tempo_line(value, lineno, raw)
             return
-        if key in ("title", "time", "meter", "key", "sample_rate", "master"):
+        if key in ("title", "time", "meter", "key", "sample_rate", "engine", "master"):
             if self.mode == "snippet":
                 raise ScoreError(f"'{key}:' is a score header and is not allowed in a note snippet; set it with "
                                  f"update_project instead", lineno, f"{key}:", raw)
@@ -421,6 +442,8 @@ class _Parser:
             if not 8000 <= sr <= 192000:
                 raise ScoreError("sample_rate must be between 8000 and 192000", lineno, value, raw)
             p.sample_rate = sr
+        elif key == "engine":
+            p.engine = _parse_engine(value, lineno, value, raw)
         elif key == "master":
             self.master_line(value, lineno, raw)
 
@@ -491,9 +514,10 @@ class _Parser:
         for k, (v, tok) in opts.items():
             if k.startswith("voice."):
                 f = k[6:]
-                if f not in voice_fields:
-                    raise ScoreError(f"unknown voice parameter {f!r}; valid: {', '.join(sorted(voice_fields))}",
-                                     lineno, tok, raw)
+                if f not in voice_fields and not _NEURAL_PARAM_RE.match(f):
+                    raise ScoreError(f"unknown voice parameter {f!r}; valid: {', '.join(sorted(voice_fields))}, "
+                                     f"and neural.<name> for the neural engine (e.g. neural.gender, "
+                                     f"neural.fx.alien)", lineno, tok, raw)
                 t.voice_params[f] = _parse_number(v, k, lineno, raw)
             elif k.startswith("style."):
                 f = k[6:]
@@ -536,6 +560,8 @@ class _Parser:
                 t.solo = _parse_bool(v, k, lineno, raw)
             elif k == "seed":
                 t.seed = int(_parse_number(v, k, lineno, raw))
+            elif k == "engine":
+                t.engine = _parse_engine(v, lineno, tok, raw)
             else:
                 raise ScoreError(f"unknown track option {k!r}; valid options: {', '.join(TRACK_OPTIONS)}",
                                  lineno, tok, raw)
@@ -923,6 +949,10 @@ def _value_token(s: str) -> str:
     return s if s and _SAFE_VALUE_RE.match(s) else _quote(s)
 
 
+def _engine_token(spec: str) -> str:
+    return spec if _SAFE_ENGINE_RE.match(spec) else _quote(spec)
+
+
 def notes_to_score(notes: list[Note], start_beat: float = 0.0, beats_per_bar: float = 4.0) -> list[str]:
     """Serialise notes as score lines (one line per bar), starting from position ``start_beat``."""
     lines: list[str] = []
@@ -983,6 +1013,8 @@ def _track_line(t: Track, index: int) -> str:
         parts.append("solo=true")
     if t.seed != index * 7919 + 17:
         parts.append(f"seed={t.seed}")
+    if t.engine:
+        parts.append(f"engine={_engine_token(t.engine)}")
     for k, v in t.voice_params.items():
         parts.append(f"{k}={_num(v)}" if k.startswith("style.") else f"voice.{k}={_num(v)}")
     return " ".join(parts)
@@ -1002,6 +1034,8 @@ def project_to_score(project: Project, tracks: list[Track] | None = None) -> str
     out.append(f"key: {p.key if key_safe else _name_token(p.key)}")
     if p.sample_rate != 44100:
         out.append(f"sample_rate: {p.sample_rate}")
+    if p.engine:
+        out.append(f"engine: {_engine_token(p.engine)}")
     m, d = p.master, MasterSettings()
     if m != d:
         out.append(f"master: gain={_num(m.gain_db)} room={_num(m.reverb_room)} wet={_num(m.reverb_wet)} "

@@ -362,3 +362,101 @@ def test_track_subset_keeps_seed():
     assert parse_score(project_to_score(p, [c])).tracks[0].seed == 17
     assert [t.seed for t in parse_score(project_to_score(p, [b, c])).tracks] == [b.seed, 17]
     assert [t.seed for t in parse_score(project_to_score(p)).tracks] == [t.seed for t in p.tracks]
+
+
+# ---- engines ------------------------------------------------------------------------------------
+
+ENGINE_SCORE = """\
+title: Engines
+tempo: 120
+engine: Neural: qixuan
+track: Lead voice=aurora engine=formant voice.neural.gender=0.2 voice.neural.fx.alien=0.6 voice.breathiness=0.3
+C4 q la  D4 q la
+track: Bank engine="neural:My Bank"
+E4 q la
+track: Auto engine=AUTO voice.neural.level_db=-3
+G4 q la
+"""
+
+
+def test_engine_header_and_track_attribute():
+    p = parse_score(ENGINE_SCORE)
+    assert p.engine == "neural:qixuan"                    # stored in its canonical spelling
+    lead, bank, auto = p.tracks
+    assert lead.engine == "formant" and bank.engine == "neural:My Bank"
+    assert auto.engine == ""                               # auto is "not set"
+    assert lead.voice_params == {"neural.gender": 0.2, "neural.fx.alien": 0.6, "breathiness": 0.3}
+    assert auto.voice_params == {"neural.level_db": -3.0}
+    plain = parse_score("title: x\ntempo: 100\ntrack: A\nC4 q la")
+    assert plain.engine == "" and plain.tracks[0].engine == ""
+    assert parse_score("engine: auto\ntrack: A\nC4 q la").engine == ""
+    assert parse_score('engine: "neural:My Bank"\ntrack: A\nC4 q la').engine == "neural:My Bank"
+    assert parse_score("engine: neural:My Bank  # the header takes the rest of the line\ntrack: A\nC4 q la"
+                       ).engine == "neural:My Bank"
+
+
+def test_engine_round_trip():
+    p = parse_score(ENGINE_SCORE)
+    text = project_to_score(p)
+    lines = text.splitlines()
+    assert "engine: neural:qixuan" in lines
+    lead = next(ln for ln in lines if ln.startswith("track: Lead"))
+    assert " engine=formant" in lead
+    assert " voice.neural.gender=0.2" in lead and " voice.neural.fx.alien=0.6" in lead
+    assert ' engine="neural:My Bank"' in next(ln for ln in lines if ln.startswith("track: Bank"))
+    assert "engine" not in next(ln for ln in lines if ln.startswith("track: Auto"))
+    p2 = parse_score(text)
+    assert _strip_ids(p2.to_dict()) == _strip_ids(p.to_dict())
+    assert project_to_score(p2) == text
+    # an unset engine writes nothing, so older scores are unchanged
+    assert "engine" not in project_to_score(parse_score("title: x\ntempo: 100\ntrack: A\nC4 q la"))
+    # a header bank id that needs quotes
+    p.engine = "neural:My Bank"
+    text = project_to_score(p)
+    assert 'engine: "neural:My Bank"' in text.splitlines()
+    assert parse_score(text).engine == "neural:My Bank"
+
+
+def test_engine_survives_project_json_and_s2s_files(tmp_path):
+    p = parse_score(ENGINE_SCORE)
+    path = tmp_path / "song.s2s"
+    path.write_text(project_to_score(p), encoding="utf-8")
+    q = Project.load(path)
+    assert q.engine == "neural:qixuan" and [t.engine for t in q.tracks] == ["formant", "neural:My Bank", ""]
+    assert q.tracks[0].voice_params["neural.fx.alien"] == 0.6
+    r = Project.from_json(q.to_json())
+    assert r.tracks[0].voice_params == p.tracks[0].voice_params and r.tracks[1].engine == "neural:My Bank"
+
+
+@pytest.mark.parametrize("text, line, token, fragment", [
+    ("title: x\nengine: vocaloid\ntrack: A\nC4 q la", 2, "vocaloid", "unknown engine"),
+    ("engine: formant:x\ntrack: A\nC4 q la", 1, "formant:x", "unknown engine"),
+    ("title: x\ntrack: A engine=neural:\nC4 q la", 2, "engine=neural:", "neural:<voicebank id>"),
+    ("track: A engine=diffsinger\nC4 q la", 1, "engine=diffsinger", "unknown engine"),
+    ('engine: "neural:x\ntrack: A\nC4 q la', 1, '"neural:x', "quoted string"),
+    ("track: A voice.neural.gender=abc\nC4 q la", 1, "abc", "expected a number"),
+    ("track: A voice.neural.gender=nan\nC4 q la", 1, "nan", "finite"),
+    ("track: A voice.neural=1\nC4 q la", 1, "voice.neural=1", "unknown voice parameter"),
+    ("track: A voice.neural..x=1\nC4 q la", 1, "voice.neural..x=1", "unknown voice parameter"),
+    ("track: A voice.neuralx.gender=1\nC4 q la", 1, "voice.neuralx.gender=1", "neural.<name>"),
+])
+def test_engine_errors_have_line_and_token(text, line, token, fragment):
+    with pytest.raises(ScoreError) as ei:
+        parse_score(text)
+    assert ei.value.line == line and ei.value.token == token
+    assert fragment in str(ei.value)
+
+
+def test_snippet_rejects_engine_header():
+    with pytest.raises(ScoreError) as ei:
+        parse_snippet("engine: neural\nC4 q la")
+    assert ei.value.token == "engine:" and "update_project" in str(ei.value)
+
+
+def test_dotted_voice_params_keep_any_depth_and_sign():
+    p = parse_score("track: A voice.neural.fx.alien=1 voice.neural.fx.double=0.25 voice.neural.tone=-0.5 "
+                    "voice.neural.breath_db=-12.5\nC4 q la")
+    vp = p.tracks[0].voice_params
+    assert vp == {"neural.fx.alien": 1.0, "neural.fx.double": 0.25, "neural.tone": -0.5, "neural.breath_db": -12.5}
+    again = parse_score(project_to_score(p)).tracks[0].voice_params
+    assert again == vp and list(again) == list(vp)
