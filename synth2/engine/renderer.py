@@ -1,8 +1,11 @@
 """Render orchestration: project -> per-track vocals -> mix -> master."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -13,7 +16,6 @@ from ..phonemes import english, japanese
 from ..project import CURVE_SPECS, Project, Track, iter_active_tracks
 from ..timing import midi_to_note
 from ..voices import get_voice
-from . import effects
 from .backend import backend_for_voice, register_backend
 from .expression import build_dynamics, build_pitch, evaluate_curve, get_style
 from .params import build_params
@@ -221,49 +223,188 @@ def _resolve_tracks(project: Project, track_ids) -> list[Track]:
     return [t for t in project.tracks if id(t) in picked]
 
 
+SONG_LUFS = -11.0  # default integrated loudness of a song with a backing band
+LEGACY_CEILING_DB = -0.3  # limiter ceiling (dBTP) of vocal-only renders, as before the mastering chain
+BACKING_TAIL = 2.0  # s rendered after the backing's estimated end (cymbals, synth releases, its own reverb)
+
+
+def _backing_api(project: Project) -> tuple[Callable | None, Callable | None, Callable | None, str | None]:
+    """``(render_backing, kick_times, song_length_seconds, warning)`` from :mod:`synth2.arranger`,
+    imported lazily. All None when the project has no backing or the arranger is not available
+    (``song_length_seconds`` is optional)."""
+    if not getattr(project, "backing", None):
+        return None, None, None, None
+    try:
+        from ..arranger import kick_times, render_backing
+    except ImportError as exc:
+        return None, None, None, f"backing ignored: the arranger engine is not available ({exc})"
+    try:
+        from ..arranger import song_length_seconds
+    except ImportError:
+        song_length_seconds = None
+    return render_backing, kick_times, song_length_seconds, None
+
+
+def _peak(x: np.ndarray) -> float:
+    """max |x| without a temporary array."""
+    return float(max(x.max(), -x.min())) if x.size else 0.0
+
+
+def _rms(x: np.ndarray) -> float:
+    if not x.size:
+        return 0.0
+    f = x.reshape(-1)
+    return float(np.sqrt(np.einsum("i,i->", f, f, dtype=np.float64) / f.size))
+
+
+def _num(v) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v) else None
+
+
+def _backing_end_beat(project: Project, spec, kicks_beats: np.ndarray) -> float | None:
+    """Best guess of where the backing arrangement ends (beats): explicit length keys of the spec,
+    its sections' bar ranges (1-based, inclusive), or a bar after the last kick."""
+    bpb = project.beats_per_bar()
+    cands: list[float] = []
+    if isinstance(spec, dict):
+        for k in ("length_beats", "end_beat", "end"):
+            if _num(spec.get(k)) is not None:
+                cands.append(_num(spec[k]))
+        for k in ("length_bars", "bars"):
+            if _num(spec.get(k)) is not None:
+                cands.append(_num(spec[k]) * bpb)
+        for coll in ("sections", "parts", "tracks", "patterns"):
+            items = spec.get(coll)
+            items = items.values() if isinstance(items, dict) else items
+            for sec in items if isinstance(items, (list, tuple, type({}.values()))) else []:
+                if not isinstance(sec, dict):
+                    continue
+                for k in ("end_beat", "end"):
+                    if _num(sec.get(k)) is not None:
+                        cands.append(_num(sec[k]))
+                bars = sec.get("bars")
+                if isinstance(bars, (list, tuple)) and len(bars) == 2 and _num(bars[1]) is not None:
+                    cands.append(_num(bars[1]) * bpb)
+                elif isinstance(bars, str) and re.fullmatch(r"\s*\d+\s*-\s*\d+\s*", bars):
+                    cands.append(float(bars.split("-")[1]) * bpb)
+                if _num(sec.get("start_bar")) is not None and _num(sec.get("length_bars")) is not None:
+                    cands.append((_num(sec["start_bar"]) - 1 + _num(sec["length_bars"])) * bpb)
+    if len(kicks_beats):
+        cands.append(float(np.max(kicks_beats)) + bpb)
+    return max(cands) if cands else None
+
+
+# level decisions of recent full song renders (band gain, compressor thresholds, master gain), so a
+# section preview of the same mix (same master settings, backing and track mixer settings) is
+# mastered like the full song instead of on its own
+_LEVEL_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_LEVEL_KEYS = ("band_gain_db", "bus_threshold_db", "low_end_trim_db", "glue_threshold_db", "master_gain_db")
+
+
+def _level_key(project: Project, sr: int) -> str:
+    mixer = [(t.id, t.voice, t.gain_db, t.pan, t.mute, t.solo, t.reverb_send) for t in project.tracks]
+    blob = json.dumps({"master": project.master.to_dict(), "backing": getattr(project, "backing", None),
+                       "mixer": mixer, "sr": sr, "key": project.key, "tempo": project.tempo.to_list()},
+                      sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode()).hexdigest()
+
+
+def _overrides(mo: dict, *refs) -> dict:
+    """Merged ``MasterSettings.mix_overrides`` entries for ``refs`` (later refs win); keys are
+    matched exactly or case-insensitively."""
+    out: dict = {}
+    if not mo:
+        return out
+    low = {str(k).lower(): v for k, v in mo.items()}
+    for r in refs:
+        if r is None:
+            continue
+        v = mo.get(r) if r in mo else low.get(str(r).lower())
+        if isinstance(v, dict):
+            out.update(v)
+    return out
+
+
 def render_project(project: Project, *, sample_rate: int | None = None, track_ids=None,
                    start_beat: float | None = None, end_beat: float | None = None,
                    progress: Callable[[float, str], None] | None = None) -> RenderResult:
-    """Render and mix a whole project (or a beat range / subset of tracks).
+    """Render, mix and master a whole project (or a beat range / subset of tracks).
 
     ``track_ids`` entries are track ids, names (case-insensitive) or indexes; an unknown entry
     raises :class:`LookupError`. A beat-range render sings the region the way the full render
     does: it is planned with the whole song around it, the reverb of earlier notes carries into
-    it, and notes still sounding at ``end_beat`` fade out over :data:`REGION_FADE` seconds. It is
-    not normalised on its own (that would play quiet passages at full scale); only a full render
-    is peak-normalised, by at most :data:`NORMALIZE_MAX_GAIN_DB`. The master gain applies after
-    normalisation, and the stems get the same gain, so they sum to the dry master.
+    it, and notes still sounding at ``end_beat`` fade out over :data:`REGION_FADE` seconds.
+
+    Every vocal goes through the channel strip of :mod:`.mixing` (``master.vocal_chain``). When
+    the project has a backing arrangement (``project.backing``, rendered by
+    :mod:`synth2.arranger`; skipped for a ``track_ids`` subset or while a track is soloed), the
+    band stems are mixed under the vocals and the master is glued, limited and brought to an
+    integrated loudness (``master.loudness_target``, default :data:`SONG_LUFS`). Vocal-only
+    projects keep the classic behaviour: a full render is peak-normalised to -1 dBFS (by at most
+    :data:`NORMALIZE_MAX_GAIN_DB`), a region is not normalised on its own. ``master.gain_db``
+    applies after the normalisation (or the loudness target), and the stems (vocal tracks by id,
+    backing stems by name) get the same gains, so they sum to the dry part of the master.
     """
+    from . import mixing
+
     t_start = time.perf_counter()
     sr = int(sample_rate or project.sample_rate)
+    ms = project.master
     tracks = _resolve_tracks(project, track_ids) if track_ids else list(iter_active_tracks(project))
     b2s = project.tempo.beat_to_sec
     partial = start_beat is not None or end_beat is not None
     start_sec = b2s(start_beat) if start_beat is not None else 0.0
-    end_b = end_beat if end_beat is not None else max((t.end for t in tracks), default=0.0)
+    warnings_extra: list[str] = []
+
+    # ---- the backing band (full mix only: not for a track subset or while a track is soloed)
+    render_backing = kick_fn = length_fn = None
+    if not track_ids and not any(t.solo for t in project.tracks):
+        render_backing, kick_fn, length_fn, warn = _backing_api(project)
+        if warn:
+            warnings_extra.append(warn)
+    kicks_abs = np.zeros(0)
+    backing_end_b = None
+    if render_backing is not None:
+        kicks_abs = np.sort(np.asarray(kick_fn(project) if kick_fn else [], dtype=np.float64).ravel())
+        kicks_abs = kicks_abs[np.isfinite(kicks_abs)]
+        length_s = _num(length_fn(project)) if length_fn is not None else None
+        if length_s:
+            backing_end_b = project.tempo.sec_to_beat(length_s)
+        else:
+            kb = np.array([project.tempo.sec_to_beat(float(t)) for t in kicks_abs[-1:]]) if len(kicks_abs) else np.zeros(0)
+            backing_end_b = _backing_end_beat(project, project.backing, kb)
+
+    vocal_end_b = max((t.end for t in tracks), default=0.0)
+    end_b = end_beat if end_beat is not None else max(vocal_end_b, backing_end_b or 0.0)
     end_sec = max(b2s(end_b), start_sec + 0.1)
     room = project.master.reverb_room
-    reverb_tail = 0.3 + 2.2 * room if any(t.reverb_send > 0 for t in tracks) else 0.0
+    band_sends = render_backing is not None and ms.band_reverb > 0
+    reverb_tail = 0.3 + 2.2 * room if (any(t.reverb_send > 0 for t in tracks) or band_sends) else 0.0
+    if ms.vocal_delay > 0 and any(t.notes for t in tracks):
+        reverb_tail = max(reverb_tail, 1.5)
     # a region that ends mid-phrase fades out right after end_beat instead of singing on
     voice_end = end_sec + (REGION_FADE if end_beat is not None else VOICE_TAIL)
-    total = int(round((voice_end - start_sec + reverb_tail) * sr))
+    tail = reverb_tail
+    if render_backing is not None and end_beat is None:
+        tail = max(tail, BACKING_TAIL)
+    total = int(round((voice_end - start_sec + tail) * sr))
     n_voice = int(round((voice_end - start_sec) * sr))
     # a region starting later is rendered from earlier on (pre-roll) so the reverb of the notes before
     # it carries into it; the pre-roll is dropped after the reverb
     render0 = min(start_sec, max(0.0, start_sec - reverb_tail))
     n_pre = int(round(start_sec * sr)) - int(round(render0 * sr))
+    n_all = n_pre + total
     n_fade = min(int(round(REGION_FADE * sr)), n_voice)
     fade_out = 0.5 + 0.5 * np.cos(np.linspace(0.0, np.pi, n_fade))
 
-    dry = np.zeros((n_pre + total, 2))
-    bus = np.zeros((n_pre + total, 2))
-    stems: dict[str, np.ndarray] = {}
+    sources: list[mixing.Source] = []
     track_reports = []
     note_range = (start_beat if start_beat is not None else -1e9, end_b) if partial else None
     last_end = start_sec  # end (s) of the last note that starts before end_beat
+    mo = ms.mix_overrides or {}
     for k, tr in enumerate(tracks):
         if progress:
-            progress(k / max(len(tracks), 1), f"rendering {tr.name}")
+            progress(0.8 * k / max(len(tracks), 1), f"rendering {tr.name}")
         if not tr.notes:
             continue
         mono, rep = backend_for_voice(tr.voice).render_track(project, tr, sr, render0, voice_end, note_range)
@@ -272,48 +413,118 @@ def render_project(project: Project, *, sample_rate: int | None = None, track_id
             a = n_pre + n_voice - n_fade
             mono = mono.copy()
             mono[a:a + n_fade] *= fade_out[: max(0, len(mono) - a)]
-        st = effects.pan_stereo(mono, tr.pan, tr.gain_db)
-        stem = np.zeros((n_pre + total, 2))
-        stem[: len(st)] = st
-        stems[tr.id] = stem
-        dry += stem
-        if tr.reverb_send > 0:
-            bus += stem * tr.reverb_send
+        buf = np.zeros(n_all)
+        buf[: len(mono)] = mono
+        low = min(n.pitch + float(n.attrs.get("detune", 0) or 0) / 100 for n in tr.notes)
+        sources.append(mixing.Source(
+            key=tr.id, name=tr.name, kind="vocal", audio=buf, gain_db=tr.gain_db, pan=tr.pan,
+            reverb_send=tr.reverb_send, delay_send=1.0, lowest_hz=440.0 * 2 ** ((low - 69) / 12.0),
+            overrides=_overrides(mo, tr.id, tr.name)))
         rep.update({"gain_db": tr.gain_db, "pan": tr.pan})
         track_reports.append(rep)
         ends = [n.end for n in tr.notes if n.onset < end_b]
         if ends:
             last_end = max(last_end, b2s(max(ends)))
+
+    backing_reports = []
+    if render_backing is not None:
+        if progress:
+            progress(0.8, "rendering backing")
+        t1 = render0 + n_all / sr
+        used = {s.key for s in sources}
+        for st in render_backing(project, sr, render0, t1) or []:
+            audio = np.asarray(getattr(st, "audio"), dtype=np.float64)
+            if audio.ndim == 1:
+                audio = np.stack([audio, audio], axis=1)
+            buf = np.zeros((n_all, 2))
+            m = min(n_all, len(audio))
+            buf[:m] = audio[:m, :2] if audio.shape[1] >= 2 else audio[:m, :1]
+            if end_beat is not None:  # the band stops with the region, like the vocals
+                a = n_pre + n_voice - n_fade
+                if n_fade:
+                    buf[a:a + n_fade] *= fade_out[:, None][: max(0, n_all - a)]
+                buf[n_pre + n_voice:] = 0.0
+            name = str(getattr(st, "name", "") or "backing")
+            role = str(getattr(st, "role", "keys") or "keys")
+            key, j = name, 2
+            while key in used:
+                key, j = f"{name}_{j}", j + 1
+            used.add(key)
+            src = mixing.Source(
+                key=key, name=name, kind="backing", audio=buf, role=role,
+                gain_db=float(getattr(st, "gain_db", 0.0) or 0.0), pan=float(getattr(st, "pan", 0.0) or 0.0),
+                sidechain=bool(getattr(st, "sidechain", False)), overrides=_overrides(mo, role, name))
+            sources.append(src)
+            backing_reports.append({"name": key, "role": role, "gain_db": src.gain_db, "pan": src.pan,
+                                    "sidechain": src.sidechain})
+        if backing_end_b is not None and end_beat is None:
+            last_end = max(last_end, b2s(backing_end_b))
+    band_mode = any(s.kind == "backing" for s in sources)
+
     if progress:
-        progress(0.9, "mixing")
-    master = dry
-    if reverb_tail > 0 and project.master.reverb_wet > 0 and np.any(bus):
-        wet = effects.apply_reverb(bus, sr, room)[: len(dry)] * project.master.reverb_wet
-        master = master + wet
-    master = master[n_pre:]
+        progress(0.85, "mixing")
+    t_mix = time.perf_counter()
+    bpm = project.tempo.bpm_at(start_beat or 0.0) if hasattr(project.tempo, "bpm_at") else project.bpm
+    mastered = band_mode or ms.loudness_target is not None
+    level_key = _level_key(project, sr) if mastered else None
+    fixed = _LEVEL_CACHE.get(level_key) if (mastered and partial) else None
+    mix = mixing.mix_sources(sources, sr, band_mode=band_mode, settings=ms, kicks=kicks_abs - render0, bpm=bpm,
+                             reverb_room=room, reverb_wet=ms.reverb_wet if reverb_tail > 0 else 0.0, fixed=fixed)
+    stems = mix.stems
+    master = (mix.dry + mix.wet)[n_pre:]
     stems = {k: v[n_pre:] for k, v in stems.items()}
+    del sources
     if start_beat is not None and start_sec > 0:  # the region may start inside a note: no click
         n_in = min(int(round(REGION_FADE_IN * sr)), len(master))
         ramp = np.linspace(0.0, 1.0, n_in, endpoint=False)[:, None]
-        for x in (master, *stems.values()):
-            x[:n_in] *= ramp
-    # normalisation sets the reference level (full renders only, with a gain limit), then the master
-    # gain trims it; the stems get the same linear gain so they sum to the dry master
-    peak = float(np.max(np.abs(master))) if master.size else 0.0
-    gain = 1.0
-    if project.master.normalize and not partial and peak > 0:
-        gain = min(10 ** (NORMALIZE_PEAK_DB / 20.0) / peak, 10 ** (NORMALIZE_MAX_GAIN_DB / 20.0))
-    norm_db = 20 * np.log10(gain)
-    gain *= 10 ** (project.master.gain_db / 20.0)
-    master = master * gain
-    stems = {k: v * gain for k, v in stems.items()}
-    if project.master.limiter:
-        master = effects.limiter(master, sr, -0.3)
+        master[:n_in] *= ramp
+        for k in stems:  # (views of this render's own buffers)
+            stems[k][:n_in] *= ramp.astype(np.float32)
+
+    if progress:
+        progress(0.92, "mastering")
+    mix_info = dict(mix.info)
+    norm_db = 0.0
+    if mastered:
+        target = (ms.loudness_target if ms.loudness_target is not None else SONG_LUFS) if ms.normalize else None
+        master, stem_gain, minfo = mixing.master_bus(
+            master, np.zeros_like(master), sr, glue=ms.glue if band_mode else 0.0, target_lufs=target,
+            ceiling_db=ms.ceiling_db, limiter=ms.limiter, gain_db=ms.gain_db, fixed=fixed)
+        mix_info.update(minfo)
+        levels = {k: mix_info.get(k) for k in _LEVEL_KEYS}
+        if not partial and level_key:  # remember the full song's levels for section previews
+            _LEVEL_CACHE[level_key] = levels
+            _LEVEL_CACHE.move_to_end(level_key)
+            while len(_LEVEL_CACHE) > 8:
+                _LEVEL_CACHE.popitem(last=False)
+        mix_info["levels_from_full_render"] = fixed is not None
+        for k in _LEVEL_KEYS:
+            mix_info[k] = mixing._r(mix_info.get(k))
+        sg = stem_gain.astype(np.float32)[:, None]
+        for k in stems:  # the stems are this render's own float32 buffers: scale in place
+            stems[k] = np.multiply(stems[k], sg, out=stems[k] if stems[k].dtype == np.float32 else None)
+        del sg
+        norm_db = minfo.get("master_gain_db") or 0.0
+    else:
+        # normalisation sets the reference level (full renders only, with a gain limit), then the master
+        # gain trims it; the stems get the same linear gain so they sum to the dry master
+        peak = float(np.max(np.abs(master))) if master.size else 0.0
+        gain = 1.0
+        if ms.normalize and not partial and peak > 0:
+            gain = min(10 ** (NORMALIZE_PEAK_DB / 20.0) / peak, 10 ** (NORMALIZE_MAX_GAIN_DB / 20.0))
+        norm_db = 20 * np.log10(gain)
+        gain *= 10 ** (ms.gain_db / 20.0)
+        master = master * gain
+        for v in stems.values():
+            v *= np.float32(gain)
+        if ms.limiter:
+            master = mixing.limit(master, sr, LEGACY_CEILING_DB)
     # stems are not limited: if one would clip, all of them are turned down by the same amount
-    stem_peak = max((float(np.max(np.abs(v))) for v in stems.values() if v.size), default=0.0)
+    stem_peak = max((_peak(v) for v in stems.values()), default=0.0)
     stem_gain = 1.0 / stem_peak if stem_peak > 1.0 else 1.0
     if stem_gain != 1.0:
-        stems = {k: v * stem_gain for k, v in stems.items()}
+        for v in stems.values():
+            v *= np.float32(stem_gain)
     # trim the silent tail (relative to the peak, so a quiet mix keeps its reverb), but never before
     # the release of the last note
     if master.size:
@@ -325,7 +536,19 @@ def render_project(project: Project, *, sample_rate: int | None = None, track_id
         keep = min(len(master), max(keep, floor))
         master = master[:keep]
         stems = {k: v[:keep] for k, v in stems.items()}
-    stems = {k: v.astype(np.float32) for k, v in stems.items()}
+    stems = {k: np.ascontiguousarray(v, dtype=np.float32) for k, v in stems.items()}
+    master = master.astype(np.float32)
+
+    # ---- metering
+    loud = mixing.loudness_stats(master, sr) if master.size else {}
+    tp = mix_info.pop("true_peak", None)
+    if tp is None:
+        tp = mixing.true_peak(master) if master.size else 0.0
+    names = {r["id"]: r["name"] for r in track_reports}
+    stem_levels = []
+    for k, v in stems.items():
+        stem_levels.append({"key": k, "name": names.get(k, k), "group": mix.groups.get(k, "vocal"),
+                            "peak_db": _db(_peak(v)), "rms_db": _db(_rms(v))})
     elapsed = time.perf_counter() - t_start
     dur = len(master) / sr
     report = {
@@ -333,14 +556,23 @@ def render_project(project: Project, *, sample_rate: int | None = None, track_id
         "sample_rate": sr,
         "start_seconds": round(start_sec, 3),
         "peak_db": _db(np.max(np.abs(master)) if master.size else 0.0),
-        "rms_db": _db(float(np.sqrt(np.mean(master ** 2))) if master.size else 0.0),
+        "rms_db": _db(_rms(master)),
+        "true_peak_db": _db(tp),
+        "loudness_lufs": mixing._r(loud.get("integrated")),
+        "short_term_max_lufs": mixing._r(loud.get("short_term_max")),
+        "loudness_range_lu": mixing._r(loud.get("range")),
+        "vocal_to_band_db": mix_info.get("vocal_to_band_db"),
         "normalize_gain_db": round(float(norm_db), 2),
         "stems_gain_db": round(float(20 * np.log10(stem_gain)), 2),
+        "stem_levels": stem_levels,
+        "mix": {"mode": "song" if band_mode else ("mastered" if mastered else "vocal"), **mix_info},
         "render_time_s": round(elapsed, 3),
+        "mix_time_s": round(time.perf_counter() - t_mix, 3),
         "realtime_factor": round(dur / elapsed, 1) if elapsed > 0 else None,
         "tracks": track_reports,
-        "warnings": [w for r in track_reports for w in r["warnings"]],
+        "backing": backing_reports,
+        "warnings": [w for r in track_reports for w in r["warnings"]] + warnings_extra,
     }
     if progress:
         progress(1.0, "done")
-    return RenderResult(master.astype(np.float32), sr, stems, report, start_sec)
+    return RenderResult(master, sr, stems, report, start_sec)

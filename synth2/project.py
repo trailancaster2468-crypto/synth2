@@ -245,11 +245,40 @@ class Track:
 
 @dataclass
 class MasterSettings:
-    gain_db: float = 0.0
+    """Master / mix settings. The fields after ``limiter`` drive the mixing and mastering chain
+    (``synth2.engine.mixing``); their defaults suit both vocal-only projects and full songs."""
+
+    gain_db: float = 0.0  # trim after normalisation (or after the loudness target)
     reverb_room: float = 0.55  # 0..1 room size
     reverb_wet: float = 1.0  # scales every track's send
-    normalize: bool = True  # peak-normalise the master to -1 dBFS
+    normalize: bool = True  # vocal-only: peak-normalise to -1 dBFS; songs: hit the loudness target
     limiter: bool = True
+    # ---- mastering
+    loudness_target: float | None = None  # integrated LUFS; None = auto (-11 with a backing band, else peak-normalise)
+    ceiling_db: float = -1.0  # true-peak ceiling (dBTP) of the mastering limiter
+    glue: float = 0.5  # master glue compression 0..1 (songs with a backing band)
+    master_eq: list | None = None  # EQ band specs folded into every source; None = preset (subsonic HPF, +1 dB air)
+    # ---- vocals
+    vocal_chain: bool = True  # channel strip on every vocal: HPF, de-mud, presence, air, de-esser, compressor
+    vocal_delay: float = 0.0  # ping-pong delay return level for the vocals (0 = off, 0.1-0.3 typical)
+    delay_beats: float = 0.5  # delay time in beats (0.5 = eighth notes)
+    delay_feedback: float = 0.35
+    # ---- band (backing stems from synth2.arranger)
+    vocal_balance_db: float | None = 4.0  # band gain is set so vocals sit this far above it in 1-5 kHz; None = off
+    backing_gain_db: float = 0.0  # band trim after the vocal balance
+    band_duck_db: float = 1.5  # band dips this much (x role factor) while the vocals sing
+    vocal_carve_db: float = 3.0  # and its 1.5-4 kHz band is carved by this much (x role factor)
+    sidechain_db: float = 6.0  # kick ducking depth for stems flagged sidechain (x role factor)
+    sidechain_release: float = 0.16  # s
+    band_width: float = 1.0  # stereo width multiplier for the band (bass stays mono)
+    band_glue: float = 0.5  # instrument bus compression 0..1
+    band_reverb: float = 0.5  # scales the role-based sends of the band into the song reverb (stems bring their own)
+    sub_max_db: float | None = 4.0  # band's 30-60 Hz octave may sit this far above its 120-240 Hz one (else low shelf, max -4 dB)
+    # per-track / per-stem overrides, keyed by track id or name, backing stem name or role:
+    # {gain_db, pan, reverb, delay, eq_add: [bands], chain: bool, comp: {...} | None, sidechain_db,
+    #  duck, carve, width, mono_below, crest_db (transient limiter: peaks within this many dB of the loud level;
+    #  drums / perc / fx by default, opt-in for vocals)}
+    mix_overrides: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)
@@ -257,7 +286,7 @@ class MasterSettings:
     @classmethod
     def from_dict(cls, d):
         valid = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in (d or {}).items() if k in valid})
+        return cls(**{k: copy.deepcopy(v) for k, v in (d or {}).items() if k in valid})
 
 
 @dataclass
@@ -270,6 +299,8 @@ class Project:
     tracks: list[Track] = field(default_factory=list)
     master: MasterSettings = field(default_factory=MasterSettings)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # backing-track arrangement for synth2.arranger (JSON-serialisable dict, see synth2/arranger/FORMAT.md)
+    backing: dict | None = None
 
     # ---- convenience -----------------------------------------------------
     @classmethod
@@ -338,6 +369,7 @@ class Project:
             "master": self.master.to_dict(),
             "metadata": dict(self.metadata),
             "tracks": [t.to_dict() for t in self.tracks],
+            **({"backing": copy.deepcopy(self.backing)} if self.backing else {}),
         }
 
     @classmethod
@@ -354,6 +386,8 @@ class Project:
             metadata=dict(d.get("metadata") or {}),
         )
         p.tracks = [Track.from_dict(t) for t in d.get("tracks", [])]
+        backing = d.get("backing")
+        p.backing = copy.deepcopy(backing) if isinstance(backing, dict) and backing else None
         return p
 
     def to_json(self, indent=2) -> str:
@@ -402,6 +436,10 @@ class Project:
                 "gain_db": t.gain_db,
                 "pan": t.pan,
             })
+        if self.backing:
+            secs = self.backing.get("sections") or []
+            out["backing"] = {"instruments": sorted(self.backing.get("instruments") or {}),
+                              "sections": [s.get("name") for s in secs if isinstance(s, dict)]}
         return out
 
 

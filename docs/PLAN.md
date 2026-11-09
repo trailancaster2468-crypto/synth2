@@ -98,18 +98,54 @@ res: RenderResult = render_project(project, *, sample_rate=None, track_ids=None,
                                    start_beat=None, end_beat=None, progress=None)
 res.audio        # float32 (n, 2)
 res.sample_rate  # int
-res.stems        # dict[track_id, float32 (n, 2)]: post-fader, pre-reverb, with the master
-                 #   normalisation and gain applied (stems sum to the dry part of the master)
-res.report       # dict (JSON-serialisable): duration_s, peak_db, rms_db, render_time_s,
-                 #   realtime_factor, tracks: [{id, name, warnings: [str], notes, phonemes}]
+res.stems        # dict[track_id | backing stem name, float32 (n, 2)]: post-fader (and post bus
+                 #   processing), pre-reverb, with the master normalisation / loudness gain applied
+                 #   (stems sum to the dry part of the master, before the limiter)
+res.report       # dict (JSON-serialisable): duration_s, peak_db, rms_db, true_peak_db, loudness_lufs,
+                 #   short_term_max_lufs, loudness_range_lu, vocal_to_band_db, stem_levels, mix, backing,
+                 #   render_time_s, mix_time_s, realtime_factor,
+                 #   tracks: [{id, name, warnings: [str], notes, phonemes}]
 res.save(path, bits=16)            # write master WAV
 res.save_stems(directory, bits=16) # write <track name>.wav per stem
 render_track(project, track) -> (mono float32 array, report dict)  # dry, unmixed
 ```
 Internals: `planner.py` (notes to timed phoneme segments), `params.py`
 (segments to frame parameter tracks), `vocoder.py` (pulse-OLA harmonic plus
-noise synthesis), `effects.py` (reverb, pan, limiter), `renderer.py`
-(orchestration), `backend.py` (backend interface and registry).
+noise synthesis), `effects.py` (reverb IR, pan), `mixing.py` (mixing and
+mastering DSP, below), `renderer.py` (orchestration), `backend.py` (backend
+interface and registry).
+
+#### Mixing and mastering (`synth2/engine/mixing.py`, numpy only)
+* **Vocal channel strip** (every vocal track, `master.vocal_chain`): high-pass at
+  0.7 x the lowest sung f0 (40-90 Hz), de-mud bell at 300 Hz, presence bell at 3.2 kHz,
+  air shelf at 10 kHz, dynamic de-harsh (3.2 kHz) and de-ess (6.8 kHz) bands, an RMS
+  compressor; then fader and pan. Sends: the song reverb (`reverb_send`) and a
+  tempo-synced ping-pong delay (`master.vocal_delay`, `delay_beats`, ducked while the
+  vocals sing). With a band the strip is stronger (more presence and compression).
+* **Band** (`project.backing` rendered by `synth2.arranger.render_backing`; skipped for
+  a `track_ids` subset or while a track is soloed): per role (drums and its
+  kick/snare/hats/cymbals sub-stems, bass, keys, lead, pad, perc, fx): EQ, mono bass,
+  transient limiter for drums / perc / fx (peaks within `crest_db` of the stem's loud
+  level), compressor, kick sidechain ducking from `kick_times` for stems flagged
+  `sidechain`, vocal-keyed ducking (`band_duck_db`) and a 1.5-4 kHz carve of the mid
+  (`vocal_carve_db`). Bus: a bounded low shelf when the band's 30-60 Hz octave is more
+  than `sub_max_db` above its 120-240 Hz octave (predicted from the raw stems), a
+  gain-staged compressor (`band_glue`), then the band gain is set so the vocals sit
+  `vocal_balance_db` above the band in 1-5 kHz. A section preview reuses the level
+  decisions of the last full render of the same mix, so it sounds like that part of the song.
+* **Master** (songs, or `master.loudness_target` set): glue compressor (`glue`), gain to
+  the integrated-loudness target (`loudness_target`, default -11 LUFS for songs) and a
+  true-peak look-ahead limiter (`ceiling_db`, default -1 dBTP). Vocal-only projects keep
+  the peak normalisation to -1 dBFS. The master EQ (`master_eq`) is folded into every
+  source. `mix_overrides` holds per-track / per-stem / per-role tweaks (`crest_db` adds the
+  transient limiter to a vocal, for peaky character voices). `update_project` sets every
+  master field, `mix_overrides` merged per key.
+* **Report** adds `loudness_lufs` (BS.1770-4 integrated), `short_term_max_lufs`,
+  `loudness_range_lu`, `true_peak_db` (4x oversampled), `vocal_to_band_db` (1-5 kHz,
+  while the vocals sing), `stem_levels` ([{key, name, group, peak_db, rms_db}]),
+  `backing` (the arranger's stems) and `mix` (mode `vocal` / `mastered` / `song`, band
+  gain, compressor, de-esser and limiter activity, master gain). Backing stems are in
+  `RenderResult.stems` under their stem names.
 
 ### Analysis (main thread): `synth2/analysis.py`
 ```python

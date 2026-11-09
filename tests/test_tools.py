@@ -197,6 +197,23 @@ def test_new_project_from_score_and_summary():
     assert summ["scale"] == ["A", "B", "C", "D", "E", "F", "G"] and summ["history"]["undo"] == 1
 
 
+def test_update_project_mix_settings(s):
+    r = call_tool(s, "update_project", {"master": {"loudness_target": -10.5, "vocal_delay": 0.2, "band_width": 1.2,
+                                                   "mix_overrides": {"Lead": {"gain_db": 1.0}, "bass": {"gain_db": -2}}}})
+    m = r["master"]
+    assert m["loudness_target"] == -10.5 and m["vocal_delay"] == 0.2 and m["band_width"] == 1.2
+    # mix_overrides merge per key; a null entry removes it; null for the whole dict clears it
+    r = call_tool(s, "update_project", {"master": {"loudness_target": None,
+                                                   "mix_overrides": {"bass": None, "drums snare": {"crest_db": 9}}}})
+    assert r["master"]["loudness_target"] is None
+    assert r["master"]["mix_overrides"] == {"Lead": {"gain_db": 1.0}, "drums snare": {"crest_db": 9}}
+    assert call_tool(s, "update_project", {"master": {"mix_overrides": None}})["master"]["mix_overrides"] == {}
+    with pytest.raises(ToolError, match="must be an object"):
+        call_tool(s, "update_project", {"master": {"mix_overrides": {"bass": -2}}})
+    with pytest.raises(ToolError, match="unknown argument"):
+        call_tool(s, "update_project", {"master": {"loudness": -10}})
+
+
 def test_update_project_and_tempo(s):
     r = call_tool(s, "update_project", {"title": "New", "key": "Am", "time_signature": "3/4",
                                         "master": {"gain_db": -3, "normalize": False}})

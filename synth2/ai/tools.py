@@ -999,6 +999,14 @@ def _new_project(s: Session, a: dict) -> dict:
 Change project settings: title, key (used by add_harmony and diatonic transpose; e.g. 'A minor', 'Eb major'),
 time_signature ('3/4'), sample_rate (Hz) and master settings {gain_db, reverb_room 0..1 (room size), reverb_wet
 0..2 (scales all reverb sends), normalize (peak-normalise to -1 dBFS), limiter}. Tempo is set with set_tempo.
+Mixing / mastering (songs with a backing band, see docs/PLAN.md): loudness_target (integrated LUFS, null = auto
+-11), ceiling_db (true-peak ceiling), glue (master glue 0..1), master_eq (EQ band list, null = preset),
+vocal_chain, vocal_delay (ping-pong delay return 0..1, 0 = off), delay_beats, delay_feedback, vocal_balance_db
+(vocals over the band in 1-5 kHz, null = off), backing_gain_db, band_duck_db, vocal_carve_db, sidechain_db,
+sidechain_release (s), band_width, band_glue, band_reverb, sub_max_db, mix_overrides ({track id/name, backing
+stem name or role: {gain_db, pan, reverb, delay, eq_add, chain, comp, sidechain_db, duck, carve, width,
+mono_below, crest_db (transient limiter, dB above the loud level)}}; merged per key, a null entry removes that
+key, mix_overrides=null clears them all).
 """, {
     "title": {"type": "string"},
     "key": {"type": "string"},
@@ -1008,7 +1016,26 @@ time_signature ('3/4'), sample_rate (Hz) and master settings {gain_db, reverb_ro
         "gain_db": {"type": "number", "minimum": -48, "maximum": 24},
         "reverb_room": {"type": "number", "minimum": 0, "maximum": 1},
         "reverb_wet": {"type": "number", "minimum": 0, "maximum": 2},
-        "normalize": {"type": "boolean"}, "limiter": {"type": "boolean"}}},
+        "normalize": {"type": "boolean"}, "limiter": {"type": "boolean"},
+        "loudness_target": {"type": ["number", "null"], "minimum": -40, "maximum": -3},
+        "ceiling_db": {"type": "number", "minimum": -12, "maximum": 0},
+        "glue": {"type": "number", "minimum": 0, "maximum": 1},
+        "master_eq": {"type": ["array", "null"]},
+        "vocal_chain": {"type": "boolean"},
+        "vocal_delay": {"type": "number", "minimum": 0, "maximum": 1},
+        "delay_beats": {"type": "number", "minimum": 0.0625, "maximum": 4},
+        "delay_feedback": {"type": "number", "minimum": 0, "maximum": 0.9},
+        "vocal_balance_db": {"type": ["number", "null"], "minimum": -12, "maximum": 18},
+        "backing_gain_db": {"type": "number", "minimum": -24, "maximum": 12},
+        "band_duck_db": {"type": "number", "minimum": 0, "maximum": 12},
+        "vocal_carve_db": {"type": "number", "minimum": 0, "maximum": 12},
+        "sidechain_db": {"type": "number", "minimum": 0, "maximum": 24},
+        "sidechain_release": {"type": "number", "minimum": 0.01, "maximum": 1},
+        "band_width": {"type": "number", "minimum": 0, "maximum": 2},
+        "band_glue": {"type": "number", "minimum": 0, "maximum": 1},
+        "band_reverb": {"type": "number", "minimum": 0, "maximum": 2},
+        "sub_max_db": {"type": ["number", "null"], "minimum": -6, "maximum": 24},
+        "mix_overrides": {"type": ["object", "null"]}}},
 }, mutating=True)
 def _update_project(s: Session, a: dict) -> dict:
     p = s.project
@@ -1021,7 +1048,19 @@ def _update_project(s: Session, a: dict) -> dict:
     if "sample_rate" in a:
         p.sample_rate = int(a["sample_rate"])
     for k, v in (a.get("master") or {}).items():
-        setattr(p.master, k, v)
+        if k == "mix_overrides" and v is not None:  # merged per key; a null entry removes it
+            mo = dict(p.master.mix_overrides or {})
+            for ref, over in v.items():
+                if over is None:
+                    mo.pop(ref, None)
+                elif not isinstance(over, dict):
+                    raise ToolError(f"master.mix_overrides[{ref!r}] must be an object like {{\"gain_db\": -2}}")
+                else:
+                    mo[ref] = copy.deepcopy(over)
+            v = mo
+        elif k == "mix_overrides":
+            v = {}
+        setattr(p.master, k, copy.deepcopy(v))
     try:
         scale = composer.scale_degrees(p.key)
     except ValueError:
@@ -1764,6 +1803,152 @@ def _add_harmony(s: Session, a: dict) -> dict:
             "chromatic_source_notes": stats.get("chromatic_notes", 0),
             "octave_shifted_notes": stats.get("range_shifted", 0),
             "warnings": _overlap_warnings(t, {n.id for n in notes}) + _voice_range_warnings(t, notes)}
+
+
+# ============================================================================ tools: backing band
+
+_BACKING_DOC = """
+The arrangement is a JSON object (format 'synth2-arrangement'); tempo comes from the project, bars are absolute
+and 1-based (bar 1 starts at beat 0), 'beat' inside a bar is 1-based (2.5 = the 'and' of 2). Keys:
+- key: 'A minor' (default: project key); swing: 0..0.75 (fraction of a 16th that off-beats are late; 0.33 =
+  shuffle); humanize: {timing_ms, velocity}; energy_response: 0..2 (how much section energy changes velocity and
+  brightness, default 1).
+- instruments: {name: {...}}. A pitched part is {"preset": P, ...} with P one of bass_pick, bass_slap, bass_sub,
+  bass_growl, bass_chip, power_saw (crunchy distorted 'guitar'), gtr_mute (palm-muted chug), gtr_clean,
+  supersaw, brass, chip_lead, chip_square, chip_arp, saw_lead, sync_lead, pluck, organ, pad, pad_glass, bell,
+  glock, music_box, epiano, piano, acoustic (strummed guitar). A kit is {"type": "drums", "kit": "pop"|"rock"|"electro"|"chip",
+  "voices": {"kick": {"pitch": 52, "decay": 0.45}, ...}}. An FX rack is {"type": "fx"}. Mix defaults on every
+  instrument: gain_db, pan (-1..1), role (drums|bass|keys|lead|pad|fx|perc), sidechain (duck under the kick),
+  width (0..2), reverb (0..1 send to its own room), reverb_decay (s), delay {time: '8d'|'4'|'16'|... or beats,
+  feedback, mix}, eq {low_cut, high_cut, bands: [{hz, db, q}]}, drive (0..1 bus saturation), low (register: chord
+  roots are placed at or above this note, e.g. 'E1' for bass), center (where chord voicings sit, e.g. 'B3'),
+  voicing, transpose/octave, strum (s), humanize, mute. Synth sound tweaks go in params (osc layers, cutoff,
+  resonance, env, attack, decay, sustain, release, drive, vibrato, glide, chip_arp ... see get_backing
+  detail='reference').
+- patterns: {name: {kind, ...}}; grid = steps per bar (16 default), bars, swing, gate, velocity, transpose.
+  * drums: lanes {kick: 'x...x...x...x...', snare: '....X.......X...', hat: 'x.x.x.x.'} - '.' rest, x hit,
+    X accent, o ghost, 1-9 velocity, r roll, f flam; voices kick snare clap rim hat ohat crash ride tom1 tom2
+    tom3 shaker tamb cowbell snap. Lanes loop on their own length.
+  * line (bass lines, chord-relative): steps 'R.R8.R5.R.Lx8.5.' - R chord bass (slash note), 1 root, 3 5 7
+    chord tones, 8 octave, L octave below, H fifth above the octave, x dead note, '-' tie, '.' rest. Spaced form
+    'R . b7 . 5 , 8' allows b/# and ' (up) , (down) octave marks plus ! accent ? ghost.
+  * chords: rhythm 'x..x..x.x--.x-x.' (x hit, X accent, o soft, d/u down/up strum, m palm mute, - tie) with
+    voicing triad|seventh|power|power8|open|full|shell|octave|root|cluster|spread, optional center/low.
+  * arp: mode up|down|updown|downup|random|order, octaves, rhythm, order '1 5 8 10' (degrees).
+  * notes (riffs/melodies in absolute pitch): score 'A4 e C5 e r q E5+A5 q.' or notes [[beat, pitch, beats,
+    velocity], ...]; relative=true uses degrees instead.
+- sections: [{name, start_bar, bars, chords: ['Am', 'Am/G', 'F', 'E7'] (one per bar, cycles; 'F G' splits a bar),
+  energy 0..1, key (e.g. 'B minor' after a modulation), transpose (semitones for 'notes' riffs), crash: true,
+  like: 'Chorus 1' (copy another section's parts/chords), parts: {instrument: 'pattern' | null (silent) |
+  {pattern, bars: [from, to], transpose, octave, velocity} | [segments...]}, fills, events, stops}].
+  Instruments not listed in a section's parts are silent there.
+- fills: [{part, bar, beat, pattern}] replaces the part's groove from that beat to the end of the fill.
+- events: one-offs at {bar, beat}: {type:'fx', sound: laser|zap|ufo|riser|downlifter|whoosh|sweep|impact|boom|
+  radio|bleeps|glitch|modem|alarm|powerdown|coin|error|reverse_cymbal, beats, pitch, gain_db, pan};
+  {type:'hit', part, voice}; {type:'note', part, pitch, beats}; {type:'chord', part, beats}; processing on the
+  rendered stems of `parts` ('all' default, `except` list) over `beats`: stutter {slice, decay, pitch}, tapestop,
+  crush {bits, downsample}, filter {mode lp|hp|bp, from_hz, to_hz}, gate {steps}, reverse, telephone.
+- stops: [{bar, beat, beats, parts: 'all', except: [...]}] = sudden silence (notes are dropped, tails cut).
+"""
+
+
+def _merge_backing(old: dict | None, new: dict) -> dict:
+    """Merge a partial arrangement into the current one: dict entries (instruments, patterns) are replaced per
+    name, sections are replaced by name (new names appended in order), lists (events, stops, fills) replaced."""
+    out = copy.deepcopy(old) if old else {}
+    for k, v in new.items():
+        if k in ("instruments", "patterns") and isinstance(v, dict) and isinstance(out.get(k), dict):
+            for name, spec in v.items():
+                if spec is None:
+                    out[k].pop(name, None)
+                else:
+                    out[k][name] = copy.deepcopy(spec)
+        elif k == "sections" and isinstance(v, list) and isinstance(out.get(k), list):
+            secs = out[k]
+            index = {sec.get("name"): i for i, sec in enumerate(secs) if isinstance(sec, dict)}
+            for sec in v:
+                name = sec.get("name") if isinstance(sec, dict) else None
+                if name in index:
+                    secs[index[name]] = copy.deepcopy(sec)
+                else:
+                    secs.append(copy.deepcopy(sec))
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+@_tool("set_backing", f"""
+Set the project's instrumental backing band (drums, bass, guitars/synths, leads, pads, FX) as an arrangement that
+the arranger engine renders and the mixer combines with the vocals in `render` (undoable). The arrangement is
+validated first: errors reject the call (nothing changes) with messages saying what to fix; warnings are returned.
+merge=true merges a partial arrangement into the current one (instruments/patterns replaced per name, sections
+replaced by name or appended, events/stops/fills lists replaced), so you can tweak one pattern or section at a time.
+Call get_backing(detail='reference') for every preset, parameter, drum voice and FX sound.
+{_BACKING_DOC}
+Minimal example: {{"instruments": {{"drums": {{"type": "drums"}}, "bass": {{"preset": "bass_pick"}}}}, "patterns":
+{{"beat": {{"kind": "drums", "lanes": {{"kick": "x...x...x...x...", "snare": "....x.......x...", "hat":
+"x.x.x.x.x.x.x.x."}}}}, "root8": {{"kind": "line", "steps": "R.R.R.R.R.R.R.R."}}}}, "sections": [{{"name": "Verse",
+"start_bar": 1, "bars": 8, "chords": ["Am", "F", "G", "E"], "parts": {{"drums": "beat", "bass": "root8"}}}}]}}
+""", {"arrangement": {"type": "object", "description": "The arrangement (or a partial one with merge=true)."},
+      "merge": {"type": "boolean", "description": "Merge into the current arrangement instead of replacing it."}},
+    required=("arrangement",), mutating=True)
+def _set_backing(s: Session, a: dict) -> dict:
+    from .. import arranger
+
+    arr = a["arrangement"]
+    if a.get("merge"):
+        arr = _merge_backing(s.project.backing, arr)
+    try:
+        json.dumps(arr)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(f"the arrangement must be plain JSON: {exc}") from None
+    problems = arranger.validate_arrangement(arr)
+    errors = [m for m in problems if m.startswith("error")]
+    warnings = [m for m in problems if not m.startswith("error")]
+    if errors:
+        shown = errors[:25] + ([f"... and {len(errors) - 25} more errors"] if len(errors) > 25 else [])
+        raise ToolError("set_backing: the arrangement has errors (nothing was changed):\n" + "\n".join(shown)
+                        + ("\n" + "\n".join(warnings[:10]) if warnings else "")
+                        + "\nSee get_backing(detail='reference') for presets, voices, FX and pattern syntax.")
+    s.project.backing = copy.deepcopy(arr)
+    summary = arranger.summarize(arr, s.project)
+    summary.pop("problems", None)
+    return {"ok": True, "warnings": warnings, "summary": summary}
+
+
+@_tool("get_backing", """
+Read the backing arrangement. detail='summary' (default): sections (bars, start/end seconds, chords, which pattern
+each instrument plays), instruments (preset, role, gain, pan, event count), pattern names, length, kick count and
+any validation problems. detail='full': the arrangement JSON itself (edit it and send it back with set_backing).
+detail='reference': the arranger's manual - every instrument preset with its sound description, synth parameters,
+drum voices and their parameters, kits, FX sounds, processing effects, pattern grammar, voicings and arp modes
+(works without a backing). detail='example': a complete small example arrangement to start from.
+""", {"detail": {"type": "string", "enum": ["summary", "full", "reference", "example"],
+                 "description": "What to return."}})
+def _get_backing(s: Session, a: dict) -> dict:
+    from .. import arranger
+
+    detail = a.get("detail", "summary")
+    if detail == "reference":
+        return arranger.reference()
+    if detail == "example":
+        return {"arrangement": arranger.example_arrangement()}
+    arr = s.project.backing
+    if not arr:
+        return {"backing": None, "hint": "no backing band yet; build one with set_backing (see "
+                                         "get_backing(detail='reference') and detail='example')"}
+    if detail == "full":
+        return {"arrangement": copy.deepcopy(arr)}
+    return {"backing": arranger.summarize(arr, s.project)}
+
+
+@_tool("clear_backing", """
+Remove the backing band arrangement from the project (undoable); render then produces vocals only.
+""", mutating=True)
+def _clear_backing(s: Session, a: dict) -> dict:
+    had = s.project.backing is not None
+    s.project.backing = None
+    return {"cleared": had}
 
 
 # ============================================================================ tools: checks
