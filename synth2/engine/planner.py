@@ -5,10 +5,12 @@ exactly on the note onset, onset consonants are placed *before* the note
 (borrowing time from the previous note or rest), coda consonants close the
 syllable just before the next onset, melisma notes extend the vowel, and
 diphthongs glide to their second target at the end of the sung span.
+Breath notes and silent closures (Japanese small tsu) are unpitched: they get
+no :class:`NoteTiming`, and a breath separates phrases like a rest does.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -17,6 +19,8 @@ from ..phonemes.inventory import Phoneme, get
 from .expression import NoteTiming, Style
 
 PHRASE_GAP = 0.2  # seconds of silence that separate phrases
+MIN_SPAN = 0.03  # seconds: the shortest sung span (vowel + coda) a syllable keeps
+MIN_NOTE = 0.03  # seconds: a note cut shorter than this by an overlapping note is dropped
 
 
 @dataclass
@@ -45,6 +49,7 @@ class Unit:
     start: float
     end: float
     breath: bool = False
+    closure: bool = False  # silent closure (small tsu "q"): no nucleus, not pitched
     lead: float = 0.0
     phrase_start: bool = False
     phrase_end: bool = False
@@ -95,69 +100,107 @@ def plan_track(notes, tempo, language: str, style: Style, rng: np.random.Generat
     # trim overlaps (a single voice is monophonic)
     clean = []
     for n in notes:
+        if n.duration <= 1e-6:
+            continue  # nothing to sing: must not cut the note before it either
         if clean and n.onset < clean[-1].end - 1e-6:
             prev = clean[-1]
             if n.onset - prev.onset <= 1e-6:
                 warnings.append(f"note {n.id} at beat {n.onset:g} starts with another note; dropped")
                 continue
+            if tempo.beat_to_sec(n.onset) - tempo.beat_to_sec(prev.onset) < MIN_NOTE:
+                # near-duplicate onset (tick jitter, humanized chord): the sliver left of the
+                # first note could not be sung, so the later note replaces it
+                warnings.append(f"note {prev.id} at beat {prev.onset:g} is cut to almost nothing by note "
+                                f"{n.id}; dropped")
+                clean[-1] = n
+                continue
             warnings.append(f"notes {prev.id} and {n.id} overlap; first note shortened")
             prev = _shorten(prev, n.onset - prev.onset)
             clean[-1] = prev
-        if n.duration > 1e-6:
-            clean.append(n)
+        clean.append(n)
     notes = clean
 
     try:
         sylls = ph.resolve_notes(notes, language)
-    except Exception as exc:  # bad explicit phonemes: resolve one by one
-        warnings.append(f"lyric resolution: {exc}")
-        sylls = []
+    except Exception:  # bad explicit phonemes: replace only the offending notes, keep "+" words intact
+        fixed = []
         for n in notes:
             try:
-                sylls += ph.resolve_notes([n], language)
-            except Exception:
-                warnings.append(f"note {n.id} lyric {n.lyric!r} invalid; sung as 'la'")
-                sylls.append(ph.Syllable(["l", "aa"]))
+                ph.resolve_notes([n], language)
+            except Exception as exc:
+                warnings.append(f"note {n.id} lyric {n.lyric!r} invalid ({exc}); sung as 'la'")
+                n = replace(n, lyric="la", phonemes=None)
+            fixed.append(n)
+        try:
+            sylls = ph.resolve_notes(fixed, language)
+        except Exception as exc:  # last resort: note by note (loses "+" grouping)
+            warnings.append(f"lyric resolution: {exc}")
+            sylls = [s for n in fixed for s in ph.resolve_notes([n], language)]
 
     on = np.array([tempo.beat_to_sec(n.onset) for n in notes])
     off = np.array([tempo.beat_to_sec(n.end) for n in notes])
     if style.timing_humanize > 0 and len(notes):
         jit = rng.normal(0, style.timing_humanize, len(notes))
-        on = on + jit
+        # never pull a note before the start of the song (a note at beat 0 would lose its attack)
+        on = np.maximum(on + jit, np.minimum(on, 0.0))
         off = np.maximum(off + np.roll(jit, -1) * 0.0, on + 0.03)
 
     # ---- build units
     units: list[Unit] = []
     note_unit = [-1] * len(notes)
+    silent_notes: set[int] = set()  # explicit "[sil]" notes: rests, reported as "sil"
     last_vowel = "aa"
     for i, (n, s) in enumerate(zip(notes, sylls)):
         if s.rest:
             continue
         if s.melisma:
-            if units and units[-1].notes[-1] == i - 1 and on[i] - off[i - 1] < 0.08:
-                units[-1].notes.append(i)
-                units[-1].end = off[i]
+            last = units[-1] if units else None
+            if (last is not None and not (last.breath or last.closure) and last.notes[-1] == i - 1
+                    and on[i] - off[i - 1] < 0.08):
+                last.notes.append(i)
+                last.end = off[i]
                 note_unit[i] = len(units) - 1
                 continue
             phones = [last_vowel]
         else:
             phones = list(s.phones)
         if not phones:
+            warnings.append(f"note {n.id} lyric {n.lyric!r} has no pronounceable phonemes; not sung "
+                            "(spell it out as a word, e.g. 'two' for '2')")
             continue
-        u = Unit([i], phones, on[i], off[i], breath=s.breath)
+        core = [p for p in phones if p != "sil"]
+        if not core:
+            silent_notes.add(i)
+            continue
+        breath = s.breath or all(p == "br" for p in core)
+        closure = not breath and all(p == "q" for p in core)
+        if breath or closure:
+            phones = core
+        elif not any(get(p).is_vowel or p == "N" or get(p).is_sonorant for p in phones):
+            phones = phones + ["ax"]  # a consonant-only lyric is sung on a schwa (and reported so)
+        u = Unit([i], phones, on[i], off[i], breath=breath, closure=closure)
         units.append(u)
         note_unit[i] = len(units) - 1
         vs = [p for p in phones if get(p).is_vowel]
         if vs:
             last_vowel = get(vs[-1]).parts[-1] if get(vs[-1]).parts else vs[-1]
 
-    # ---- phrase structure and consonant timing
+    # ---- phrase structure: a breath (like a rest of PHRASE_GAP or more) separates phrases
     for k, u in enumerate(units):
         prev = units[k - 1] if k > 0 else None
         nxt = units[k + 1] if k + 1 < len(units) else None
-        u.phrase_start = prev is None or u.start - prev.end >= PHRASE_GAP
-        u.phrase_end = nxt is None or nxt.start - u.end >= PHRASE_GAP
-        if u.breath:
+        u.phrase_start = bool(prev is None or prev.breath or u.start - prev.end >= PHRASE_GAP)
+        u.phrase_end = bool(nxt is None or nxt.breath or nxt.start - u.end >= PHRASE_GAP)
+    for k, u in enumerate(units):
+        if u.closure:  # a silent closure sits inside its phrase; it never starts or ends one itself
+            if u.phrase_start and k + 1 < len(units):
+                units[k + 1].phrase_start = True
+            u.phrase_start = u.phrase_end = False
+
+    # ---- consonant timing
+    for k, u in enumerate(units):
+        prev = units[k - 1] if k > 0 else None
+        if u.breath or u.closure:
             continue
         u.onset, nuclei, u.coda = _split_syllable(u.phones)
         u.nuclei = [list(c) + [v] for c, v in nuclei]
@@ -167,19 +210,28 @@ def plan_track(notes, tempo, language: str, style: Style, rng: np.random.Generat
             u.lead = 0.0
             continue
         if prev is None or u.start - prev.end > 0.6:
-            room = 0.45
+            room, hard = 0.45, np.inf
         else:
             gap = max(0.0, u.start - prev.end)
             last_note_dur = off[prev.notes[-1]] - on[prev.notes[-1]]
             room = gap + 0.55 * last_note_dur
+            # the onset consonants never eat the previous syllable's minimum sung span
+            hard = gap + max(0.0, last_note_dur - MIN_SPAN)
         scale = min(1.0, room / d_on)
-        u.lead = d_on * max(scale, 0.3)
+        u.lead = min(d_on * max(scale, 0.3), hard)
 
     segments: list[Segment] = []
     for k, u in enumerate(units):
         nxt = units[k + 1] if k + 1 < len(units) else None
-        if u.breath:
-            segments.append(Segment(get("br"), u.start, u.end, note=u.notes[0], unit=k, level=0.8))
+        nxt_onset = nxt.start - nxt.lead if nxt is not None else np.inf
+        if u.breath or u.closure:
+            # stops where the next syllable's onset consonants begin
+            end = min(u.end, nxt_onset)
+            if end > u.start:
+                if u.breath:
+                    segments.append(Segment(get("br"), u.start, end, note=u.notes[0], unit=k, level=0.8))
+                else:
+                    segments += _expand_consonant(get("q"), u.start, end, False, u.notes[0], k)
             continue
         # onset consonants (placed before the vowel)
         t = u.start - u.lead
@@ -190,10 +242,9 @@ def plan_track(notes, tempo, language: str, style: Style, rng: np.random.Generat
             segments += _expand_consonant(get(p), t, t + dd, True, u.notes[0], k)
             t += dd
         # end of the sung span
-        span_end = u.end
-        if nxt is not None and nxt.start - nxt.lead < span_end + 1e-6:
-            span_end = nxt.start - nxt.lead
-        span_end = max(span_end, u.start + 0.03)
+        span_end = min(u.end, nxt_onset)
+        # keep a minimum sung span, but never run into the next syllable's onset consonants
+        span_end = max(span_end, min(u.start + MIN_SPAN, nxt_onset), u.start + 0.005)
         # coda consonants
         d_coda = [_cons_dur(get(p), False) for p in u.coda]
         coda_total = sum(d_coda)
@@ -269,9 +320,14 @@ def plan_track(notes, tempo, language: str, style: Style, rng: np.random.Generat
     for i, n in enumerate(notes):
         ui = note_unit[i]
         if ui < 0:
+            if i in silent_notes:
+                note_phonemes[n.id] = "sil"
             continue
         u = units[ui]
         first = u.notes[0] == i
+        note_phonemes[n.id] = " ".join(u.phones) if first else "-"
+        if u.breath or u.closure:
+            continue  # unpitched: takes no part in pitch transitions, dynamics or phrase arcs
         timings.append(NoteTiming(
             index=i, start=on[i], end=off[i],
             pitch=n.pitch + float(n.attr("detune", 0.0) or 0.0) / 100.0,
@@ -279,7 +335,6 @@ def plan_track(notes, tempo, language: str, style: Style, rng: np.random.Generat
             phrase_end=u.phrase_end and u.notes[-1] == i,
             lead=u.lead if first else 0.0, melisma=not first,
         ))
-        note_phonemes[n.id] = " ".join(u.phones) if first else "-"
     start = min((s.start for s in segments), default=0.0)
     end = max((s.end for s in segments), default=0.0)
     return Plan(segments, timings, units, note_phonemes, warnings, start, end)
@@ -307,14 +362,18 @@ def _vowel_segments(p: Phoneme, a: float, b: float, u: Unit, k: int, last: bool)
 
 def _expand_consonant(p: Phoneme, a: float, b: float, before_vowel: bool, note: int, unit: int,
                       final: bool = False) -> list[Segment]:
-    d = max(b - a, 0.005)
-    b = a + d
+    # squeezed consonants get shorter, never longer than their slot (that would push the
+    # following phones out of order)
+    d = b - a
+    if d <= 1e-6:
+        return []
     if p.kind == "affricate":
         stop, fric = get(p.parts[0]), get(p.parts[1])
         c_end = a + 0.42 * d
+        burst = min(0.006, 0.25 * d)
         return [
-            Segment(stop, a, c_end - 0.006, part="closure", note=note, unit=unit),
-            Segment(stop, c_end - 0.006, c_end, part="burst", note=note, unit=unit),
+            Segment(stop, a, c_end - burst, part="closure", note=note, unit=unit),
+            Segment(stop, c_end - burst, c_end, part="burst", note=note, unit=unit),
             Segment(fric, c_end, b, part="fric", note=note, unit=unit),
         ]
     if p.kind == "stop":
@@ -326,7 +385,8 @@ def _expand_consonant(p: Phoneme, a: float, b: float, before_vowel: bool, note: 
         scale = d / nominal if nominal > 0 else 1.0
         asp *= min(scale, 1.0)
         burst = min(burst, 0.3 * d)
-        closure = max(d - burst - asp, 0.002)
+        closure = max(d - burst - asp, min(0.002, 0.5 * d))
+        burst = min(burst, d - closure)
         segs = [Segment(p, a, a + closure, part="closure", note=note, unit=unit),
                 Segment(p, a + closure, a + closure + burst, part="burst", note=note, unit=unit)]
         if asp > 0.001:

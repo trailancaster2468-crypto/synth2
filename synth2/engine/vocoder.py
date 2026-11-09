@@ -41,8 +41,16 @@ LN10_20 = np.log(10.0) / 20.0
 OUTPUT_GAIN = 0.1  # global calibration (see tests/test_engine.py::test_loudness_calibration)
 VOICED_NORM = 0.85  # fraction of the envelope loudness that is normalised away for voiced pulses
 ALIGN_NORM = 0.7  # fraction of the harmonic/formant alignment gain that is compensated
+# the harmonics are taken to carry at least this fraction of the envelope power, which caps the alignment
+# gain at +14 dB: a lone harmonic far down the envelope (f0 near Nyquist) must not be boosted by 200 dB
+ALIGN_FLOOR = 0.01
+DENSE_HARM = 0.5  # harmonic/envelope power ratio when the harmonics sample the envelope densely (low f0)
+F0_MIN = 30.0  # Hz: f0 floor for the glottal open phase and pulse level (a fry pulse keeps a short open phase)
+F0_MAX = 0.45  # x sr: the voiced source fades out from 0.40 sr up to here, where no harmonic fits below Nyquist
+FORMANT_MAX = 0.47  # x sr: resonators fade out from 0.42 sr up to here instead of folding back to sr - F
 GRID = 3  # spectral envelopes are evaluated every GRID frames (~8.7 ms) and interpolated per pulse
 FRAC_STEPS = 64  # sub-sample pulse placement resolution (1/64 sample)
+SAMPLE_CHUNK = 1 << 16  # per-sample bookkeeping (glottal phase, breath gate) is done in blocks this long
 PULSE_POST_S = 0.0232  # seconds of vocal-tract ring-down kept after each glottal closure
 RD_MODAL = 0.9  # Fant's Rd for a neutral (tension 0) voice with source_tilt == 11
 FA_REF_HZ = 300.0  # f0 at which the return-phase corner equals f0 / (2 pi Ra)
@@ -56,10 +64,22 @@ def fft_size(sr: int) -> int:
     return 1 << int(round(np.log2(sr * 0.0464)))
 
 
-def _resonator_db(freqs: np.ndarray, F: np.ndarray, B: np.ndarray, sr: int) -> np.ndarray:
+def _nyquist_fade(F: np.ndarray, sr: int) -> np.ndarray:
+    """Weight (0..1) of a resonator at F Hz: 1 up to 0.42 sr, smoothly 0 from FORMANT_MAX * sr.
+
+    A digital resonator above Nyquist folds back to sr - F, a spurious resonance that a
+    higher sample rate would not have, so resonators near Nyquist fade out instead.
+    """
+    x = np.clip((FORMANT_MAX * sr - F) / (0.05 * sr), 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _resonator_db(freqs: np.ndarray, F: np.ndarray, B: np.ndarray, sr: int,
+                  weight: np.ndarray | None = None) -> np.ndarray:
     """Magnitude (dB) of DC-normalised digital 2-pole resonators.
 
-    freqs: (nb,) Hz; F, B: (k, m) -> returns (k, nb) summed over the m resonators.
+    freqs: (nb,) Hz; F, B: (k, m) -> returns (k, nb) summed over the m resonators, each
+    scaled in dB by ``weight`` (k, m) when given.
     Uses the closed form |1 - c z^-1 + r^2 z^-2|^2 = 1 + c^2 + r^4 - 2c(1 + r^2)cos w + 2r^2 cos 2w.
     """
     w = 2 * np.pi * freqs / sr
@@ -74,7 +94,10 @@ def _resonator_db(freqs: np.ndarray, F: np.ndarray, B: np.ndarray, sr: int) -> n
         c = c_all[:, j:j + 1]
         num = 1 - c + r2
         den2 = (1 + c * c + r2 * r2) - (2 * c * (1 + r2)) * cw + (2 * r2) * c2w
-        prod *= (num * num) / np.maximum(den2, 1e-30)
+        if weight is not None and np.any(weight[:, j] < 1.0):
+            prod *= ((num * num) / np.maximum(den2, 1e-30)) ** weight[:, j:j + 1]
+        else:
+            prod *= (num * num) / np.maximum(den2, 1e-30)
     return 10 * np.log10(np.maximum(prod, 1e-300))
 
 
@@ -109,7 +132,9 @@ def vocal_tract_db(freqs, formants, bandwidths, nasal, nasal_zero, sr):
     f5 = formants[:, 4]
     # a tube of length L resonates every c/2L ~ F5/4.5
     spacing = np.maximum(f5 - formants[:, 3], 0.22 * f5)
-    db = _resonator_db(freqs, formants, bandwidths, sr) + _higher_poles_db(freqs, f5, spacing, sr)
+    # formants pushed towards Nyquist (gender / toneShift at a low sample rate) fade out like the higher poles
+    fade = _nyquist_fade(formants, sr) if np.any(formants > 0.42 * sr) else None
+    db = _resonator_db(freqs, formants, bandwidths, sr, fade) + _higher_poles_db(freqs, f5, spacing, sr)
     if np.any(nasal > 0.01):
         # nasal coupling adds a pole-zero pair (Klatt's FNP/FNZ): the oral side-branch zero
         # plus a nasal pole just below it.  A lone DC-normalised zero would rise +12 dB/oct
@@ -118,7 +143,7 @@ def vocal_tract_db(freqs, formants, bandwidths, nasal, nasal_zero, sr):
         fz = nasal_zero
         z = _antiresonator_db(freqs, fz, np.full_like(fz, 120.0), sr)
         z += _resonator_db(freqs, (0.8 * fz)[:, None], (80.0 + 0.05 * fz)[:, None], sr)
-        db += nasal[:, None] * z
+        db += (nasal * _nyquist_fade(fz, sr))[:, None] * z
     return db
 
 
@@ -215,6 +240,10 @@ def loudness_weight(f: np.ndarray) -> np.ndarray:
 def _voiced_spectra(fp: FrameParams, idx: np.ndarray, voice, sr: int, n_fft: int):
     """Normalised voiced pulse spectra (complex, (k, n_fft//2+1)) at frames ``idx``.
 
+    Returns ``(H, oq, harm)``: ``harm`` (k,) is the amplitude of the harmonics relative
+    to the smooth envelope, ``sqrt(min(p_harm / (DENSE_HARM p_env), 1))``, which scales
+    the breath noise so it follows the periodic power (see :func:`_noise`).
+
     The minimum-phase part (vocal tract, return-phase tilt, colour) is built
     from the real cepstrum; the glottal open phase is multiplied in with its own
     (anticausal) phase.  Each spectrum is then loudness-normalised so phoneme
@@ -227,7 +256,9 @@ def _voiced_spectra(fp: FrameParams, idx: np.ndarray, voice, sr: int, n_fft: int
       harmonics actually carry relative to the smooth envelope.  Without it a
       formant sitting on H1 (e.g. /iy/ near E4) or between two harmonics makes
       one vowel up to ~10 dB louder than the next at the same pitch; keeping
-      30 % of it preserves the natural partial modulation of vibrato.
+      30 % of it preserves the natural partial modulation of vibrato.  The
+      correction is capped (``ALIGN_FLOOR``) for a lone harmonic far down the
+      envelope, e.g. f0 near Nyquist.
     """
     freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
     f0 = fp.f0[idx]
@@ -237,7 +268,7 @@ def _voiced_spectra(fp: FrameParams, idx: np.ndarray, voice, sr: int, n_fft: int
     db = vocal_tract_db(freqs, fp.formants[idx], fp.bandwidths[idx], fp.nasal[idx], fp.nasal_zero[idx], sr)
     db += colour_db(freqs, ten, voice)
     db -= 10 * np.log10(1 + (freqs[None, :] / fa[:, None]) ** 2)
-    g = glottal_spectrum(freqs, f0, oq)
+    g = glottal_spectrum(freqs, np.maximum(f0, F0_MIN), oq)
     fold = np.zeros(n_fft)
     fold[0] = 1
     fold[1:n_fft // 2] = 2
@@ -256,9 +287,10 @@ def _voiced_spectra(fp: FrameParams, idx: np.ndarray, voice, sr: int, n_fft: int
     w = pos - i0
     ph = np.take_along_axis(P, i0, axis=1) * (1 - w) + np.take_along_axis(P, i0 + 1, axis=1) * w
     p_harm = np.maximum((2 * fn / sr) * np.sum(ph * valid, axis=1), 1e-30)
-    gain = p_env ** (-0.5 * VOICED_NORM) * (p_harm / p_env) ** (-0.5 * ALIGN_NORM)
+    gain = p_env ** (-0.5 * VOICED_NORM) * np.maximum(p_harm / p_env, ALIGN_FLOOR) ** (-0.5 * ALIGN_NORM)
     H *= (gain * 10 ** (SOURCE_GAIN_DB / 20.0))[:, None]
-    return H, oq
+    harm = np.sqrt(np.minimum(p_harm / (DENSE_HARM * p_env), 1.0))
+    return H, oq, harm
 
 
 def _ola(out: np.ndarray, starts: np.ndarray, blocks: np.ndarray):
@@ -293,23 +325,40 @@ def _pulse_positions(fp: FrameParams, voice, sr: int, hop: float, n_samples: int
     f0 gets a slow "flutter" (band-limited random FM) and every pulse a small
     independent timing displacement (cycle-to-cycle jitter).  Displacing pulses
     instead of integrating random periods keeps the long-term pitch exact.
+
+    The per-sample phase is integrated in blocks of ``SAMPLE_CHUNK`` samples (the
+    running sum carries over, so the result equals one cumsum over the render) and
+    only its fractional part is kept, in single precision: ~4 bytes per output
+    sample instead of several full-length float64 temporaries.
     """
-    frame_pos_of_sample = np.arange(n_samples) / hop
-    f0_s = np.interp(frame_pos_of_sample, np.arange(fp.n), fp.f0)
-    if voice.jitter > 0:
-        flt = rng.standard_normal(fp.n // 4 + 2)
-        flt = np.interp(frame_pos_of_sample, np.linspace(0, fp.n, len(flt)), flt)
-        f0_s = f0_s * (1.0 + 0.7 * voice.jitter * flt)
-    phase = np.cumsum(f0_s / sr)
-    cyc = np.floor(phase)
-    idx = np.nonzero(np.diff(cyc))[0] + 1
-    frac = (phase[idx] - cyc[idx]) / np.maximum(f0_s[idx] / sr, 1e-9)
-    pos = idx - frac
+    flt = rng.standard_normal(fp.n // 4 + 2) if voice.jitter > 0 else None
+    flt_pos = np.linspace(0, fp.n, len(flt)) if flt is not None else None
+    frames = np.arange(fp.n)
+    f0 = np.minimum(fp.f0, F0_MAX * sr)  # the source is silent above (see synthesize): bound the pulse rate
+    gph = np.empty(n_samples, dtype=np.float32)
+    pos_l, f0_l = [], []
+    carry = 0.0
+    for s0 in range(0, n_samples, SAMPLE_CHUNK):
+        s1 = min(s0 + SAMPLE_CHUNK, n_samples)
+        frame_pos = np.arange(s0, s1) / hop
+        f0_s = np.interp(frame_pos, frames, f0)
+        if flt is not None:
+            f0_s *= 1.0 + 0.7 * voice.jitter * np.interp(frame_pos, flt_pos, flt)
+        phase = np.cumsum(np.concatenate(([carry], f0_s / sr)))  # phase[j + 1] belongs to sample s0 + j
+        carry = float(phase[-1])
+        cyc = np.floor(phase)
+        j = np.nonzero(np.diff(cyc))[0]
+        frac = (phase[j + 1] - cyc[j + 1]) / np.maximum(f0_s[j] / sr, 1e-9)
+        pos_l.append(s0 + j - frac)
+        f0_l.append(f0_s[j])
+        gph[s0:s1] = (phase - cyc)[1:]
+    pos = np.concatenate(pos_l) if pos_l else np.zeros(0)
+    f0_at = np.concatenate(f0_l) if f0_l else np.zeros(0)
     if voice.jitter > 0 and len(pos):
         # ~0.5 % local jitter (Praat definition) for the default voice.jitter of 0.004
-        pos = pos + (0.65 * voice.jitter * sr / f0_s[idx]) * np.clip(rng.standard_normal(len(pos)), -3, 3)
+        pos = pos + (0.65 * voice.jitter * sr / f0_at) * np.clip(rng.standard_normal(len(pos)), -3, 3)
         pos = np.maximum.accumulate(pos)
-    return pos, phase
+    return pos, gph
 
 
 def synthesize(fp: FrameParams, voice, sr: int, rng: np.random.Generator) -> np.ndarray:
@@ -318,11 +367,12 @@ def synthesize(fp: FrameParams, voice, sr: int, rng: np.random.Generator) -> np.
     n_noise = max(64, n_fft // 4)  # noise frames of ~11.6 ms, 4x overlap at the frame hop
     post = int(round(PULSE_POST_S * sr))
     n_samples = int(np.ceil(fp.n * hop)) + post
-    pre_max = int(0.4 * n_fft)  # room for the longest open phase (Oq * T0 at ~50 Hz)
-    out = np.zeros(n_samples + post + pre_max)
 
     gain = 10.0 ** (fp.loudness_db / 20.0) * OUTPUT_GAIN * 10 ** (voice.loudness_db / 20.0)
     v_amp = fp.voiced * np.clip(fp.voicing, 0, 1) * (1.0 - 0.25 * np.clip(fp.breath, 0, 1)) * gain
+    # no harmonic of an f0 near or above Nyquist fits in the band: the voiced source (and the breath
+    # noise riding on it) fades out between 0.40 sr and F0_MAX * sr instead of aliasing
+    v_amp = v_amp * np.clip((F0_MAX * sr - fp.f0) / (0.05 * sr), 0.0, 1.0)
 
     # ---------------------------------------------------------------- pulses
     pos, phase = _pulse_positions(fp, voice, sr, hop, n_samples, rng)
@@ -331,6 +381,27 @@ def synthesize(fp: FrameParams, voice, sr: int, rng: np.random.Generator) -> np.
     keep = va > 1e-5
     pos, fpos, va = pos[keep], fpos[keep], va[keep]
 
+    # pulse envelopes are interpolated between grid frames GRID * g0 and GRID * (g0 + 1)
+    n_grid = (fp.n - 1) // GRID + 1
+    gpos = np.clip(fpos, 0, fp.n - 1) / GRID
+    g0 = np.floor(gpos).astype(int)
+    gw = (gpos - g0).astype(np.float32)
+    g1 = np.minimum(g0 + 1, n_grid - 1)
+
+    # the longest open phase among the grid spectra the pulses use decides how many samples precede
+    # each closure; the pulse FFT (~46 ms) doubles until it holds that open phase plus the ring-down
+    # (low bass notes), so the open phase is never cut into a per-period step
+    if len(pos):
+        fr = np.minimum(np.unique(np.concatenate([g0, g1])) * GRID, fp.n - 1)
+        oq_r, _ = rd_glottal(fp.f0[fr], fp.tension[fr], fp.breath[fr], voice)
+        pre = int(np.ceil(np.max(oq_r * sr / np.maximum(fp.f0[fr], F0_MIN)))) + 8
+    else:
+        pre = 8
+    while pre > 0.4 * n_fft:
+        n_fft *= 2
+    lead = pre + 8  # samples of headroom before the first closure in the output buffer
+    out = np.zeros(n_samples + post + lead, dtype=np.float32)  # single precision: 4 bytes per sample
+
     nb = n_fft // 2 + 1
     kbin = np.arange(nb)
     # sub-sample delays as a table of linear-phase ramps (no transcendental maths per pulse)
@@ -338,30 +409,19 @@ def synthesize(fp: FrameParams, voice, sr: int, rng: np.random.Generator) -> np.
                    / n_fft).astype(np.complex64)
     shimmer = voice.shimmer_db * LN10_20
 
-    # pulse envelopes are interpolated between grid frames GRID * g0 and GRID * (g0 + 1)
-    n_grid = (fp.n - 1) // GRID + 1
-    gpos = np.clip(fpos, 0, fp.n - 1) / GRID
-    g0 = np.floor(gpos).astype(int)
-    gw = (gpos - g0).astype(np.float32)
-    g1 = np.minimum(g0 + 1, n_grid - 1)
     # magnitude of the voiced spectrum at the noise resolution, reused to shape breath noise
     ratio = n_fft // n_noise
     vmag = np.zeros((n_grid, n_noise // 2 + 1), dtype=np.float32)
+    have = np.zeros(n_grid, dtype=bool)
 
     f0p = _interp_frames(fp.f0, fpos)
-    amp = va * np.sqrt(sr / np.maximum(f0p, 30.0))
+    amp = va * np.sqrt(sr / np.maximum(f0p, F0_MIN))
     if shimmer > 0:
         amp = amp * np.exp(shimmer * rng.standard_normal(len(amp)))
     amp = amp.astype(np.float32)
     ip = np.floor(pos).astype(int)
     q = np.rint((pos - ip) * FRAC_STEPS).astype(int)
 
-    # longest open phase in this render decides how many samples precede each closure
-    if len(pos):
-        oq_all, _ = rd_glottal(f0p, _interp_frames(fp.tension, fpos), _interp_frames(fp.breath, fpos), voice)
-        pre = int(min(pre_max, np.ceil(np.max(oq_all * sr / np.maximum(f0p, 30.0))) + 8))
-    else:
-        pre = 8
     taper = np.ones(pre + post, dtype=np.float32)
     tl = post // 4
     taper[-tl:] = 0.5 + 0.5 * np.cos(np.linspace(0, np.pi, tl))
@@ -372,8 +432,9 @@ def synthesize(fp: FrameParams, voice, sr: int, rng: np.random.Generator) -> np.
         sl = slice(c0, c0 + CH)
         a, b = g0[sl], g1[sl]
         need, inv = np.unique(np.concatenate([a, b]), return_inverse=True)
-        Hg, _ = _voiced_spectra(fp, np.minimum(need * GRID, fp.n - 1), voice, sr, n_fft)
-        vmag[need] = np.abs(Hg[:, ::ratio])
+        Hg, _, hfac = _voiced_spectra(fp, np.minimum(need * GRID, fp.n - 1), voice, sr, n_fft)
+        vmag[need] = np.abs(Hg[:, ::ratio]) * hfac[:, None]
+        have[need] = True
         Hg = Hg.astype(np.complex64)
         k = len(a)
         w = gw[sl][:, None]
@@ -383,9 +444,19 @@ def synthesize(fp: FrameParams, voice, sr: int, rng: np.random.Generator) -> np.
         y = np.fft.irfft(H, n=n_fft, axis=1)  # single precision
         # closure at index 0; the anticausal open phase wrapped around to the end of the buffer
         blocks = np.concatenate([y[:, n_fft - pre:], y[:, :post]], axis=1) * taper[None, :]
-        _ola(out, ip[sl] - pre + pre_max, blocks)
+        _ola(out, ip[sl] - pre + lead, blocks)
 
-    voiced = out[pre_max:pre_max + n_samples]
+    # breath noise reads vmag on every grid row next to a voiced frame: fill the rows no pulse
+    # needed (pulses more than two rows apart below ~57 Hz, voicing edges) so it does not drop out
+    fv = np.nonzero(v_amp > 1e-6)[0] // GRID
+    rows = np.unique(np.minimum(np.concatenate([fv, fv + 1]), n_grid - 1))
+    rows = rows[~have[rows]]
+    for c0 in range(0, len(rows), CH):
+        r = rows[c0:c0 + CH]
+        Hg, _, hfac = _voiced_spectra(fp, np.minimum(r * GRID, fp.n - 1), voice, sr, n_fft)
+        vmag[r] = np.abs(Hg[:, ::ratio]) * hfac[:, None]
+
+    voiced = out[lead:lead + n_samples]
     # ---------------------------------------------------------------- noise
     voiced += _noise(fp, voice, sr, rng, gain, v_amp, phase, hop, n_samples, vmag, n_noise)
     return voiced
@@ -395,10 +466,13 @@ def _noise(fp: FrameParams, voice, sr, rng, gain, v_amp, phase, hop, n_samples, 
     """Breath + aspiration + frication noise via short-time inverse FFT overlap-add.
 
     * air: breath noise riding on the voice.  Its spectrum is the voiced spectrum
-      (``vmag``: pulse spectra on the envelope grid, at this resolution) minus a
-      harmonics-to-noise ratio (HNR) that falls with frequency, so a breathy voice
-      is airy at the top while the low harmonics stay clean.  It is pulsed by the
-      glottal cycle, peaking around maximum glottal flow.
+      (``vmag``: pulse spectra on the envelope grid, at this resolution, scaled by
+      the harmonic/envelope power ratio so it follows the power the harmonics
+      really carry, also at high f0 where a few harmonics sample a formant-rich
+      envelope) minus a harmonics-to-noise ratio (HNR) that falls with frequency,
+      so a breathy voice is airy at the top while the low harmonics stay clean.
+      It is pulsed by the glottal cycle (``phase``: glottal phase per sample, in
+      cycles), peaking around maximum glottal flow.
     * aspiration: h / stop release / breath intake / whisper, shaped by the vocal tract.
     * frication: resonance-shaped noise for s, sh, f, bursts...
 
@@ -414,7 +488,8 @@ def _noise(fp: FrameParams, voice, sr, rng, gain, v_amp, phase, hop, n_samples, 
     asp = (fp.asp + whisper) * gain
     air = v_amp
     fric = fp.fric * gain
-    noise = np.zeros(max(n * H, n_samples) + 3 * N)
+    # single precision accumulators (the output is float32 anyway): ~8 bytes per output sample
+    noise = np.zeros(max(n * H, n_samples) + 3 * N, dtype=np.float32)
     air_out = np.zeros_like(noise)
     win = np.hanning(N + 1)[:-1].astype(np.float32)
     scale = np.sqrt(8.0 * H / 3.0)  # Hann^2 overlap-add at hop H: E[noise^2] = mean(|mag|^2)
@@ -477,8 +552,11 @@ def _noise(fp: FrameParams, voice, sr, rng, gain, v_amp, phase, hop, n_samples, 
     noise = noise[N:N + n_samples]
     air_out = air_out[N:N + n_samples]
     # breath noise is pulsed by the glottal cycle: strongest near maximum flow, late in the
-    # open phase (the closure instant is at integer phase)
-    ph = phase[:n_samples] - np.floor(phase[:n_samples])
-    gate = 0.3 + 1.4 * (0.5 - 0.5 * np.cos(2 * np.pi * (ph - 0.3))) ** 2
-    gate /= np.sqrt(0.3 ** 2 + 2 * 0.3 * 1.4 * 0.375 + 1.4 ** 2 * 35.0 / 128.0)  # unit RMS over a cycle
-    return noise + air_out * gate
+    # open phase (the closure instant is at integer phase); gated in blocks to bound memory
+    norm = 1.0 / np.sqrt(0.3 ** 2 + 2 * 0.3 * 1.4 * 0.375 + 1.4 ** 2 * 35.0 / 128.0)  # unit RMS over a cycle
+    for s0 in range(0, n_samples, SAMPLE_CHUNK):
+        s1 = min(s0 + SAMPLE_CHUNK, n_samples)
+        ph = phase[s0:s1] - np.floor(phase[s0:s1])
+        gate = 0.3 + 1.4 * (0.5 - 0.5 * np.cos(2 * np.pi * (ph - 0.3))) ** 2
+        noise[s0:s1] += air_out[s0:s1] * (gate * norm)
+    return noise

@@ -169,8 +169,9 @@ def pitch_accuracy(project, result, max_list: int = 10) -> dict:
         errors = []
         missing = []
         for n in tr.notes:
-            if (n.lyric or "").strip().lower() in ("br", "breath", "", "r"):
-                continue
+            lyr = (n.lyric or "").strip().lower()
+            if lyr in ("br", "breath", "", "r", "[br]", ".br") or (n.phonemes or "").strip() == "br":
+                continue  # breaths and rests have no pitch
             a, b = b2s(n.onset), b2s(n.end)
             if b - a < 0.12 or a < span0 or b > span1:
                 continue  # too short to judge, or outside a partial render
@@ -185,11 +186,13 @@ def pitch_accuracy(project, result, max_list: int = 10) -> dict:
                 missing.append({"id": n.id, "beat": n.onset, "note": midi_to_note(n.pitch), "lyric": n.lyric})
                 continue
             target = n.pitch + float(n.attrs.get("detune", 0) or 0) / 100.0
+            # octave errors from the tracker are not pitch errors of the singer: fold every frame
+            # to the octave nearest the target *before* the median, otherwise a mix of 1x and 2x
+            # frames gives a median in between (about +700 cents) for a correctly sung note
+            target_hz = 440.0 * 2 ** ((target - 69) / 12.0)
+            v = v * 2.0 ** -np.round(np.log2(v / target_hz))
             sung = 69 + 12 * np.log2(np.median(v) / 440.0)
             cents = float((sung - target) * 100)
-            # octave errors from the tracker are not pitch errors of the singer
-            if abs(abs(cents) - 1200) < 60:
-                cents = cents - np.sign(cents) * 1200
             errors.append({"id": n.id, "beat": n.onset, "note": midi_to_note(n.pitch), "lyric": n.lyric,
                            "cents": round(cents, 1)})
         abs_err = np.array([abs(e["cents"]) for e in errors]) if errors else np.zeros(0)

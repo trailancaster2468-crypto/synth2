@@ -121,14 +121,33 @@ def _smoothstep(x):
     return x * x * (3.0 - 2.0 * x)
 
 
-def smooth_noise(n: int, frame_rate: float, rng: np.random.Generator, cutoff_hz: float = 1.5, n_sines: int = 6):
-    """Low-frequency band-limited noise in [-1, 1] built from random sinusoids."""
-    t = np.arange(n) / frame_rate
+def smooth_noise(n: int, frame_rate: float, rng: np.random.Generator, cutoff_hz: float = 1.5, n_sines: int = 6,
+                 t0: float = 0.0):
+    """Low-frequency band-limited noise in [-1, 1] built from random sinusoids.
+
+    ``t0`` is the absolute time of the first frame, so the same ``rng`` state gives the same
+    noise at the same time whatever window is rendered.
+    """
+    t = t0 + np.arange(n) / frame_rate
     out = np.zeros(n)
     for _ in range(n_sines):
         f = rng.uniform(0.15, cutoff_hz)
         out += np.sin(2 * np.pi * f * t + rng.uniform(0, 2 * np.pi))
     return out / np.sqrt(n_sines / 2.0)
+
+
+def _keyed_rng(rng: np.random.Generator, *key: int) -> np.random.Generator:
+    """A generator that depends only on the seed ``rng`` was made from and on ``key``.
+
+    It does not depend on how much of ``rng`` has been drawn (by the planner, or for other notes),
+    so a partial render gets the same randomness for a note as the full render of the song.
+    """
+    bg = rng.bit_generator
+    ss = getattr(bg, "seed_seq", None) or getattr(bg, "_seed_seq", None)
+    if not isinstance(ss, np.random.SeedSequence):
+        return rng
+    spawn = tuple(ss.spawn_key) + tuple(int(k) % (1 << 32) for k in key)
+    return np.random.default_rng(np.random.SeedSequence(ss.entropy, spawn_key=spawn))
 
 
 def build_pitch(t: np.ndarray, notes: list[NoteTiming], style: Style, voice, rng: np.random.Generator,
@@ -145,8 +164,11 @@ def build_pitch(t: np.ndarray, notes: list[NoteTiming], style: Style, voice, rng
     pitch = np.full(n, notes[0].pitch, dtype=float)
     for i in range(1, len(notes)):
         nt, prev = notes[i], notes[i - 1]
-        if nt.start - prev.end >= 0.08:
-            # separated by a rest: switch while silent, just before the onset consonants
+        if (nt.start - nt.lead) - prev.end >= 0.08:
+            # separated by a rest that is still silent where the onset consonants begin: switch
+            # while silent, just before them. (Onset consonants may borrow the whole rest and part
+            # of the previous note; then the previous vowel is still sounding and the note is
+            # joined with a normal transition below instead of a jump inside that vowel.)
             pitch[t >= nt.start - nt.lead - 0.015] = nt.pitch
             continue
         interval = nt.pitch - prev.pitch
@@ -169,7 +191,8 @@ def build_pitch(t: np.ndarray, notes: list[NoteTiming], style: Style, voice, rng
             pm = (px > 0) & (px < 1)
             pitch[pm] -= np.sign(interval) * min(abs(interval), 7) * prep * np.sin(np.pi * px[pm])
         # overshoot: damped oscillation after arriving
-        ov = nt.attrs.get("overshoot", style.overshoot) * (1 - robotic)
+        ov = nt.attrs.get("overshoot")
+        ov = (style.overshoot if ov is None else float(ov)) * (1 - robotic)
         if ov > 0:
             dt = t - b
             om = (dt > 0) & (dt < 0.4)
@@ -196,36 +219,41 @@ def build_pitch(t: np.ndarray, notes: list[NoteTiming], style: Style, voice, rng
             m = (x >= 0) & (x <= 1.2)
             pitch[m] -= style.fall * np.clip(x[m], 0, 1.2) ** 2 * (1 - robotic)
 
-    # 3) vibrato
+    # 3) vibrato. Each note's randomness comes from its own generator keyed by its onset time, and
+    #    everything is a function of absolute time, so a partial render sings the same vibrato.
     vib = np.zeros(n)
     for nt in notes:
         dur = nt.end - nt.start
         depth = nt.attrs.get("vibrato_depth")
         depth = voice.vibrato_depth * style.vibrato_depth if depth is None else float(depth)
-        if depth <= 0 or dur < style.vibrato_min_note:
-            continue
         rate = nt.attrs.get("vibrato_rate")
         rate = voice.vibrato_rate * style.vibrato_rate if rate is None else float(rate)
+        if depth <= 0 or rate <= 0 or dur < style.vibrato_min_note:
+            continue
         vstart = nt.attrs.get("vibrato_start")
         vstart = min(style.vibrato_start, 0.45 * dur) if vstart is None else float(vstart)
         a = nt.start + vstart
         m = (t >= a) & (t < nt.end + 0.05)
         if not m.any():
             continue
+        nrng = _keyed_rng(rng, 1, int(round(nt.start * 1000)))
+        p_wob, p0, p_dwob = nrng.uniform(0, 6.28), nrng.uniform(0, 0.5), nrng.uniform(0, 6.28)
         tt = t[m] - a
         fade_in = _smoothstep(tt / max(style.vibrato_fade, 1e-3))
         fade_out = _smoothstep((nt.end + 0.05 - t[m]) / 0.12)
-        wobble = 1.0 + (1 - robotic) * 0.06 * np.sin(2 * np.pi * 0.8 * tt + rng.uniform(0, 6.28))
-        phase = 2 * np.pi * np.cumsum(rate * wobble) / frame_rate + rng.uniform(0, 0.5)
-        dwob = 1.0 + (1 - robotic) * 0.15 * np.sin(2 * np.pi * 0.55 * tt + rng.uniform(0, 6.28))
+        # phase = 2 pi * integral from the vibrato start of rate * (1 + w sin(2 pi 0.8 s + p_wob)) ds
+        w, wf = (1 - robotic) * 0.06, 2 * np.pi * 0.8
+        phase = 2 * np.pi * rate * (tt + w / wf * (np.cos(p_wob) - np.cos(wf * tt + p_wob))) + p0
+        dwob = 1.0 + (1 - robotic) * 0.15 * np.sin(2 * np.pi * 0.55 * tt + p_dwob)
         vib[m] += depth * dwob * fade_in * fade_out * np.sin(phase)
     if vibrato_env is not None:
         vib *= vibrato_env
     pitch += vib
 
-    # 4) drift
+    # 4) drift (on absolute time, from a generator that only depends on the seed)
     if style.drift_cents > 0 and robotic < 1:
-        pitch += smooth_noise(n, frame_rate, rng, 2.0) * style.drift_cents / 100.0 * (1 - robotic)
+        drift = smooth_noise(n, frame_rate, _keyed_rng(rng, 0), 2.0, t0=float(t[0]) if n else 0.0)
+        pitch += drift * style.drift_cents / 100.0 * (1 - robotic)
     return pitch
 
 
@@ -255,20 +283,33 @@ def build_dynamics(t: np.ndarray, notes: list[NoteTiming], style: Style, voice, 
         x = np.clip((t[m] - a) / (b - a), 0, 1)
         loud[m] += style.phrase_arc_db * (np.sin(np.pi * np.clip(x * 1.2, 0, 1)) - 0.5)
 
+    # per-note velocity / tension / breathiness hold over the note's whole sung span: from its onset
+    # consonants (start - lead) to where the next note's consonants begin, or through the release of
+    # a phrase-final note (short of an automatic breath before the next phrase). The spans are
+    # assigned, not added, so they can neither overlap nor leave gaps when note times are humanized.
+    vel_db, ten_off, br_off = np.zeros(n), np.zeros(n), np.zeros(n)
+    for i, nt in enumerate(notes):
+        nxt = notes[i + 1].start - notes[i + 1].lead if i + 1 < len(notes) else np.inf
+        hi = min(nxt, nt.end + 0.1) if nt.phrase_end or i + 1 == len(notes) else nxt
+        m = (t >= nt.start - nt.lead) & (t < hi)
+        v = nt.attrs.get("velocity")
+        vel_db[m] = 20 * np.log10(max(1.0 if v is None else float(v), 0.05))
+        v = nt.attrs.get("tension")
+        ten_off[m] = 0.0 if v is None else float(v)
+        v = nt.attrs.get("breathiness")
+        br_off[m] = 0.0 if v is None else float(v)
+    loud += vel_db
+    tension += ten_off
+    breath += br_off
+
     for i, nt in enumerate(notes):
         dur = nt.end - nt.start
         m = (t >= nt.start) & (t < nt.end)
         if not m.any():
             continue
         x = (t[m] - nt.start) / max(dur, 1e-3)
-        vel = float(nt.attrs.get("velocity", 1.0) or 1.0)
-        loud[m] += 20 * np.log10(max(vel, 0.05))
         if dur > 0.5:
             loud[m] += style.note_swell_db * np.sin(np.pi * x) * min(1.0, (dur - 0.5) / 0.5)
-        if nt.attrs.get("tension") is not None:
-            tension[m] += float(nt.attrs["tension"])
-        if nt.attrs.get("breathiness") is not None:
-            breath[m] += float(nt.attrs["breathiness"])
         if nt.phrase_end:
             # the taper (and the breathier tone) holds through the release instead of snapping
             # back while the voice is still fading out
@@ -292,14 +333,45 @@ def _smooth(x: np.ndarray, width: int) -> np.ndarray:
     return np.convolve(xp, k / k.sum(), mode="same")[width:-width]
 
 
+def _times_to_beats(t: np.ndarray, beat_to_sec, beats: np.ndarray) -> np.ndarray:
+    """Map times (s) to beats between ``beats[0]`` and ``beats[-1]`` (sorted).
+
+    ``beat_to_sec`` is linear between tempo changes, so its inverse is interpolated through
+    ``beats`` plus every tempo change between them, which is exact for a :class:`TempoMap` (passed
+    itself or as its bound ``beat_to_sec``). Another callable is sampled finely instead. Times
+    outside that span only keep their side of it (a curve is constant there).
+    """
+    tempo = beat_to_sec if hasattr(beat_to_sec, "beat_to_sec") else getattr(beat_to_sec, "__self__", None)
+    b2s = getattr(beat_to_sec, "beat_to_sec", beat_to_sec)
+    b0, b1 = beats[0], beats[-1]
+    tempo_points = getattr(tempo, "points", None)
+    if tempo_points is not None:
+        breaks = np.array([float(p.beat) for p in tempo_points], dtype=float)
+    else:
+        breaks = np.linspace(b0, b1, 2049)
+    grid = np.unique(np.concatenate([beats, breaks[(breaks > b0) & (breaks < b1)]]))
+    secs = np.array([b2s(float(b)) for b in grid])
+    tb = np.interp(t, secs, grid)
+    tb[t < secs[0]] = b0 - 1.0
+    tb[t > secs[-1]] = b1 + 1.0
+    return tb
+
+
 def evaluate_curve(curve, t: np.ndarray, beat_to_sec, default: float) -> np.ndarray:
-    """Evaluate a project :class:`~synth2.project.Curve` at times ``t`` (seconds)."""
+    """Evaluate a project :class:`~synth2.project.Curve` at times ``t`` (seconds).
+
+    The curve is interpolated in beat space, the way the studio's parameter lanes draw it, so a
+    tempo change between two points does not bend it. ``beat_to_sec`` is the tempo map's
+    ``beat_to_sec`` (or the :class:`TempoMap` itself).
+    """
     if curve is None or not curve.points:
         return np.full(len(t), default, dtype=float)
-    xs = np.array([beat_to_sec(b) for b, _ in curve.points])
-    ys = np.array([v for _, v in curve.points], dtype=float)
-    if len(xs) == 1:
+    pts = sorted(curve.points, key=lambda p: p[0])  # stable: same-beat jumps keep their order
+    ys = np.array([v for _, v in pts], dtype=float)
+    if len(pts) == 1:
         return np.full(len(t), ys[0])
+    xs = np.array([b for b, _ in pts], dtype=float)
+    t = _times_to_beats(np.asarray(t, dtype=float), beat_to_sec, xs)  # from here on t is in beats
     if curve.interpolation == "step":
         idx = np.clip(np.searchsorted(xs, t, side="right") - 1, 0, len(xs) - 1)
         return ys[idx]

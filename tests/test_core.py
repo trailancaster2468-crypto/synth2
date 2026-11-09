@@ -184,3 +184,33 @@ def test_estimate_f0_memory_is_bounded_and_blocking_is_exact(monkeypatch):
     monkeypatch.setattr(analysis, "_F0_BLOCK", 97)
     got = estimate_f0(x[: 3 * sr], sr, return_confidence=True)
     assert all(np.array_equal(a, b) for a, b in zip(ref, got))
+
+
+def test_pitch_accuracy_folds_octave_errors_per_frame():
+    """A two-cluster f0 track (1x and 2x frames) must not median out to about +700 cents."""
+    import numpy as np
+
+    from synth2 import Project
+    from synth2.analysis import pitch_accuracy
+    from synth2.engine.renderer import RenderResult
+    import synth2.analysis as analysis
+
+    p = Project.new("t", bpm=60)
+    tr = p.tracks[0]
+    tr.add_note(1, 2, 59, "oh")
+    sr = 8000
+    res = RenderResult(np.zeros((sr * 4, 2), dtype=np.float32), sr, {tr.id: np.zeros((sr * 4, 2), dtype=np.float32)}, {})
+    hz = 440 * 2 ** ((59 - 69) / 12)
+
+    def fake_f0(mono, sr_, return_confidence=False, **kw):
+        t = np.arange(0, 4, 0.005)
+        f0 = np.where(np.arange(len(t)) % 2 == 0, hz, 2 * hz)
+        return (t, f0, np.ones_like(t)) if return_confidence else (t, f0)
+
+    orig = analysis.estimate_f0
+    analysis.estimate_f0 = fake_f0
+    try:
+        out = pitch_accuracy(p, res)["tracks"][0]
+    finally:
+        analysis.estimate_f0 = orig
+    assert out["max_abs_cents"] < 5

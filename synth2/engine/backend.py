@@ -22,7 +22,14 @@ class VoiceBackend(Protocol):
 
     def render_track(self, project, track, sample_rate: int, t0: float, t1: float,
                      note_range: tuple[float, float] | None = None) -> tuple[np.ndarray, dict]:
-        """Return (mono float32 audio covering [t0, t1) seconds, report dict)."""
+        """Return (mono float32 audio covering [t0, t1) seconds, report dict).
+
+        Sample ``i`` of the audio is at time ``t0 + i / sample_rate``. ``note_range`` (beats) is
+        set for a partial render: the audio must still be what the full render has over
+        ``[t0, t1)`` (so plan with the whole track as context, not only the notes in the window),
+        and the report's ``notes``, ``phonemes`` and ``warnings`` cover only the notes that
+        overlap ``note_range``.
+        """
         ...
 
 

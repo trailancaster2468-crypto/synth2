@@ -128,12 +128,28 @@ def build_params(plan: Plan, t: np.ndarray, voice, pitch_semitones: np.ndarray, 
     nzero = np.full(n, np.nan)
     sharp = np.zeros(n, dtype=bool)  # frames where amplitude changes must stay sharp (bursts)
 
-    def idx(a, b):
-        i0 = int(np.clip(np.floor((a - t0) / fp + 0.5), 0, n))
-        i1 = int(np.clip(np.floor((b - t0) / fp + 0.5), 0, n))
-        if i1 <= i0 and i0 < n and b > a:
+    def span(a, b):
+        """Frames [i0, i1) covered by the time range [a, b), not clipped to the frame grid."""
+        i0 = int(np.floor((a - t0) / fp + 0.5))
+        i1 = int(np.floor((b - t0) / fp + 0.5))
+        if i1 <= i0 and b > a:
             i1 = i0 + 1
         return i0, i1
+
+    def idx(a, b):
+        # clip after the one-frame minimum: a segment lying wholly before the first frame (e.g. the
+        # notes kept before the start of a partial render) or after the last one must give an empty
+        # range, not be squashed onto the edge frame
+        i0, i1 = span(a, b)
+        return min(max(i0, 0), n), min(max(i1, 0), n)
+
+    def ramp(a, b, shape):
+        # envelope ramp over [a, b), evaluated on the unclipped span so a ramp cut by the edge of a
+        # partial render keeps the values a full render has there
+        i0, i1 = span(a, b)
+        lo, hi = max(i0, 0), min(i1, n)
+        if hi > lo:
+            env[lo:hi] *= shape(np.linspace(0.0, 1.0, i1 - i0))[lo - i0:hi - i0]
 
     for s in plan.segments:
         i0, i1 = idx(s.start, s.end)
@@ -162,18 +178,12 @@ def build_params(plan: Plan, t: np.ndarray, voice, pitch_semitones: np.ndarray, 
         if u.breath:
             continue
         if u.phrase_start and u.lead <= 0.0:
-            i0, i1 = idx(u.start - 0.01, u.start + 0.06)
-            if i1 > i0:
-                env[i0:i1] *= np.linspace(0.0, 1.0, i1 - i0) ** 1.5
+            ramp(u.start - 0.01, u.start + 0.06, lambda x: x ** 1.5)
         elif u.phrase_start:
             a = u.start - u.lead
-            i0, i1 = idx(a, a + min(0.03, 0.5 * u.lead))
-            if i1 > i0:
-                env[i0:i1] *= np.linspace(0.0, 1.0, i1 - i0)
+            ramp(a, a + min(0.03, 0.5 * u.lead), lambda x: x)
         if u.phrase_end:
-            i0, i1 = idx(u.end - 0.07, u.end + 0.005)
-            if i1 > i0:
-                env[i0:i1] *= np.linspace(1.0, 0.0, i1 - i0) ** 0.8
+            ramp(u.end - 0.07, u.end + 0.005, lambda x: (1.0 - x) ** 0.8)
 
     # smoothing (in frames)
     ms = lambda x: x / 1000.0 / fp  # noqa: E731

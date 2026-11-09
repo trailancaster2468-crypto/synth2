@@ -98,7 +98,8 @@ res: RenderResult = render_project(project, *, sample_rate=None, track_ids=None,
                                    start_beat=None, end_beat=None, progress=None)
 res.audio        # float32 (n, 2)
 res.sample_rate  # int
-res.stems        # dict[track_id, float32 (n, 2)]: post-fader, pre-reverb
+res.stems        # dict[track_id, float32 (n, 2)]: post-fader, pre-reverb, with the master
+                 #   normalisation and gain applied (stems sum to the dry part of the master)
 res.report       # dict (JSON-serialisable): duration_s, peak_db, rms_db, render_time_s,
                  #   realtime_factor, tracks: [{id, name, warnings: [str], notes, phonemes}]
 res.save(path, bits=16)            # write master WAV
