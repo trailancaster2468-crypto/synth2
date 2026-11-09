@@ -1274,3 +1274,10 @@ def test_lyric_tokens_hyphenation_and_overflow():
     assert out[1].lyric.startswith("[") and "s t aa r" in out[1].lyric and "sh" in out[1].lyric
     assert [n.lyric for n in composer.fit_lyrics(two, "oh my br shine")] == ["oh", "my shine"]
     assert [n.lyric for n in composer.fit_lyrics(two, "oh br br")] == ["oh", "br"]
+
+
+def test_hyphenated_compound_words_keep_each_parts_syllables():
+    from synth2.ai.composer import lyric_tokens
+
+    assert lyric_tokens("never-ending") == ["never", "+", "ending", "+"]
+    assert lyric_tokens("beau-ti-ful") == ["beautiful", "+", "+"]

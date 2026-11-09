@@ -443,7 +443,12 @@ def _hyphenated(tok: str) -> list[str]:
     joined = "".join(parts)
     if len(parts) > 1 and english.lookup(joined) is not None:
         return [joined] + ["+"] * (len(parts) - 1)
-    return parts
+    # a compound of real words (never-ending): each part keeps its own syllables
+    out: list[str] = []
+    for part in parts:
+        out.append(part)
+        out.extend(["+"] * (english.count_syllables(part) - 1))
+    return out
 
 
 def lyric_tokens(text: str, language: str = "en") -> list[str]:

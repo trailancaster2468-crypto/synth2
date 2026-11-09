@@ -17,10 +17,10 @@ key: C major
 track: Lead voice=aurora style=pop lang=en pan=0
 r w
 # --- verse
-E4 e city    E4 e +    G4 q lights   G4 e are   A4 e calling  G4 e +   E4 e out  D4 e my  | E4 h. name  r e
-G4 e all     G4 e the  A4 q heart    G4 e beats E4 e burning   F4 e +   E4 e like D4 e a   | C4 h. flame r e
+E4 e city    E4 e +    G4 q lights   G4 e are   A4 e calling  G4 e +   E4 e out  | D4 e my  E4 h. name  r e
+G4 e all     G4 e the  A4 q heart    G4 e beats E4 e burning   F4 e +   E4 e like | D4 e a   C4 h. flame r e
 E4 e we      E4 e keep G4 e dancing  G4 e +     A4 e through   C5 e the B4 e silver A4 e + | G4 h. rain  r q
-F4 e hold    E4 e me   D4 q close    E4 e and   F4 e never     E4 e +   D4 e let  C4 e me  | D4 h. go    r e
+F4 e hold    E4 e me   D4 q close    E4 e and   F4 e never     E4 e +   D4 e let  | C4 e me  D4 h. go    r e
 r w
 # --- chorus
 C5 q neon{tension=0.3}  B4 e +   G4 q. hearts   r e   A4 e we  | C5 q light  D5 e up  C5 e the  E5 h sky{vibrato_depth=0.45}
@@ -39,7 +39,7 @@ track: Lead voice=seraph style=ballad lang=en reverb=0.4
 r h
 D4 q amazing | G4 h + B4 e + G4 e - | B4 h grace A4 q how | G4 h sweet E4 q the | D4 h sound D4 q that
 G4 h saved B4 e a G4 e - | B4 h wretch A4 q like | D5 h. me{vibrato_depth=0.4} | r h B4 q i
-D5 h. once B4 e was G4 e - | B4 h lost A4 q but | G4 h now E4 q am | D4 h found D4 q was
+D5 h once B4 e was G4 e - | B4 h lost A4 q but | G4 h now E4 q am | D4 h found D4 q was
 G4 h blind B4 e but G4 e - | B4 h now A4 q i | G4 h. see | G4 h. -
 """,
     "sakura": """\

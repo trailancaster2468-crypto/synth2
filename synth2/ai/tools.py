@@ -460,6 +460,11 @@ def _track(session: Session, ref, required: bool = True) -> Track:
         if not p.tracks:
             raise ToolError("the project has no tracks; create one with add_track")
         return p.tracks[0]
+    ref_s = str(ref).strip()
+    if isinstance(ref, str):
+        for t in p.tracks:  # an exact id wins over a digit string read as an index
+            if t.id == ref_s:
+                return t
     if isinstance(ref, int) or (isinstance(ref, str) and re.fullmatch(r"\s*-?\d+\s*", ref)):
         i = int(ref)
         if not 0 <= i < len(p.tracks):

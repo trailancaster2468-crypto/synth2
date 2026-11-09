@@ -239,9 +239,19 @@ def _history_lists(session) -> tuple[list | None, list | None]:
     return undo, redo
 
 
-def push_undo(session, label: str = "edit") -> None:
-    """Push an undo snapshot of the session's current project (before a mutation)."""
+def push_undo(session, label: str = "edit", new_path=False) -> None:
+    """Push an undo snapshot of the session's current project (before a mutation).
+
+    Pass ``new_path`` (``None`` or a path) when the step also switches the project file, so
+    undo/redo restore the matching path and a later Save never writes into the wrong file.
+    """
     # synth2.ai.tools.Session.push_undo(label) is the contract; the other names are defensive fallbacks.
+    if new_path is not False and hasattr(session, "path"):
+        try:
+            session.push_undo(label, None, (session.path, new_path))
+            return
+        except (AttributeError, TypeError):
+            pass
     for name in ("push_undo", "push_snapshot", "save_undo", "record_undo", "_push_undo"):
         fn = getattr(session, name, None)
         if callable(fn):
@@ -944,7 +954,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise HttpError(400, f"invalid project: {exc}") from None
         st = self.state
         with st.lock:
-            push_undo(st.session, "new project")
+            push_undo(st.session, "new project", new_path=None)
             st.session.project = project
             if hasattr(st.session, "path"):
                 st.session.path = None  # a new project has no file yet: Save asks for one
@@ -1144,7 +1154,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             project.title = re.sub(r"(\.s2p)?\.[A-Za-z0-9]+$", "", filename) or "Imported"
         st = self.state
         with st.lock:
-            push_undo(st.session, f"import {filename}")
+            push_undo(st.session, f"import {filename}", new_path=None)
             st.session.project = project
             if hasattr(st.session, "path"):
                 st.session.path = None  # the upload came from the browser; Save asks where to write

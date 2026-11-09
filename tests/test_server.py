@@ -691,3 +691,17 @@ def test_ai_chat_does_not_freeze_the_studio(srv, monkeypatch):
     assert r["project"]["title"] == "During AI"  # the director's edit applied on top of the studio's
     assert any(n["lyric"] == "late" for n in r["project"]["tracks"][0]["notes"])
     assert r["history"]["undo"] == 2
+
+
+def test_undo_of_new_project_or_import_restores_the_save_path():
+    from synth2.ai.tools import Session
+    from synth2.server.app import push_undo
+
+    s = Session()
+    s.path = "song.s2p.json"
+    push_undo(s, "import x.svp", new_path=None)
+    s.path = None
+    s.undo()
+    assert s.path == "song.s2p.json"
+    s.redo()
+    assert s.path is None
