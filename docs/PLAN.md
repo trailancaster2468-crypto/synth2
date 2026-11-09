@@ -30,9 +30,11 @@ real singers. We cannot download or train those here. The built-in engine is a
 parametric source-filter / pulse-synchronous vocoder (WORLD-style overlap-add
 with formant-synthesised spectral envelopes). It is clear, controllable and
 fast, but it sounds synthetic. The engine is built behind a **backend
-interface** (`synth2.engine.backend`) so that a neural acoustic model and
-vocoder (for example a DiffSinger-style ONNX voicebank via `onnxruntime`) can be
-plugged in later without changing the project model, tools or GUI.
+interface** (`synth2.engine.backend`), and a second engine plugs into it: the
+**neural engine** (`synth2.neural`), which runs a DiffSinger voicebank and a
+neural vocoder on `onnxruntime`. It is an optional extra with models that are
+downloaded separately under their own licences. Its contract is in
+[`docs/NEURAL.md`](NEURAL.md).
 
 ## Architecture
 

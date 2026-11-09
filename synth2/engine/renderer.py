@@ -16,7 +16,8 @@ from ..phonemes import english, japanese
 from ..project import CURVE_SPECS, Project, Track, iter_active_tracks
 from ..timing import midi_to_note
 from ..voices import get_voice
-from .backend import backend_for_voice, register_backend
+from .backend import (backend_for_track, backend_for_voice, engine_signature, parse_quality,  # noqa: F401
+                      register_backend, render_options)
 from .expression import build_dynamics, build_pitch, evaluate_curve, get_style
 from .params import build_params
 from .planner import plan_track
@@ -89,6 +90,50 @@ def _stem_name(name: str, tid: str, used: set[str]) -> str:
     return safe
 
 
+def track_report(project: Project, track: Track, plan, voice, style, audio: np.ndarray,
+                 note_range: tuple[float, float] | None = None, *, engine: str = "formant",
+                 check_range: bool = True) -> dict:
+    """The per-track render report every backend returns.
+
+    It covers the notes in ``note_range`` (beats) only, all of them for a full render: planner
+    warnings about those notes, notes outside the voice's range (``check_range``), English words
+    whose pronunciation was guessed, and the phonemes each note was sung with. ``plan`` is the
+    :func:`.planner.plan_track` result, ``voice`` and ``style`` the resolved voice and style, and
+    ``audio`` the dry mono render (for the peak).
+    """
+    notes = track.notes if note_range is None else track.notes_in_range(*note_range)
+    shown = {n.id for n in notes}
+    all_ids = {n.id for n in track.notes}
+    warnings = []
+    for w in plan.warnings:  # keep warnings about shown notes, and those about no note at all
+        ids = set(re.findall(r"[^\s,;:()'\"]+", w)) & all_ids
+        if not ids or ids & shown:
+            warnings.append(w)
+    if check_range:
+        for n in notes:
+            if n.pitch < voice.range_low - 2 or n.pitch > voice.range_high + 2:
+                warnings.append(
+                    f"note {n.id} ({midi_to_note(n.pitch)} at beat {n.onset:g}) is outside {voice.name}'s "
+                    f"range {midi_to_note(voice.range_low)}-{midi_to_note(voice.range_high)}")
+    guessed = sorted({
+        w for n in notes for w in re.findall(r"[A-Za-z']+", n.lyric or "")
+        if (n.attrs.get("language") or track.language) == "en" and not japanese.is_kana(n.lyric or "")
+        and not n.phonemes and not (n.lyric or "").startswith((".", "[")) and w.lower() not in ("br",)
+        and english.lookup(w) is None and len(w) > 1
+    })
+    if guessed:
+        warnings.append("pronunciation guessed (not in dictionary): " + ", ".join(guessed[:20])
+                        + " - use '+' continuation notes for split words or set explicit phonemes")
+    if plan.start < 0 and (note_range is None or note_range[0] <= 0):
+        warnings.append("the first consonants start before beat 0 and are cut; start the song at beat 1 or later")
+    return {
+        "id": track.id, "name": track.name, "voice": voice.id, "style": style.name, "engine": engine,
+        "notes": len(notes), "warnings": warnings,
+        "phonemes": {k: v for k, v in plan.note_phonemes.items() if k in shown},
+        "peak_db": _db(np.max(np.abs(audio)) if len(audio) else 0.0),
+    }
+
+
 class FormantBackend:
     """The built-in parametric singing engine."""
 
@@ -147,37 +192,7 @@ class FormantBackend:
         if len(audio) < n_out:
             audio = np.pad(audio, (0, n_out - len(audio)))
 
-        # the report covers the notes in the requested range only (all of them for a full render)
-        notes = track.notes if note_range is None else track.notes_in_range(*note_range)
-        shown = {n.id for n in notes}
-        all_ids = {n.id for n in track.notes}
-        warnings = []
-        for w in plan.warnings:  # keep warnings about shown notes, and those about no note at all
-            ids = set(re.findall(r"[^\s,;:()'\"]+", w)) & all_ids
-            if not ids or ids & shown:
-                warnings.append(w)
-        for n in notes:
-            if n.pitch < voice.range_low - 2 or n.pitch > voice.range_high + 2:
-                warnings.append(
-                    f"note {n.id} ({midi_to_note(n.pitch)} at beat {n.onset:g}) is outside {voice.name}'s "
-                    f"range {midi_to_note(voice.range_low)}-{midi_to_note(voice.range_high)}")
-        guessed = sorted({
-            w for n in notes for w in re.findall(r"[A-Za-z']+", n.lyric or "")
-            if (n.attrs.get("language") or track.language) == "en" and not japanese.is_kana(n.lyric or "")
-            and not n.phonemes and not (n.lyric or "").startswith((".", "[")) and w.lower() not in ("br",)
-            and english.lookup(w) is None and len(w) > 1
-        })
-        if guessed:
-            warnings.append("pronunciation guessed (not in dictionary): " + ", ".join(guessed[:20])
-                            + " - use '+' continuation notes for split words or set explicit phonemes")
-        if plan.start < 0 and (note_range is None or note_range[0] <= 0):
-            warnings.append("the first consonants start before beat 0 and are cut; start the song at beat 1 or later")
-        report = {
-            "id": track.id, "name": track.name, "voice": voice.id, "style": style.name,
-            "notes": len(notes), "warnings": warnings,
-            "phonemes": {k: v for k, v in plan.note_phonemes.items() if k in shown},
-            "peak_db": _db(np.max(np.abs(audio)) if len(audio) else 0.0),
-        }
+        report = track_report(project, track, plan, voice, style, audio, note_range, engine=self.name)
         return audio.astype(np.float32), report
 
 
@@ -189,13 +204,22 @@ def _db(x: float) -> float:
 
 
 def render_track(project: Project, track: Track | str | int, sample_rate: int | None = None,
-                 tail: float = VOICE_TAIL) -> tuple[np.ndarray, dict]:
-    """Render one track dry (no pan / reverb), from beat 0 to the end of the track."""
+                 tail: float = VOICE_TAIL, *, engine: str | None = None,
+                 quality: str | None = None) -> tuple[np.ndarray, dict]:
+    """Render one track dry (no pan / reverb), from beat 0 to the end of the track.
+
+    ``engine`` (``auto`` / ``formant`` / ``neural`` / ``neural:<voicebank>``) overrides the
+    track's and the project's engine; ``quality`` is ``draft`` / ``normal`` / ``high``.
+    """
     if not isinstance(track, Track):
         track = project.track(track)
     sr = int(sample_rate or project.sample_rate)
     t1 = project.tempo.beat_to_sec(track.end) + tail
-    return backend_for_voice(track.voice).render_track(project, track, sr, 0.0, t1)
+    backend = backend_for_track(project, track, engine)
+    with render_options(quality=parse_quality(quality)):
+        audio, rep = backend.render_track(project, track, sr, 0.0, t1)
+    rep.setdefault("engine", backend.name)
+    return audio, rep
 
 
 def _resolve_tracks(project: Project, track_ids) -> list[Track]:
@@ -301,10 +325,11 @@ _LEVEL_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 _LEVEL_KEYS = ("band_gain_db", "bus_threshold_db", "low_end_trim_db", "glue_threshold_db", "master_gain_db")
 
 
-def _level_key(project: Project, sr: int) -> str:
+def _level_key(project: Project, sr: int, engine: str | None = None) -> str:
     mixer = [(t.id, t.voice, t.gain_db, t.pan, t.mute, t.solo, t.reverb_send) for t in project.tracks]
     blob = json.dumps({"master": project.master.to_dict(), "backing": getattr(project, "backing", None),
-                       "mixer": mixer, "sr": sr, "key": project.key, "tempo": project.tempo.to_list()},
+                       "mixer": mixer, "sr": sr, "key": project.key, "tempo": project.tempo.to_list(),
+                       "engines": engine_signature(project, engine)},
                       sort_keys=True, default=str)
     return hashlib.sha1(blob.encode()).hexdigest()
 
@@ -327,8 +352,15 @@ def _overrides(mo: dict, *refs) -> dict:
 
 def render_project(project: Project, *, sample_rate: int | None = None, track_ids=None,
                    start_beat: float | None = None, end_beat: float | None = None,
-                   progress: Callable[[float, str], None] | None = None) -> RenderResult:
+                   progress: Callable[[float, str], None] | None = None,
+                   engine: str | None = None, quality: str | None = None) -> RenderResult:
     """Render, mix and master a whole project (or a beat range / subset of tracks).
+
+    ``engine`` picks the singing engine for this render (``auto``, ``formant``, ``neural`` or
+    ``neural:<voicebank>``) and overrides ``track.engine`` and ``project.engine``; see
+    :func:`.backend.resolve_engine`. ``quality`` (``draft`` / ``normal`` / ``high``) trades render
+    time for quality in engines that support it. The report lists the engine of every track, the
+    ``engines`` used and, for the neural engine, the ``credits`` its models ask for.
 
     ``track_ids`` entries are track ids, names (case-insensitive) or indexes; an unknown entry
     raises :class:`LookupError`. A beat-range render sings the region the way the full render
@@ -345,12 +377,21 @@ def render_project(project: Project, *, sample_rate: int | None = None, track_id
     applies after the normalisation (or the loudness target), and the stems (vocal tracks by id,
     backing stems by name) get the same gains, so they sum to the dry part of the master.
     """
+    with render_options(quality=parse_quality(quality)):
+        return _render_project(project, sample_rate, track_ids, start_beat, end_beat, progress, engine)
+
+
+def _render_project(project: Project, sample_rate, track_ids, start_beat, end_beat, progress,
+                    engine) -> RenderResult:
     from . import mixing
 
     t_start = time.perf_counter()
     sr = int(sample_rate or project.sample_rate)
     ms = project.master
     tracks = _resolve_tracks(project, track_ids) if track_ids else list(iter_active_tracks(project))
+    # resolve every engine first: a missing engine fails before any audio is rendered
+    backends = {tr.id: backend_for_track(project, tr, engine) for tr in tracks if tr.notes}
+    credits: list[str] = []
     b2s = project.tempo.beat_to_sec
     partial = start_beat is not None or end_beat is not None
     start_sec = b2s(start_beat) if start_beat is not None else 0.0
@@ -407,7 +448,12 @@ def render_project(project: Project, *, sample_rate: int | None = None, track_id
             progress(0.8 * k / max(len(tracks), 1), f"rendering {tr.name}")
         if not tr.notes:
             continue
-        mono, rep = backend_for_voice(tr.voice).render_track(project, tr, sr, render0, voice_end, note_range)
+        backend = backends[tr.id]
+        mono, rep = backend.render_track(project, tr, sr, render0, voice_end, note_range)
+        rep.setdefault("engine", backend.name)
+        for c in rep.get("credits") or []:
+            if c not in credits:
+                credits.append(c)
         mono = np.asarray(mono, dtype=np.float64)[: n_pre + n_voice]
         if end_beat is not None and n_fade:
             a = n_pre + n_voice - n_fade
@@ -466,7 +512,7 @@ def render_project(project: Project, *, sample_rate: int | None = None, track_id
     t_mix = time.perf_counter()
     bpm = project.tempo.bpm_at(start_beat or 0.0) if hasattr(project.tempo, "bpm_at") else project.bpm
     mastered = band_mode or ms.loudness_target is not None
-    level_key = _level_key(project, sr) if mastered else None
+    level_key = _level_key(project, sr, engine) if mastered else None
     fixed = _LEVEL_CACHE.get(level_key) if (mastered and partial) else None
     mix = mixing.mix_sources(sources, sr, band_mode=band_mode, settings=ms, kicks=kicks_abs - render0, bpm=bpm,
                              reverb_room=room, reverb_wet=ms.reverb_wet if reverb_tail > 0 else 0.0, fixed=fixed)
@@ -569,10 +615,13 @@ def render_project(project: Project, *, sample_rate: int | None = None, track_id
         "render_time_s": round(elapsed, 3),
         "mix_time_s": round(time.perf_counter() - t_mix, 3),
         "realtime_factor": round(dur / elapsed, 1) if elapsed > 0 else None,
+        "engines": sorted({r["engine"] for r in track_reports}),
         "tracks": track_reports,
         "backing": backing_reports,
         "warnings": [w for r in track_reports for w in r["warnings"]] + warnings_extra,
     }
+    if credits:
+        report["credits"] = credits
     if progress:
         progress(1.0, "done")
     return RenderResult(master, sr, stems, report, start_sec)

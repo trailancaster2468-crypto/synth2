@@ -160,6 +160,8 @@ class Track:
     seed: int = 0
     voice_params: dict[str, float] = field(default_factory=dict)  # global tweaks (tension, breathiness...)
     id: str = field(default_factory=_new_id)
+    # engine spec for this track ("" = inherit the project's): auto, formant, neural or neural:<voicebank>
+    engine: str = ""
 
     # ---- note editing -------------------------------------------------
     def sort(self):
@@ -219,6 +221,7 @@ class Track:
             "voice_params": dict(self.voice_params),
             "notes": [n.to_dict() for n in sorted(self.notes, key=lambda n: n.onset)],
             "curves": {k: c.to_dict() for k, c in self.curves.items() if c.points},
+            **({"engine": self.engine} if self.engine else {}),
         }
 
     @classmethod
@@ -236,6 +239,7 @@ class Track:
             seed=int(d.get("seed", 0)),
             voice_params={k: float(v) for k, v in (d.get("voice_params") or {}).items()},
             id=str(d.get("id") or _new_id()),
+            engine=str(d.get("engine") or ""),
         )
         t.notes = [Note.from_dict(n) for n in d.get("notes", [])]
         t.curves = {k: Curve.from_dict(v) for k, v in (d.get("curves") or {}).items() if k in CURVE_SPECS}
@@ -302,6 +306,8 @@ class Project:
     metadata: dict[str, Any] = field(default_factory=dict)
     # backing-track arrangement for synth2.arranger (JSON-serialisable dict, see synth2/arranger/FORMAT.md)
     backing: dict | None = None
+    # default engine spec of the tracks ("" = auto): auto, formant, neural or neural:<voicebank>
+    engine: str = ""
 
     # ---- convenience -----------------------------------------------------
     @classmethod
@@ -371,6 +377,7 @@ class Project:
             "metadata": dict(self.metadata),
             "tracks": [t.to_dict() for t in self.tracks],
             **({"backing": copy.deepcopy(self.backing)} if self.backing else {}),
+            **({"engine": self.engine} if self.engine else {}),
         }
 
     @classmethod
@@ -385,6 +392,7 @@ class Project:
             sample_rate=int(d.get("sample_rate", 44100)),
             master=MasterSettings.from_dict(d.get("master")),
             metadata=dict(d.get("metadata") or {}),
+            engine=str(d.get("engine") or ""),
         )
         p.tracks = [Track.from_dict(t) for t in d.get("tracks", [])]
         backing = d.get("backing")
@@ -436,7 +444,10 @@ class Project:
                 "mute": t.mute,
                 "gain_db": t.gain_db,
                 "pan": t.pan,
+                **({"engine": t.engine} if t.engine else {}),
             })
+        if self.engine:
+            out["engine"] = self.engine
         if self.backing:
             secs = self.backing.get("sections") or []
             out["backing"] = {"instruments": sorted(self.backing.get("instruments") or {}),
