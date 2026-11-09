@@ -7,6 +7,7 @@ as floats.  This keeps projects easy for both humans and AI models to write:
 from __future__ import annotations
 
 import bisect
+import math
 import re
 from dataclasses import dataclass, field
 
@@ -67,7 +68,14 @@ class TempoMap:
     def __post_init__(self):
         self._rebuild()
 
+    @staticmethod
+    def _check(beat: float, bpm: float):
+        if not (math.isfinite(beat) and math.isfinite(bpm) and bpm > 0):
+            raise ValueError(f"invalid tempo {bpm!r} bpm at beat {beat!r}: bpm must be positive")
+
     def _rebuild(self):
+        for p in self.points:
+            self._check(p.beat, p.bpm)
         pts = sorted(self.points, key=lambda p: p.beat)
         if not pts or pts[0].beat > 0:
             pts.insert(0, TempoPoint(0.0, pts[0].bpm if pts else 120.0))
@@ -78,8 +86,7 @@ class TempoMap:
             self._secs.append(self._secs[-1] + (b.beat - a.beat) * 60.0 / a.bpm)
 
     def set(self, beat: float, bpm: float):
-        if bpm <= 0:
-            raise ValueError("bpm must be positive")
+        self._check(beat, bpm)
         self.points = [p for p in self.points if abs(p.beat - beat) > 1e-9]
         self.points.append(TempoPoint(float(beat), float(bpm)))
         self._rebuild()

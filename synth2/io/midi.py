@@ -8,10 +8,14 @@ Reading (:func:`read_midi`, :func:`loads_midi`):
   track names (``FF 03``, falling back to the instrument name ``FF 04``).
 * Lyrics: ``FF 05`` events are attached to the note that starts at the same
   tick (with a small tolerance).  When the file contains no ``FF 05`` at all,
-  ``FF 01`` text events are used instead (karaoke ``/`` and ``\\`` line markers
-  are stripped and ``@`` header lines ignored).  Hyphenated syllables
-  (``"twin-" "kle"``) become ``"twinkle" "+"``.  Notes without a lyric sing
-  ``"la"``.
+  ``FF 01`` text events are used instead, but only from tracks whose text
+  looks like a lyric line: a karaoke words track (``@`` header lines or ``/``
+  and ``\\`` line markers, which are stripped), or text events spread over
+  time with roughly one per note.  Tick-0 texts of several words (titles,
+  credits, comments) are never lyrics, and in karaoke files only the words
+  track is used.  Hyphenated syllables (``"twin-" "kle"``) become
+  ``"twinkle" "+"``; lyric-less notes inside such a word are melismas
+  (``"-"``).  Other notes without a lyric sing ``"la"``.
 * One project :class:`~synth2.project.Track` per MIDI track that contains
   notes (per channel for format 0).  Drum-channel (10) notes are ignored when
   other notes exist.  Overlapping notes are trimmed into a monophonic line:
@@ -293,7 +297,11 @@ def _assign_lyrics(notes: list[RawNote], events: list[tuple[int, str]], tol: int
 
 
 def _join_hyphenated(lyrics: list[str]) -> list[str]:
-    """``["twin-", "kle", "lit-", "tle"]`` -> ``["twinkle", "+", "little", "+"]``."""
+    """``["twin-", "kle", "lit-", "tle"]`` -> ``["twinkle", "+", "little", "+"]``.
+
+    A lyric-less note (``""``) inside a hyphenated word is a melisma on the
+    previous syllable: ``["twin-", "", "kle"]`` -> ``["twinkle", "-", "+"]``.
+    """
     out = list(lyrics)
     i = 0
     while i < len(out):
@@ -303,6 +311,10 @@ def _join_hyphenated(lyrics: list[str]) -> list[str]:
             j = i + 1
             while j < len(out):
                 t = out[j]
+                if not t.strip():  # no lyric event: hold the previous syllable
+                    out[j] = "-"
+                    j += 1
+                    continue
                 if t in ("-", "+"):  # melisma / explicit continuation inside the word
                     j += 1
                     continue
@@ -320,6 +332,45 @@ def _join_hyphenated(lyrics: list[str]) -> list[str]:
 
 def _has_kana(text: str) -> bool:
     return any("぀" <= c <= "ヿ" for c in text)
+
+
+def _is_karaoke_header(text: str) -> bool:
+    return text.lstrip().startswith("@")
+
+
+def _is_comment(tick: int, text: str) -> bool:
+    """A tick-0 text of several words (title, credit, comment), not a sung syllable."""
+    s = text.lstrip()
+    return tick == 0 and s[:1] not in ("/", "\\") and len(_clean_lyric(s).split()) > 1
+
+
+def _line_size(notes: list[RawNote]) -> int:
+    """Notes in the smallest non-drum channel: the size of the line lyrics are sung on."""
+    counts: dict[int, int] = {}
+    for x in notes:
+        counts[x.channel] = counts.get(x.channel, 0) + 1
+    melodic = [c for ch, c in counts.items() if ch != DRUM_CHANNEL]
+    return min(melodic or counts.values() or [0])
+
+
+def _text_lyrics(t: RawTrack, karaoke: bool, n_notes: int) -> list[tuple[int, str]]:
+    """The ``FF 01`` text events of ``t`` if they look like a lyric line, else ``[]``.
+
+    ``karaoke`` says the file has ``@`` header lines (a ``.kar`` words track);
+    ``n_notes`` is the size of the note line the texts would be sung on.
+    """
+    events = [(tick, s) for tick, s in t.texts if not _is_karaoke_header(s) and not _is_comment(tick, s)]
+    if not events:
+        return []
+    if any(_is_karaoke_header(s) for _, s in t.texts) or any(s.lstrip()[:1] in ("/", "\\") for _, s in events):
+        return events  # karaoke words track
+    if karaoke:  # the file has a karaoke words track: other text events are not lyrics
+        return []
+    if n_notes > 1 and len({tick for tick, _ in events}) < 2:
+        return []  # isolated text (section label, instrument note), not a lyric line
+    if len(events) < max(1, n_notes) * 0.25:
+        return []  # far fewer texts than notes: labels, not one syllable per note
+    return events
 
 
 def loads_midi(data: bytes, title: str | None = None) -> Project:
@@ -358,20 +409,23 @@ def loads_midi(data: bytes, title: str | None = None) -> Project:
 
     # --- lyric sources ---------------------------------------------------
     use_lyrics = any(t.lyrics for t in tracks)
+    karaoke = any(_is_karaoke_header(s) for t in tracks for _, s in t.texts)
+    min_notes = min((_line_size(t.notes) for t in tracks if t.notes), default=0)
 
-    def lyric_events(t: RawTrack) -> list[tuple[int, str]]:
+    def lyric_events(t: RawTrack, n_notes: int) -> list[tuple[int, str]]:
         if use_lyrics:
             return t.lyrics
-        return [(tick, s) for tick, s in t.texts if not s.lstrip().startswith("@")]
+        return _text_lyrics(t, karaoke, n_notes)
 
-    orphan_lyrics = [e for t in tracks if not t.notes for e in lyric_events(t)]
+    # lyrics in note-less tracks (a "Words" track) are sung by every note track without its own
+    orphan_lyrics = [e for t in tracks if not t.notes for e in lyric_events(t, min_notes)]
 
     # --- note units: one per track (format 1/2) or per channel (format 0) ---
     units: list[tuple[str, list[RawNote], list[tuple[int, str]]]] = []
     for t in tracks:
         if not t.notes:
             continue
-        events = lyric_events(t) or orphan_lyrics
+        events = lyric_events(t, _line_size(t.notes)) or orphan_lyrics
         base = t.name or t.instrument or f"Track {len(units) + 1}"
         if fmt == 0:
             channels = sorted({x.channel for x in t.notes})
@@ -469,7 +523,8 @@ def dumps_midi(project: Project) -> bytes:
             on = tk(n.onset)
             off = max(on + 1, tk(n.end))
             pitch = max(0, min(127, int(n.pitch)))
-            vel = max(1, min(127, int(round(float(n.attrs.get("velocity") or 1.0) * 100))))
+            v = n.attrs.get("velocity")
+            vel = max(1, min(127, int(round((1.0 if v is None else float(v)) * 100))))
             events.append((on, 2, 2 * i, _meta(0x05, (n.lyric or "la").encode("utf-8"))))
             events.append((on, 2, 2 * i + 1, bytes([0x90 | ch, pitch, vel])))
             events.append((off, 1, i, bytes([0x80 | ch, pitch, 0])))

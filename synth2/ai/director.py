@@ -31,7 +31,13 @@ Implementation notes (Claude API):
   user message instead of the system prompt;
 * prompt-cache breakpoints on the system prompt (covers tools + system) and a
   top-level automatic breakpoint for the growing message history;
-* server-side refusal fallbacks (``fallbacks="default"``) on models that support them.
+* server-side refusal fallbacks (``fallbacks="default"``) on models that support them;
+* eager input streaming on the tools: when the SDK cannot parse a streamed tool input at all it raises
+  ``ValueError`` before the block completes (no ``tool_use_id`` to answer), so the request is re-issued a
+  bounded number of times; the SDK's typed API errors are never caught there;
+* a ``chat()`` that fails part-way (API error, Ctrl-C) leaves a valid history behind: the unfinished request is
+  dropped, or, when some tool calls already completed, closed with a short assistant note, so a later message is
+  never merged with the failed one.
 """
 from __future__ import annotations
 
@@ -51,6 +57,8 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 # models that accept the server-side ``fallbacks="default"`` parameter
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-fable-5", "claude-sonnet-5-5"}
 MAX_TOOL_RESULT_CHARS = 60000
+# re-issues of a request whose streamed tool input JSON the SDK could not parse (eager input streaming)
+MAX_STREAM_RETRIES = 2
 _CREDENTIAL_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE", "ANTHROPIC_FEDERATION_RULE_ID")
 
 
@@ -230,6 +238,14 @@ def _summarize(result: Any, limit: int = 240) -> str:
     return s if len(s) <= limit else s[: limit - 3] + "..."
 
 
+def _is_api_error(exc: BaseException) -> bool:
+    try:
+        import anthropic
+    except ImportError:
+        return False
+    return isinstance(exc, anthropic.AnthropicError)
+
+
 def _state_block(session: Session) -> str:
     try:
         summary = call_tool(session, "get_project", {"detail": "summary"})
@@ -270,6 +286,13 @@ class Director:
         start_len = len(self.history)
         text = f"{_state_block(self.session)}\n\n{message}" if self.include_state else message
         self.history.append({"role": "user", "content": [{"type": "text", "text": text}]})
+        try:
+            return self._chat_loop(start_len)
+        except BaseException as exc:
+            self._close_failed_turn(start_len, exc)
+            raise
+
+    def _chat_loop(self, start_len: int) -> dict:
         actions: list[dict] = []
         last_texts: list[str] = []
         stop_reason = None
@@ -314,6 +337,24 @@ class Director:
         return {"reply": reply, "actions": actions, "stop_reason": stop_reason, "turns": turns}
 
     # ------------------------------------------------------------- internals
+    def _close_failed_turn(self, start_len: int, exc: BaseException):
+        """Leave a valid history after ``chat()`` raised part-way through its turn.
+
+        Without this the failed user message would stay at the end of the history and be merged with the next
+        one into a single user turn, so a cancelled request could still be carried out.
+        """
+        h = self.history
+        # an assistant turn whose tool calls never got their results would make every later request invalid
+        if len(h) > start_len + 1 and h[-1]["role"] == "assistant" and any(
+                _btype(b) == "tool_use" for b in h[-1]["content"]):
+            h.pop()
+        if len(h) <= start_len + 1:  # nothing completed: forget the request
+            del h[start_len:]
+        elif h[-1]["role"] == "user":  # completed tool exchanges are kept (the edits happened); close the turn
+            h.append({"role": "assistant", "content": [{"type": "text", "text": (
+                f"(This request stopped with an error ({type(exc).__name__}) before I finished it. The tool calls "
+                "above were carried out; the rest was not done.)")}]})
+
     def _request(self):
         params: dict[str, Any] = {
             "model": self.model,
@@ -328,8 +369,16 @@ class Director:
         if self.fallbacks:
             params["betas"] = [FALLBACK_BETA]
             params["fallbacks"] = "default"
-        with self.client.beta.messages.stream(**params) as stream:
-            return stream.get_final_message()
+        for attempt in range(MAX_STREAM_RETRIES + 1):
+            try:
+                with self.client.beta.messages.stream(**params) as stream:
+                    return stream.get_final_message()
+            except ValueError as exc:
+                # eager input streaming: the SDK raises ValueError for tool input JSON it cannot parse at all;
+                # re-issue the request. Anything else (the SDK's typed API errors) propagates.
+                if _is_api_error(exc) or attempt >= MAX_STREAM_RETRIES:
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _run_tool(self, tu, actions: list, truncated: bool = False) -> dict:
         name = _battr(tu, "name")
@@ -383,7 +432,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not msg:
             continue
-        out = director.chat(msg)
+        try:
+            out = director.chat(msg)
+        except Exception as exc:  # API errors (overloaded, connection...) end only this message
+            print(f"error: {type(exc).__name__}: {exc}")
+            continue
         for a in out["actions"]:
             print(f"  [{'ok' if a['ok'] else 'error'}] {a['tool']}: {a['result_summary']}")
         print(out["reply"])

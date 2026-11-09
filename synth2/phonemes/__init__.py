@@ -117,16 +117,19 @@ def resolve_notes(notes, default_language: str = "en") -> list[Syllable]:
         if group == 1:
             out[i] = Syllable(phones)
         else:
+            sylls: list[list[str] | None]
             if lang == "ja" or japanese.is_kana(lyric):
-                sylls = [japanese.romaji_to_phonemes(m) for m in japanese.morae(lyric)] or [phones]
+                # a long-vowel mark mora ("ー" / "-") holds the previous vowel: None = melisma slot
+                sylls = [None if m == "-" else japanese.romaji_to_phonemes(m) for m in japanese.morae(lyric)]
             else:
-                sylls = english.syllabify(phones)
+                sylls = list(english.syllabify(phones))
             if not sylls:
                 sylls = [phones]
             if len(sylls) > group:
-                sylls = sylls[: group - 1] + [sum(sylls[group - 1:], [])]
+                tail = [x for x in sylls[group - 1:] if x is not None]
+                sylls = sylls[: group - 1] + [sum(tail, []) if tail else None]
             for k, slot in enumerate(slots):
-                if k < len(sylls):
+                if k < len(sylls) and sylls[k] is not None:
                     out[slot] = Syllable(sylls[k])
                 else:
                     out[slot] = Syllable(melisma=True)
@@ -147,26 +150,30 @@ def split_lyrics(text: str, language: str = "en") -> list[str]:
 
     English words with several syllables are emitted as ``word`` followed by
     ``+`` tokens, so that the full word is pronounced correctly across notes.
-    Japanese kana are split into morae.  Existing ``-``/``+`` tokens are kept.
+    Japanese is split into morae: romaji morae for ``language="ja"``, kana
+    morae otherwise (so they are still recognised as Japanese on the note).
+    Existing ``-``/``+`` tokens are kept.
     """
     tokens: list[str] = []
-    for raw in text.split():
+    for raw in english.normalize_apostrophes(text).split():
         if raw in MELISMA or raw in CONTINUATION:
             tokens.append(raw)
             continue
-        if language == "ja" or japanese.is_kana(raw):
-            tokens += [m if m != "-" else "-" for m in japanese.morae(raw)]
+        if language == "ja":
+            tokens += japanese.morae(raw)
             continue
-        # allow explicit hyphenation "twin-kle"
-        if "-" in raw.strip("-"):
-            tokens += [p for p in raw.split("-") if p]
+        if japanese.is_kana(raw):
+            # keep the kana spelling: romaji tokens on a non-Japanese track would be sung as English
+            tokens += ["-" if k == "ー" else k for k in japanese.kana_morae(raw)]
             continue
-        word = re.sub(r"[^A-Za-z']", "", raw)
-        if not word:
-            continue
-        k = english.count_syllables(word)
-        tokens.append(word)
-        tokens += ["+"] * (k - 1)
+        # explicit hyphenation ("twin-kle", "never-ending"): every part starts a new note
+        for part in raw.split("-"):
+            word = re.sub(r"[^A-Za-z']", "", part)
+            if not word:
+                continue
+            k = english.count_syllables(word)
+            tokens.append(word)
+            tokens += ["+"] * (k - 1)
     return tokens
 
 

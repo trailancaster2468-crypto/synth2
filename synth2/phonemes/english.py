@@ -36,7 +36,7 @@ SUNG_OVERRIDES = {
     "ba": ["b", "aa"],
     "mm": ["m"],
     "hmm": ["hh", "m"],
-    "yeah": ["y", "eh", "ah"],
+    "yeah": ["y", "eh"],  # one syllable (a second vowel would make it a two-note word)
     "love": ["l", "ah", "v"],
     "of": ["ah", "v"],
     "and": ["ae", "n", "d"],
@@ -50,6 +50,15 @@ LEGAL_ONSETS = {
         "s k r", "s k w", "s k l", "s p y", "s k y", "v r", "sh w",
     ]
 }
+
+
+# typographic apostrophes (as pasted from the web or word processors) -> ASCII "'"
+_APOSTROPHES = str.maketrans({c: "'" for c in "\u2019\u2018\u201b\u02bc\u2032\u00b4\uff07`"})
+
+
+def normalize_apostrophes(text: str) -> str:
+    """Replace typographic apostrophes (``’`` ``‘`` ``ʼ`` ...) with ``'`` so contractions stay one word."""
+    return text.translate(_APOSTROPHES)
 
 
 @functools.lru_cache(maxsize=1)
@@ -75,7 +84,7 @@ def _convert_arpa(pron: list[str]) -> list[str]:
 
 
 def lookup(word: str) -> list[str] | None:
-    w = word.lower().strip("'")
+    w = normalize_apostrophes(word).lower().strip("'")
     if w in SUNG_OVERRIDES:
         return list(SUNG_OVERRIDES[w])
     prons = _cmu().get(w)
@@ -166,7 +175,7 @@ def g2p_word(word: str) -> list[str]:
 
 def g2p(text: str) -> list[str]:
     phones: list[str] = []
-    for word in re.findall(r"[A-Za-z']+", text):
+    for word in re.findall(r"[A-Za-z']+", normalize_apostrophes(text)):
         phones += g2p_word(word)
     return phones
 

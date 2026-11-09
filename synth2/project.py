@@ -52,7 +52,10 @@ NOTE_ATTRIBUTES: dict[str, tuple[Any, str]] = {
 
 
 def _new_id() -> str:
-    return uuid.uuid4().hex[:12]
+    while True:
+        h = uuid.uuid4().hex[:12]
+        if not h.isdigit():  # an all-digit id would be taken for a track index by lookups
+            return h
 
 
 @dataclass
@@ -81,10 +84,12 @@ class Note:
         return v
 
     def to_dict(self):
+        # round the end (not the duration) so back-to-back notes still touch exactly after a round trip
+        onset = round(self.onset, 6)
         d = {
             "id": self.id,
-            "onset": round(self.onset, 6),
-            "duration": round(self.duration, 6),
+            "onset": onset,
+            "duration": round(round(self.end, 6) - onset, 6),
             "pitch": self.pitch,
             "lyric": self.lyric,
         }
@@ -132,8 +137,9 @@ class Curve:
     @classmethod
     def from_dict(cls, d):
         if isinstance(d, list):
-            return cls([(float(b), float(v)) for b, v in d])
-        c = cls([(float(b), float(v)) for b, v in d.get("points", [])], d.get("interpolation", "cubic"))
+            c = cls([(float(b), float(v)) for b, v in d])
+        else:
+            c = cls([(float(b), float(v)) for b, v in d.get("points", [])], d.get("interpolation", "cubic"))
         c.sort()
         return c
 
@@ -193,7 +199,7 @@ class Track:
         self.sort()
         out = []
         for a, b in zip(self.notes, self.notes[1:]):
-            if b.onset < a.end - 1e-6:
+            if b.onset < a.end - 1e-5:
                 out.append((a, b))
         return out
 
@@ -281,15 +287,24 @@ class Project:
         return t
 
     def track(self, ref: str | int | None = None) -> Track:
-        """Look up a track by index, id or (case-insensitive) name. ``None`` = first track."""
+        """Look up a track by index, id or (case-insensitive) name. ``None`` = first track.
+
+        An exact id match wins over a digit string read as an index (ids in older projects may be all digits).
+        """
         if not self.tracks:
             raise LookupError("project has no tracks")
         if ref is None:
             return self.tracks[0]
-        if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
+        if isinstance(ref, int):
+            return self.tracks[ref]
+        ref = str(ref)
+        for t in self.tracks:
+            if t.id == ref:
+                return t
+        if ref.isdigit():
             return self.tracks[int(ref)]
         for t in self.tracks:
-            if t.id == ref or t.name.lower() == str(ref).lower():
+            if t.name.lower() == ref.lower():
                 return t
         raise LookupError(f"no track {ref!r}")
 

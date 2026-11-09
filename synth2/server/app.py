@@ -27,15 +27,33 @@ Endpoints
 ``GET  /api/phonemes``           automatic phonemes per note, for display in the piano roll
 ``POST /api/split_lyrics``       ``{text, language?}`` -> per-note lyric tokens
 
+Security
+--------
+The API reads and writes files on the server machine, so it only answers the
+studio page itself:
+
+* the ``Host`` header must name this machine (``localhost``, an IP address, the
+  ``--host`` the server is bound to, or an ``--allow-host`` name), which defeats
+  DNS rebinding;
+* a state-changing request (anything but GET/HEAD) is refused when its
+  ``Origin`` is not the server's own origin or ``Sec-Fetch-Site`` says it came
+  from another site (CSRF);
+* request bodies must use a Content-Type a cross-site page cannot send without a
+  CORS preflight (which this server never approves): ``application/json`` for
+  the JSON endpoints, e.g. ``application/octet-stream`` for ``/api/import``.
+
 Run it with ``python -m synth2.server.app --port 8765 --project song.s2p.json``.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import ipaddress
 import json
+import math
 import os
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -53,6 +71,15 @@ from ..project import CURVE_SPECS, NOTE_ATTRIBUTES, Project
 STATIC_DIR = Path(__file__).resolve().with_name("static")
 MAX_BODY = 64 * 1024 * 1024  # imports can be large MusicXML/MIDI files
 HISTORY_LIMIT = 200
+RENDER_MARGIN_BEATS = 32.0  # render ranges are clamped to the song length plus this much
+MIN_BPM, MAX_BPM = 20.0, 400.0  # same range as the new_project tool and the studio's tempo field
+
+SAFE_METHODS = ("GET", "HEAD")
+WILDCARD_HOSTS = ("", "0.0.0.0", "::")
+# Content types a web page may send cross-site without a CORS preflight ("" = no Content-Type at all).
+SIMPLE_CONTENT_TYPES = {"", "text/plain", "application/x-www-form-urlencoded", "multipart/form-data"}
+_HOST_RE = re.compile(r"(?:\[(?P<v6>[0-9A-Fa-f:.]+)\]|(?P<name>[A-Za-z0-9._-]+))(?::\d{1,5})?")
+_CHUNK_SIZE_RE = re.compile(rb"[0-9A-Fa-f]{1,16}")
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -259,7 +286,8 @@ def call_session_tool(session, name: str, args: dict | None = None) -> Any:
 # --------------------------------------------------------------------------
 class StudioState:
     def __init__(self, project_path: str | None = None):
-        self.lock = threading.RLock()
+        self._lock = threading.RLock()
+        self.ai_lock = threading.Lock()  # one Director.chat at a time (the director keeps one conversation)
         project = None
         path = None
         self.session = None
@@ -282,6 +310,17 @@ class StudioState:
         self.last_wav: bytes | None = None
         self.last_report: dict | None = None
         self.revision = 0
+
+    @property
+    def lock(self):
+        """The session's own lock when it has one (``synth2.ai.tools.Session.lock``).
+
+        ``call_tool`` takes that lock for each tool call, so studio requests and the
+        tool calls of a running AI Director exclude each other one call at a time,
+        without the director holding a lock across its network round trips.
+        """
+        lock = getattr(self.session, "lock", None)
+        return lock if lock is not None else self._lock
 
     @property
     def project(self) -> Project:
@@ -433,6 +472,8 @@ def render_wav(project: Project, start_beat=None, end_beat=None, track_ids=None)
         kwargs["start_beat"] = float(start_beat)
     if end_beat is not None:
         kwargs["end_beat"] = float(end_beat)
+    if isinstance(track_ids, str):  # one id, not an iterable of one-character ids
+        track_ids = [track_ids]
     if track_ids:
         kwargs["track_ids"] = list(track_ids)
     res = render_project(project, **kwargs)
@@ -458,6 +499,55 @@ def render_wav(project: Project, start_beat=None, end_beat=None, track_ids=None)
     return data, report, res
 
 
+def _beat_value(value, name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{name} must be a number of beats")
+    try:
+        beat = float(value)
+    except (ValueError, OverflowError):
+        raise ValueError(f"{name} must be a number of beats, got {value!r}") from None
+    if not math.isfinite(beat):
+        raise ValueError(f"{name} must be a finite number of beats")
+    return beat
+
+
+def render_args(project: Project, start_beat=None, end_beat=None, track_ids=None) -> tuple[float | None, float | None, list[str] | None]:
+    """Validate the ``/api/render`` arguments; returns ``(start_beat, end_beat, track_ids)`` or raises ``ValueError``.
+
+    Beats must be finite, ``start_beat >= 0`` and ``end_beat > start_beat``.  Both are
+    clamped to the song length plus :data:`RENDER_MARGIN_BEATS`, so no request can make
+    the engine allocate audio far beyond the song (a range wholly past the end renders
+    the usual short silence).  ``track_ids`` is a list of track ids (a single id string
+    is accepted); unknown ids are an error, an empty list means every track.
+    """
+    start = _beat_value(start_beat, "start_beat")
+    end = _beat_value(end_beat, "end_beat")
+    if start is not None and start < 0:
+        raise ValueError(f"start_beat must be >= 0, got {start:g}")
+    if end is not None and end <= (start or 0.0):
+        raise ValueError("end_beat must be greater than start_beat")
+    limit = project.duration_beats() + RENDER_MARGIN_BEATS
+    if start is not None:
+        start = min(start, limit)
+    if end is not None:
+        end = min(end, limit)
+        if start is not None and end <= start:
+            end = None  # the whole range lies past the song: render from start_beat to the end
+    if track_ids is not None:
+        if isinstance(track_ids, str):
+            track_ids = [track_ids]
+        if not isinstance(track_ids, list) or not all(isinstance(t, str) for t in track_ids):
+            raise ValueError("track_ids must be a list of track id strings")
+        known = {t.id for t in project.tracks}
+        unknown = [t for t in track_ids if t not in known]
+        if unknown:
+            raise ValueError(f"unknown track id(s): {', '.join(map(repr, unknown))}")
+        track_ids = track_ids or None
+    return start, end, track_ids
+
+
 def _record_render(session, project: Project, res, start_beat, end_beat) -> None:
     """Let the tool layer know about a studio render (so ``analyze_render`` works on it)."""
     if not hasattr(session, "last_render"):
@@ -477,7 +567,7 @@ def _record_render(session, project: Project, res, start_beat, end_beat) -> None
 def report_header(report: dict, limit: int = 7000) -> str:
     """Encode a render report as ASCII-safe JSON for an HTTP header, trimming it if too large."""
     def enc(obj):
-        return json.dumps(obj, ensure_ascii=True, separators=(",", ":"), default=str)
+        return dumps_json(obj, ensure_ascii=True, separators=(",", ":"))
 
     s = enc(report)
     if len(s) <= limit:
@@ -536,19 +626,49 @@ def export_project(project: Project, fmt: str) -> tuple[bytes, str, str]:
         return path.read_bytes(), filename, mime
 
 
+# file name ending -> save format (longest ending wins), as in the tool layer's save_project
+SAVE_FORMATS = {
+    ".s2p.json": "json", ".json": "json", ".s2p": "json", ".s2s": "score", ".txt": "score", ".svp": "svp",
+    ".mid": "midi", ".midi": "midi", ".musicxml": "musicxml", ".xml": "musicxml", ".mxl": "musicxml", ".ust": "ust",
+}
+NATIVE_SUFFIXES = (".json", ".s2p", ".s2s")  # lossless project files (``synth2.ai.tools._is_native``)
+
+
+def save_format(path: str | Path) -> str | None:
+    """The format :func:`save_project` writes for ``path`` (``None`` = not a known file type)."""
+    name = Path(path).name.lower()
+    for ext in sorted(SAVE_FORMATS, key=len, reverse=True):
+        if name.endswith(ext):
+            return SAVE_FORMATS[ext]
+    return None
+
+
+def is_project_file(path: str | Path) -> bool:
+    """Whether ``path`` is a native (lossless) project file rather than an export such as ``.mid``."""
+    return Path(path).name.lower().endswith(NATIVE_SUFFIXES)
+
+
 def save_project(project: Project, path: str) -> str:
+    """Write ``project`` to ``path``; the format follows the extension.
+
+    A name without a known extension (``My Song v1.2``, ``take.final``) gets ``.s2p.json``
+    appended, like the tool layer's ``save_project``.  Returns the path written.
+    """
     p = Path(path).expanduser()
+    fmt = save_format(p)
+    if fmt is None:
+        p = p.with_name(p.name + ".s2p.json")
+        fmt = "json"
     if p.parent and not p.parent.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
-    suffix = p.suffix.lower()
-    if suffix in ("", ".json", ".s2p"):
-        if suffix == "":
-            p = p.with_name(p.name + ".s2p.json")
+    if fmt == "json":
         project.save(p)
     else:
         from ..io import export_any  # type: ignore[attr-defined]
 
-        export_any(project, str(p))
+        written = export_any(project, str(p))
+        if written:
+            p = Path(written)
     return str(p)
 
 
@@ -591,34 +711,83 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")  # no embedding by other sites
         for k, v in (headers or {}).items():
             self.send_header(k, v)
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
         self._log_request(status)
 
     def send_json(self, obj: Any, status: int = 200, headers: dict | None = None):
-        body = json.dumps(obj, ensure_ascii=False, default=_json_default).encode("utf-8")
+        body = dumps_json(obj, ensure_ascii=False).encode("utf-8")
         self._send(status, body, "application/json; charset=utf-8", headers)
 
     def send_error_json(self, status: int, message: str, **extra):
         self.send_json({"error": message, **extra}, status)
 
     def _consume_body(self) -> None:
-        """Read the request body up front so keep-alive connections never see stale bytes."""
+        """Read the request body up front so keep-alive connections never see stale bytes.
+
+        Handles ``Content-Length`` and ``Transfer-Encoding: chunked`` bodies.  When a body
+        cannot be read completely (too large, malformed, unsupported encoding) the request
+        fails and the connection is closed, so leftover bytes are never parsed as a request.
+        """
         self._body = b""
         self._body_error = None
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length > MAX_BODY:
-            self._body_error = HttpError(413, "request body too large")
+            te = self.headers.get_all("Transfer-Encoding")
+            if te:
+                codings = [c.strip().lower() for v in te for c in v.split(",") if c.strip()]
+                if codings != ["chunked"]:
+                    raise HttpError(501, f"unsupported Transfer-Encoding {', '.join(te)!r}")
+                if self.headers.get("Content-Length") is not None:
+                    self.close_connection = True  # ambiguous framing (RFC 9112 6.1): never reuse the connection
+                self._body = self._read_chunked()
+                return
+            lengths = {v.strip() for v in self.headers.get_all("Content-Length") or []}
+            if len(lengths) > 1:
+                raise HttpError(400, "conflicting Content-Length headers")
+            raw = lengths.pop() if lengths else "0"
+            if not (raw.isascii() and raw.isdigit()):
+                raise HttpError(400, f"invalid Content-Length {raw!r}")
+            length = int(raw)
+            if length > MAX_BODY:
+                raise HttpError(413, "request body too large")
+            if length > 0:
+                self._body = self.rfile.read(length)
+                if len(self._body) < length:
+                    raise HttpError(400, "incomplete request body")
+        except HttpError as exc:
+            self._body = b""
+            self._body_error = exc
             self.close_connection = True
-            return
-        if length > 0:
-            self._body = self.rfile.read(length)
+
+    def _read_chunked(self) -> bytes:
+        body = bytearray()
+        while True:
+            line = self.rfile.readline(1026)
+            size_text = line.split(b";", 1)[0].strip()
+            if not line.endswith(b"\n") or not _CHUNK_SIZE_RE.fullmatch(size_text):
+                raise HttpError(400, "malformed chunked request body")
+            size = int(size_text, 16)
+            if size == 0:
+                for _ in range(64):  # optional trailer fields, up to the blank line
+                    trailer = self.rfile.readline(8194)
+                    if trailer in (b"\r\n", b"\n"):
+                        return bytes(body)
+                    if not trailer.endswith(b"\n"):
+                        break
+                raise HttpError(400, "malformed chunked request body")
+            if len(body) + size > MAX_BODY:
+                raise HttpError(413, "request body too large")
+            chunk = self.rfile.read(size)
+            if len(chunk) < size or self.rfile.readline(3) not in (b"\r\n", b"\n"):
+                raise HttpError(400, "malformed chunked request body")
+            body += chunk
 
     def read_body(self) -> bytes:
         if getattr(self, "_body_error", None):
@@ -629,13 +798,38 @@ class StudioHandler(BaseHTTPRequestHandler):
         raw = self.read_body()
         if not raw.strip():
             return {}
+        ctype = _media_type(self.headers.get("Content-Type"))
+        if ctype != "application/json" and not ctype.endswith("+json"):
+            raise HttpError(415, "the request body must be JSON sent with Content-Type: application/json")
         try:
-            data = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            data = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant, parse_float=_finite_float)
+        except (ValueError, RecursionError) as exc:  # includes JSONDecodeError, UnicodeDecodeError, NaN/Infinity
             raise HttpError(400, f"invalid JSON body: {exc}")
         if not isinstance(data, dict):
             raise HttpError(400, "JSON body must be an object")
         return data
+
+    def _check_request(self, method: str) -> None:
+        """Refuse requests that another web site's page could have made (CSRF) or read (DNS rebinding)."""
+        hosts = self.headers.get_all("Host") or []
+        if len(hosts) > 1:
+            raise HttpError(400, "multiple Host headers")
+        host = hosts[0].strip() if hosts else None
+        if host is not None and not self.server.host_allowed(host):  # type: ignore[attr-defined]
+            raise HttpError(403, f"forbidden: unexpected Host {host!r} (open the studio at "
+                                 f"{self.server.url}, or start it with --allow-host)")  # type: ignore[attr-defined]
+        if method in SAFE_METHODS:
+            return
+        origin = self.headers.get("Origin")
+        if origin is not None and not _same_origin(origin, host):
+            raise HttpError(403, "forbidden: cross-origin request")
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if site not in ("", "same-origin", "none"):
+            raise HttpError(403, "forbidden: cross-site request")
+        if self._body and _media_type(self.headers.get("Content-Type")) in SIMPLE_CONTENT_TYPES:
+            # a page on another site can send these without a CORS preflight
+            raise HttpError(415, "send the request body with Content-Type: application/json "
+                                 "(application/octet-stream for /api/import)")
 
     def _dispatch(self, method: str):
         self._t0 = time.perf_counter()
@@ -645,6 +839,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         route = parsed.path.rstrip("/") or "/"
         handler = ROUTES.get((method, route))
         try:
+            self._check_request(method)
+            if self._body_error is not None:
+                raise self._body_error
             if handler is not None:
                 handler(self)
             elif method in ("GET", "HEAD") and not route.startswith("/api"):
@@ -705,9 +902,11 @@ class StudioHandler(BaseHTTPRequestHandler):
     def api_put_project(self):
         body = self.read_json()
         data = body.get("project") if isinstance(body.get("project"), dict) else body
+        if not data:
+            raise HttpError(400, "missing project: send the project JSON as the request body")
         try:
             project = Project.from_dict(copy.deepcopy(data))
-            project.to_dict()  # make sure it serialises
+            _check_finite(project)  # make sure it serialises as strict JSON
         except Exception as exc:
             raise HttpError(400, f"invalid project: {exc.__class__.__name__}: {exc}")
         st = self.state
@@ -726,9 +925,23 @@ class StudioHandler(BaseHTTPRequestHandler):
     def api_new(self):
         body = self.read_json()
         title = str(body.get("title") or "Untitled")
-        bpm = float(body.get("bpm") or 120.0)
+        bpm = body.get("bpm")
+        if bpm is None or bpm == "":
+            bpm = 120.0
+        try:
+            if isinstance(bpm, bool):
+                raise TypeError
+            bpm = float(bpm)
+        except (TypeError, ValueError, OverflowError):
+            raise HttpError(400, f"bpm must be a number, got {bpm!r}") from None
+        if not (math.isfinite(bpm) and MIN_BPM <= bpm <= MAX_BPM):
+            raise HttpError(400, f"bpm must be between {MIN_BPM:g} and {MAX_BPM:g}, got {bpm:g}")
         voice = str(body.get("voice") or "aurora")
-        project = Project.new(title=title, bpm=bpm, voice=voice)
+        try:
+            project = Project.new(title=title, bpm=bpm, voice=voice)
+            _check_finite(project)
+        except (TypeError, ValueError) as exc:
+            raise HttpError(400, f"invalid project: {exc}") from None
         st = self.state
         with st.lock:
             push_undo(st.session, "new project")
@@ -784,7 +997,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             except errors as exc:  # type: ignore[misc]
                 self.send_error_json(400, str(exc), tool=name)
                 return
-            except (ValueError, KeyError, LookupError, TypeError) as exc:
+            except (ValueError, KeyError, LookupError, TypeError, OSError) as exc:  # OSError: save/export paths
                 self.send_error_json(400, f"{exc.__class__.__name__}: {exc}", tool=name)
                 return
             st.touch()
@@ -818,6 +1031,10 @@ class StudioHandler(BaseHTTPRequestHandler):
         with st.lock:
             project = st.project.copy()
         try:
+            start, end, track_ids = render_args(project, body.get("start_beat"), body.get("end_beat"), body.get("track_ids"))
+        except ValueError as exc:
+            raise HttpError(400, str(exc))
+        try:
             import importlib
 
             importlib.import_module("synth2.engine.renderer")
@@ -825,12 +1042,12 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise HttpError(503, f"render engine unavailable: {exc}")
         t0 = time.perf_counter()
         try:
-            data, report, res = render_wav(project, body.get("start_beat"), body.get("end_beat"), body.get("track_ids"))
+            data, report, res = render_wav(project, start, end, track_ids)
         except (ValueError, KeyError, LookupError) as exc:
             raise HttpError(400, f"render failed: {exc}")
         report.setdefault("render_time_s", round(time.perf_counter() - t0, 3))
-        report["start_beat"] = body.get("start_beat")
-        report["end_beat"] = body.get("end_beat")
+        report["start_beat"] = start
+        report["end_beat"] = end
         header_report = copy.deepcopy(report)
         for tr in header_report.get("tracks", []) or []:
             if isinstance(tr, dict):
@@ -838,7 +1055,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         with st.lock:
             st.last_wav = data
             st.last_report = report
-            _record_render(st.session, project, res, body.get("start_beat"), body.get("end_beat"))
+            _record_render(st.session, project, res, start, end)
         self._send(200, data, "audio/wav", {
             "X-Render-Report": report_header(header_report),
             "Content-Disposition": 'inline; filename="render.wav"',
@@ -866,31 +1083,40 @@ class StudioHandler(BaseHTTPRequestHandler):
         if not message:
             raise HttpError(400, "missing 'message'")
         st = self.state
-        with st.lock:
-            try:
-                if st.director is None or getattr(st.director, "session", st.session) is not st.session:
-                    from ..ai.director import Director
+        if not st.ai_lock.acquire(blocking=False):
+            raise HttpError(409, "the AI Director is still working on the previous request")
+        try:
+            with st.lock:
+                try:
+                    if st.director is None or getattr(st.director, "session", st.session) is not st.session:
+                        from ..ai.director import Director
 
-                    st.director = Director(st.session)
-                elif body.get("reset") and hasattr(st.director, "reset"):
-                    st.director.reset()
-            except Exception as exc:  # DirectorUnavailable, missing SDK, bad credentials...
-                if exc.__class__.__name__ == "DirectorUnavailable" or isinstance(exc, ImportError):
-                    self.send_error_json(501, str(exc), available=False)
-                    return
-                raise HttpError(500, f"AI Director could not start: {exc.__class__.__name__}: {exc}")
+                        st.director = Director(st.session)
+                    elif body.get("reset") and hasattr(st.director, "reset"):
+                        st.director.reset()
+                    director = st.director
+                except Exception as exc:  # DirectorUnavailable, missing SDK, bad credentials...
+                    if exc.__class__.__name__ == "DirectorUnavailable" or isinstance(exc, ImportError):
+                        self.send_error_json(501, str(exc), available=False)
+                        return
+                    raise HttpError(500, f"AI Director could not start: {exc.__class__.__name__}: {exc}")
+            # chat() may take minutes of Claude round trips: it runs without the studio lock (each of its
+            # tool calls locks the session on its own), so the studio keeps answering meanwhile.
             try:
-                out = st.director.chat(message)
+                out = director.chat(message)
             except Exception as exc:
                 traceback.print_exc()
                 raise HttpError(500, f"AI Director error: {exc.__class__.__name__}: {exc}")
-            st.touch()
-            result = {
-                "reply": (out or {}).get("reply", ""),
-                "actions": (out or {}).get("actions", []),
-                "project": st.project.to_dict(),
-                "history": st.history(),
-            }
+            with st.lock:
+                st.touch()
+                result = {
+                    "reply": (out or {}).get("reply", ""),
+                    "actions": (out or {}).get("actions", []),
+                    "project": st.project.to_dict(),
+                    "history": st.history(),
+                }
+        finally:
+            st.ai_lock.release()
         self.send_json(result)
 
     # ---- API: files ----------------------------------------------------
@@ -911,6 +1137,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             tmp.write_bytes(raw)
             try:
                 project = _load_project_file(tmp)
+                _check_finite(project)
             except Exception as exc:
                 raise HttpError(400, f"could not import {filename}: {exc.__class__.__name__}: {exc}")
         if not project.title or project.title == "Untitled":
@@ -938,28 +1165,126 @@ class StudioHandler(BaseHTTPRequestHandler):
         self._send(200, data, mime, {"Content-Disposition": f'attachment; filename="{_ascii(filename)}"'})
 
     def api_save(self):
+        """Save to ``path`` (default: the session's project path).
+
+        Only a native project file (``.s2p.json``/``.json``/``.s2p``/``.s2s``) becomes the
+        session's project path; saving to ``.mid``/``.svp``/``.musicxml``/``.ust`` is an export
+        (``"exported": true``) and the next plain Save still writes the lossless project file.
+        """
         body = self.read_json()
+        path = body.get("path")
+        if path is not None and not isinstance(path, str):
+            raise HttpError(400, "'path' must be a string")
+        if path and any(ord(c) < 0x20 or ord(c) == 0x7F for c in path):
+            raise HttpError(400, "'path' must not contain control characters")
         st = self.state
         with st.lock:
-            path = body.get("path") or getattr(st.session, "path", None)
+            path = path or getattr(st.session, "path", None)
             if not path:
-                raise HttpError(400, "no file path: pass {\"path\": ...} (the project has never been saved)")
+                raise HttpError(400, "no project file yet: pass {\"path\": \"<name>.s2p.json\"} (Save as…); "
+                                     "exports such as .mid or .svp do not become the project file")
             try:
                 saved = save_project(st.project, str(path))
             except ImportError as exc:
                 raise HttpError(501, f"cannot save that format yet: {exc}")
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 raise HttpError(400, f"could not save: {exc}")
-            if hasattr(st.session, "path"):
+            native = is_project_file(saved)
+            if native and hasattr(st.session, "path"):
                 st.session.path = saved
-        self.send_json({"ok": True, "path": saved})
+            project_path = getattr(st.session, "path", None)
+        self.send_json({"ok": True, "path": saved, "format": save_format(saved) or "json", "exported": not native,
+                        "project_path": project_path})
 
     def api_health(self):
         self.send_json({"ok": True, "revision": self.state.revision})
 
 
+# printable ASCII except '%' (the escape character) and '"' (ends a quoted header parameter)
+_HEADER_SAFE = "".join(chr(c) for c in range(0x20, 0x7F) if chr(c) not in '%"')
+
+
 def _ascii(s: str) -> str:
-    return s.encode("ascii", "replace").decode("ascii").replace('"', "'")
+    """Make ``s`` safe as an HTTP header value: CR/LF and other control characters, non-ASCII,
+    ``%`` and ``"`` are percent-encoded, so a value (e.g. a file name) can never split the header."""
+    return urllib.parse.quote(s, safe=_HEADER_SAFE)
+
+
+def _media_type(content_type: str | None) -> str:
+    return (content_type or "").split(";", 1)[0].strip().lower()
+
+
+def _host_name(host: str) -> str | None:
+    """The lower-case host name of a ``Host`` header value (``None`` if malformed)."""
+    m = _HOST_RE.fullmatch(host.strip())
+    if not m:
+        return None
+    return (m["v6"] or m["name"]).lower().rstrip(".")
+
+
+def _same_origin(origin: str, host: str | None) -> bool:
+    """Whether an ``Origin`` header names the origin the request was sent to (``host`` = its Host header)."""
+    if not host:
+        return False
+    o = origin.strip().lower()
+    return o in (f"http://{host.lower()}", f"https://{host.lower()}")
+
+
+def _allowed_host_names(bind_host: str | None, extra=()) -> set[str]:
+    """Host names (besides IP addresses) the server answers to; see :meth:`StudioServer.host_allowed`."""
+    names = {"localhost"}
+    bind = (bind_host or "").strip().strip("[]").lower().rstrip(".")
+    if bind in WILDCARD_HOSTS:  # reachable from the network: also accept this machine's own name
+        try:
+            name = socket.gethostname().lower().rstrip(".")
+        except OSError:  # pragma: no cover
+            name = ""
+        if name:
+            short = name.split(".")[0]
+            names |= {name, short, short + ".local"}
+    else:
+        names.add(bind)
+    names |= {h.strip().lower().rstrip(".") for h in extra if h and h.strip()}
+    return names
+
+
+def _reject_json_constant(name: str):
+    raise ValueError(f"{name} is not allowed (numbers must be finite)")
+
+
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"number {text} is out of range")
+    return value
+
+
+def _sanitize_nonfinite(obj):
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_nonfinite(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_nonfinite(v) for v in obj]
+    return obj
+
+
+def dumps_json(obj: Any, **kw) -> str:
+    """``json.dumps`` that always yields strict JSON: NaN/Infinity (which the browser's
+    ``JSON.parse`` rejects) are written as ``null`` instead of breaking the whole document."""
+    try:
+        return json.dumps(obj, allow_nan=False, default=_json_default, **kw)
+    except ValueError:
+        loose = json.loads(json.dumps(obj, default=_json_default))
+        return json.dumps(_sanitize_nonfinite(loose), allow_nan=False, **kw)
+
+
+def _check_finite(project: Project) -> None:
+    """Raise ``ValueError`` if ``project`` holds NaN/Infinity (e.g. ``"bpm": "inf"``)."""
+    try:
+        json.dumps(project.to_dict(), allow_nan=False, default=_json_default)
+    except ValueError:
+        raise ValueError("the project contains NaN or infinite numbers") from None
 
 
 def _json_default(obj):
@@ -984,6 +1309,8 @@ def _json_default(obj):
 ROUTES = {
     ("GET", "/api/project"): StudioHandler.api_get_project,
     ("PUT", "/api/project"): StudioHandler.api_put_project,
+    # POST alias for the studio's navigator.sendBeacon() flush on page unload (beacons cannot PUT); it gets the
+    # same Origin and Content-Type: application/json checks, so other sites cannot use it.
     ("POST", "/api/project"): StudioHandler.api_put_project,
     ("GET", "/api/history"): StudioHandler.api_history,
     ("POST", "/api/new"): StudioHandler.api_new,
@@ -1017,12 +1344,32 @@ class StudioServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, state: StudioState, quiet: bool = False):
+    def __init__(self, addr, state: StudioState, quiet: bool = False, allowed_hosts=()):
         super().__init__(addr, StudioHandler)
         self.state = state
         self.quiet = quiet
+        self.allowed_hosts = _allowed_host_names(addr[0], allowed_hosts)
         # Load the pronunciation dictionary in the background so the first lyric edit is instant.
         threading.Thread(target=_warm_up, name="synth2-warmup", daemon=True).start()
+
+    def host_allowed(self, host: str) -> bool:
+        """Whether a request's ``Host`` header names this server rather than some other site.
+
+        Accepted: ``localhost``, any IP address, the bound ``--host`` name (with a wildcard
+        bind, this machine's host name) and ``--allow-host`` names, on any port (so ssh
+        port forwards work).  A DNS-rebinding page always sends its own domain name, so it
+        is refused before it can read anything.
+        """
+        name = _host_name(host)
+        if not name:
+            return False
+        if name in self.allowed_hosts:
+            return True
+        try:
+            ipaddress.ip_address(name)
+        except ValueError:
+            return False
+        return True
 
     @property
     def url(self) -> str:
@@ -1032,14 +1379,20 @@ class StudioServer(ThreadingHTTPServer):
         return f"http://{host}:{port}/"
 
 
-def make_server(host: str = "127.0.0.1", port: int = 8765, project_path: str | None = None, quiet: bool = False) -> StudioServer:
-    """Create (but do not start) the studio server. ``port=0`` picks a free port."""
-    return StudioServer((host, port), StudioState(project_path), quiet=quiet)
+def make_server(host: str = "127.0.0.1", port: int = 8765, project_path: str | None = None, quiet: bool = False,
+                allowed_hosts=()) -> StudioServer:
+    """Create (but do not start) the studio server. ``port=0`` picks a free port.
+
+    ``allowed_hosts`` lists extra host names the studio may be opened at (e.g. behind a
+    reverse proxy); see :meth:`StudioServer.host_allowed`.
+    """
+    return StudioServer((host, port), StudioState(project_path), quiet=quiet, allowed_hosts=allowed_hosts)
 
 
-def run(host: str = "127.0.0.1", port: int = 8765, project_path: str | None = None, open_browser: bool = False) -> None:
+def run(host: str = "127.0.0.1", port: int = 8765, project_path: str | None = None, open_browser: bool = False,
+        allowed_hosts=()) -> None:
     """Start the studio and serve until interrupted."""
-    server = make_server(host, port, project_path)
+    server = make_server(host, port, project_path, allowed_hosts=allowed_hosts)
     _log(f"Synth2 Vocal Studio running at {server.url}  (Ctrl+C to stop)")
     if open_browser:
         threading.Timer(0.4, lambda: webbrowser.open(server.url)).start()
@@ -1057,8 +1410,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--project", default=None, help="project file to open (any supported format)")
     ap.add_argument("--open", action="store_true", help="open the studio in a web browser")
+    ap.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                    help="extra host name the studio may be opened at (repeatable; localhost and IP addresses "
+                         "always work)")
     args = ap.parse_args(argv)
-    run(args.host, args.port, args.project, args.open)
+    run(args.host, args.port, args.project, args.open, allowed_hosts=args.allow_host)
     return 0
 
 

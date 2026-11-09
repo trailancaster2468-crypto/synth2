@@ -232,7 +232,13 @@ const Api = {
     return data;
   },
   getProject: () => Api.request('GET', '/api/project'),
-  putProject: (p) => Api.request('PUT', '/api/project', p),
+  /** The project plus the server revision it belongs to (read from the same response). */
+  async getProjectRev() {
+    const res = await Api.request('GET', '/api/project', undefined, { raw: true });
+    const rev = parseInt(res.headers.get('X-Project-Revision'), 10);
+    return { project: await res.json(), revision: Number.isFinite(rev) ? rev : null };
+  },
+  putProject: (p, baseRevision) => Api.request('PUT', '/api/project', { project: p, base_revision: baseRevision }),
   meta: () => Api.request('GET', '/api/meta'),
   history: () => Api.request('GET', '/api/history'),
   phonemes: () => Api.request('GET', '/api/phonemes'),
@@ -284,6 +290,47 @@ function normalizeProject(p) {
   return p;
 }
 
+const clone = (x) => JSON.parse(JSON.stringify(x));
+const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+function deepEq(a, b) {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || !a || !b || Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((k) => hasOwn(b, k) && deepEq(a[k], b[k]));
+}
+const isIdList = (x) => Array.isArray(x) && x.every((v) => isObj(v) && typeof v.id === 'string');
+/**
+ * Three-way merge of project JSON: `mine` (local edits) and `theirs` (the server, changed by a
+ * tool call or the AI) both derive from `base`. Objects merge per key, id'd lists (tracks, notes)
+ * per id; where both sides changed the same value the local edit wins.
+ */
+function merge3(base, mine, theirs) {
+  if (deepEq(mine, base)) return theirs;
+  if (deepEq(theirs, base) || deepEq(theirs, mine)) return mine;
+  if (isObj(base) && isObj(mine) && isObj(theirs)) {
+    const out = {};
+    for (const k of new Set([...Object.keys(theirs), ...Object.keys(mine)])) {
+      const inB = hasOwn(base, k), inM = hasOwn(mine, k), inT = hasOwn(theirs, k);
+      if (inM && inT) out[k] = merge3(inB ? base[k] : undefined, mine[k], theirs[k]);
+      else if (inM) { if (!inB || !deepEq(mine[k], base[k])) out[k] = mine[k]; } // deleted on the server unless edited here
+      else if (!inB) out[k] = theirs[k]; // added on the server; a key deleted here stays deleted
+    }
+    return out;
+  }
+  if (isIdList(base) && isIdList(mine) && isIdList(theirs)) {
+    const B = new Map(base.map((v) => [v.id, v])), M = new Map(mine.map((v) => [v.id, v])), T = new Map(theirs.map((v) => [v.id, v]));
+    const out = [];
+    for (const t of theirs) {
+      if (M.has(t.id)) out.push(B.has(t.id) ? merge3(B.get(t.id), M.get(t.id), t) : M.get(t.id));
+      else if (!B.has(t.id)) out.push(t); // added on the server (an item deleted here stays deleted)
+    }
+    for (const m of mine) if (!T.has(m.id) && (!B.has(m.id) || !deepEq(m, B.get(m.id)))) out.push(m);
+    return out;
+  }
+  return mine;
+}
+
 /** Client-side state: project JSON, selection, view, transport, history; pub/sub. */
 class Store {
   constructor() {
@@ -298,7 +345,10 @@ class Store {
     this.newNoteLen = 'auto';
     this.lastDuration = 1;
     this.version = 0;
-    this.revision = null;
+    this.revision = null; // server revision of `base`
+    this.base = null; // the project as last synced with the server (for three-way merges)
+    this.syncError = null; // set while a local edit has not reached the server
+    this.isInteracting = () => false; // App: true while a drag is in progress
     this.history = { undo: null, redo: null };
     this.phonemes = {};
     this.phonemeErrors = {};
@@ -311,6 +361,7 @@ class Store {
     this._saveTimer = null;
     this._pending = false;
     this._inflight = 0;
+    this._retryMs = 0;
     this._chain = Promise.resolve();
     this._phTimer = null;
   }
@@ -361,6 +412,13 @@ class Store {
     this.emit('project', { keepView });
     this.refreshPhonemesSoon(10);
   }
+  /** Replace the local project with the server's copy at `revision`; any unsynced local edit is dropped. */
+  adopt(p, revision, opts) {
+    this.discardPending();
+    this.setProject(p, opts);
+    this.base = clone(this.project);
+    if (revision != null) this.revision = revision;
+  }
   setTrack(id) {
     if (id === this.trackId) return;
     this.trackId = id;
@@ -381,41 +439,95 @@ class Store {
     this.emit(kind);
     this.emit('dirty');
     this._pending = true;
-    clearTimeout(this._saveTimer);
-    this._saveTimer = setTimeout(() => this.flush(), 300);
+    this._scheduleFlush(300);
   }
-  /** Send any pending edit to the server; resolves when all PUTs are done. */
+  _scheduleFlush(ms) {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => {
+      if (this.isInteracting()) this._scheduleFlush(250); // a rebase must not swap notes out from under a drag
+      else this.flush();
+    }, ms);
+  }
+  /** Send any pending edit to the server; resolves when all PUTs are done. A failed PUT stays pending and is retried. */
   flush() {
     if (!this._pending) return this._chain;
     clearTimeout(this._saveTimer);
     this._pending = false;
-    const snapshot = JSON.parse(JSON.stringify(this.project));
     this._inflight++;
     this._chain = this._chain
-      .then(() => Api.putProject(snapshot))
-      .then((r) => {
-        if (r && r.history) this.setHistory(r.history);
-        if (r && r.revision != null) this.revision = r.revision;
+      .then(() => this._push())
+      .then(() => {
+        if (this.syncError) status('Synced with the server');
+        this.syncError = null;
+        this._retryMs = 0;
         this.refreshPhonemesSoon();
       })
       .catch((e) => {
-        toast('Could not sync the edit to the server: ' + e.message, 'err', 6000);
-        status('Sync failed: ' + e.message, true);
+        // The edit exists only in this browser until a PUT succeeds: keep it pending and retry with backoff.
+        this._pending = true;
+        if (!this.syncError) toast('Could not sync the edit to the server: ' + e.message + ' (retrying)', 'err', 6000);
+        this.syncError = e;
+        status('Sync failed: ' + e.message + ' - retrying', true);
+        this._retryMs = Math.min(15000, (this._retryMs || 500) * 2);
+        this._scheduleFlush(this._retryMs);
       })
       .finally(() => { this._inflight--; });
     return this._chain;
   }
+  async _push() {
+    // A tool call or the AI may have changed the project since our last sync. Fold that change in
+    // instead of overwriting it with a stale full-project PUT.
+    if (this.revision != null) {
+      const h = await Api.history();
+      if (h.revision != null && h.revision !== this.revision) await this._rebase();
+    }
+    let snapshot = clone(this.project);
+    if (this.base && deepEq(snapshot, this.base)) return; // nothing new to send
+    let r;
+    try {
+      r = await Api.putProject(snapshot, this.revision);
+    } catch (e) {
+      if (e.status !== 409) throw e; // a server that checks base_revision refused a stale PUT
+      await this._rebase();
+      snapshot = clone(this.project);
+      r = await Api.putProject(snapshot, this.revision);
+    }
+    this.base = snapshot;
+    if (r && r.revision != null) this.revision = r.revision;
+    if (r && r.history) this.setHistory(r.history);
+  }
+  async _rebase() {
+    const { project, revision } = await Api.getProjectRev();
+    const theirs = normalizeProject(project);
+    const merged = this.base ? merge3(this.base, this.project, theirs) : this.project;
+    this.setProject(clone(merged));
+    this.base = clone(theirs);
+    this.revision = revision;
+    App.transport && App.transport.invalidateCache();
+    status('Merged a change made on the server (tool call) with your edit');
+  }
+  /** Flush; true when the server has every local edit (save, render and export use the server's copy). */
+  async sync() {
+    await this.flush();
+    return !this._pending && !this.syncError;
+  }
+  discardPending() {
+    clearTimeout(this._saveTimer);
+    this._pending = false;
+    this.syncError = null;
+    this._retryMs = 0;
+  }
   get pending() { return this._pending || this._inflight > 0; }
+  /** Undo/redo counts and file path. The revision only moves together with the project (adopt, PUT). */
   setHistory(h) {
     this.history = { undo: h.undo ?? null, redo: h.redo ?? null };
-    if (h.revision != null) this.revision = h.revision;
     if (h.path !== undefined) this.path = h.path;
     this.emit('history');
   }
   async reload() {
     await this.flush();
-    const p = await Api.getProject();
-    this.setProject(p);
+    const { project, revision } = await Api.getProjectRev();
+    this.adopt(project, revision);
     await this.refreshHistory();
   }
   async refreshHistory() {
@@ -428,7 +540,7 @@ class Store {
     await this.flush();
     try {
       const r = await (which === 'undo' ? Api.undo() : Api.redo());
-      this.setProject(r.project);
+      this.adopt(r.project, r.history && r.history.revision);
       this.setHistory(r.history || {});
       this.dirty = true;
       this.emit('dirty');
@@ -472,6 +584,7 @@ const GRID_COLORS = { bar: '#3a404c', beat: '#272b34', sub: '#1d2027' };
 
 /* ============================================================== PianoRoll */
 const KEYS_W = 58;
+const DRAG_PX = 3; // pointer travel (px) before a press on a note becomes a move or resize
 const RULER_H = 28;
 const SB = 10; // scrollbar thickness
 
@@ -505,7 +618,8 @@ class PianoRoll {
     canvas.addEventListener('pointerleave', () => { if (!this.drag) { this.mouse = null; this.hover = null; App.cursorInfo(''); this.invalidate(); } });
     for (const ev of ['project', 'notes', 'tracks', 'song', 'selection', 'transport', 'view', 'phonemes']) store.on(ev, () => this.invalidate());
     store.on('project', (d) => { if (!d || !d.keepView) this.centerOnNotes(); this.clampScroll(); });
-    store.on('selection', () => { if (this.editing && !this.s.selection.has(this.editing.noteId)) this.closeLyric(false); });
+    // Selecting elsewhere (another note, another track) finishes the edit like clicking away does; only Escape discards it.
+    store.on('selection', () => { if (this.editing && !this.s.selection.has(this.editing.noteId)) this.commitLyric(); });
     this.initLyricInput();
   }
 
@@ -1013,7 +1127,7 @@ class PianoRoll {
     if (y < RULER_H) {
       if (x < KEYS_W || x >= xV) return;
       const edge = this.loopEdgeAt(x);
-      if (edge) { this.startDrag(e, { type: 'loopEdge', edge }); return; }
+      if (edge) { this.startDrag(e, { type: 'loopEdge', edge, start0: this.s.loop.start, end0: this.s.loop.end }); return; }
       this.startDrag(e, { type: 'ruler', x0: x, b0: this.beatAt(x), moved: false });
       return;
     }
@@ -1042,11 +1156,11 @@ class PianoRoll {
       const notes = this.s.selectedNotes();
       const snap0 = notes.map((n) => ({ n, onset: n.onset, pitch: n.pitch, duration: n.duration }));
       if (hit.edge) {
-        this.startDrag(e, { type: 'resize', grab: hit.note, grabEnd: hit.note.onset + hit.note.duration, b0: this.beatAt(x), orig: snap0, moved: false });
+        this.startDrag(e, { type: 'resize', grab: hit.note, grabEnd: hit.note.onset + hit.note.duration, b0: this.beatAt(x), x0: x, orig: snap0, moved: false });
       } else {
         this.startDrag(e, {
           type: 'move', grab: hit.note, grabOnset: hit.note.onset, grabPitch: hit.note.pitch, b0: this.beatAt(x), p0: this.pitchAt(y),
-          orig: snap0, moved: false, toggleOff, dup: e.ctrlKey || e.metaKey, duplicated: false, clickedId: id, shift: e.shiftKey,
+          x0: x, y0: y, dragX: false, dragY: false, orig: snap0, moved: false, toggleOff, dup: e.ctrlKey || e.metaKey, duplicated: false, clickedId: id, shift: e.shiftKey,
         });
       }
       return;
@@ -1095,10 +1209,14 @@ class PianoRoll {
       }
       case 'move': {
         const t = this.s.track;
-        let delta = this.snapRound(d.grabOnset + (this.beatAt(x) - d.b0), e) - d.grabOnset;
+        // Each axis starts following the pointer only past a small threshold, so clicking a note
+        // (with the usual 1px jitter) never moves it or snaps an off-grid onset to the grid.
+        if (Math.abs(x - d.x0) > DRAG_PX) d.dragX = true;
+        if (Math.abs(y - d.y0) > DRAG_PX) d.dragY = true;
+        let delta = d.dragX ? this.snapRound(d.grabOnset + (this.beatAt(x) - d.b0), e) - d.grabOnset : 0;
         const minOn = Math.min(...d.orig.map((o) => o.onset));
         delta = Math.max(delta, -minOn);
-        let dp = this.pitchAt(y) - d.p0;
+        let dp = d.dragY ? this.pitchAt(y) - d.p0 : 0;
         const pMin = Math.min(...d.orig.map((o) => o.pitch)), pMax = Math.max(...d.orig.map((o) => o.pitch));
         dp = clamp(dp, -pMin, 127 - pMax);
         if (!d.moved && (Math.abs(delta) > EPS || dp !== 0)) {
@@ -1118,10 +1236,11 @@ class PianoRoll {
         break;
       }
       case 'resize': {
+        if (!d.moved && Math.abs(x - d.x0) <= DRAG_PX) break;
         const newEnd = this.snapRound(d.grabEnd + (this.beatAt(x) - d.b0), e);
         const dd = newEnd - d.grabEnd;
         if (Math.abs(dd) > EPS) d.moved = true;
-        for (const o of d.orig) o.n.duration = round6(Math.max(this.minDur(), o.duration + dd));
+        for (const o of d.orig) o.n.duration = Math.abs(dd) > EPS ? round6(Math.max(this.minDur(), o.duration + dd)) : o.duration;
         this.s.emit('notes');
         break;
       }
@@ -1199,23 +1318,24 @@ class PianoRoll {
         status(`Added note ${midiName(d.note.pitch)} at ${this.s.fmtBeat(d.note.onset)}`);
         break;
       case 'move':
-        if (d.moved) this.s.commit('notes');
+        if (d.moved) { if (d.duplicated || d.orig.some((o) => o.n.onset !== o.onset || o.n.pitch !== o.pitch)) this.s.commit('notes'); }
         else if (d.toggleOff) { this.s.selection.delete(d.clickedId); this.s.emit('selection'); }
         else if (!d.shift && this.s.selection.size > 1) this.s.select([d.clickedId]);
         break;
       case 'resize':
-        if (d.moved) {
+        if (d.moved && d.orig.some((o) => o.n.duration !== o.duration)) {
           if (this.s.newNoteLen === 'auto') this.s.lastDuration = d.grab.duration;
           this.s.commit('notes');
         }
         break;
       case 'ruler':
         if (!d.moved) App.transport.seek(Math.max(0, this.snapRound(this.beatAt(this.local(e).x))));
-        else status(`Loop ${this.s.fmtBeat(this.s.loop.start)} - ${this.s.fmtBeat(this.s.loop.end)}`);
+        else { status(`Loop ${this.s.fmtBeat(this.s.loop.start)} - ${this.s.fmtBeat(this.s.loop.end)}`); App.transport.loopChanged(); }
         App.transport.updateButtons();
         break;
       case 'loopEdge':
         App.transport.updateButtons();
+        if (this.s.loop.start !== d.start0 || this.s.loop.end !== d.end0) App.transport.loopChanged();
         break;
       case 'key':
         this.pressedKey = null;
@@ -1288,7 +1408,7 @@ class PianoRoll {
       items.push(['Set loop to this bar', '', () => {
         const bpb = this.s.beatsPerBar, b0 = Math.floor(beat / bpb) * bpb;
         Object.assign(this.s.loop, { on: true, start: b0, end: b0 + bpb });
-        this.s.emit('transport'); App.transport.updateButtons();
+        this.s.emit('transport'); App.transport.updateButtons(); App.transport.loopChanged();
       }]);
     }
     App.contextMenu(e.clientX, e.clientY, items);
@@ -1320,6 +1440,7 @@ class PianoRoll {
     if (!notes.length) return;
     const lo = Math.min(...notes.map((n) => n.onset));
     beats = Math.max(beats, -lo);
+    if (Math.abs(beats) < EPS) return; // already at beat 0: no empty undo step
     for (const n of notes) n.onset = round6(n.onset + beats);
     sortNotes(this.s.track);
     this.s.commit('notes');
@@ -1327,22 +1448,31 @@ class PianoRoll {
   resizeBy(beats) {
     const notes = this.s.selectedNotes();
     if (!notes.length) return;
-    for (const n of notes) n.duration = round6(Math.max(this.minDur(), n.duration + beats));
-    this.s.commit('notes');
+    let changed = false;
+    for (const n of notes) {
+      const d = round6(Math.max(this.minDur(), n.duration + beats));
+      if (Math.abs(d - n.duration) > EPS) { n.duration = d; changed = true; }
+    }
+    if (changed) this.s.commit('notes');
   }
   quantize() {
     const notes = this.s.selectedNotes();
     const s = this.s.snap || 0.25;
+    let changed = false;
     for (const n of notes) {
       const on = round6(Math.round(n.onset / s) * s);
       const end = round6(Math.max(on + s, Math.round((n.onset + n.duration) / s) * s));
-      n.onset = on; n.duration = round6(end - on);
+      const dur = round6(end - on);
+      if (on !== n.onset || dur !== n.duration) { n.onset = on; n.duration = dur; changed = true; }
     }
+    if (!changed) return; // nothing selected or already on the grid: no empty undo step
     sortNotes(this.s.track);
     this.s.commit('notes');
   }
   clearAttrs() {
-    for (const n of this.s.selectedNotes()) delete n.attrs;
+    const notes = this.s.selectedNotes().filter((n) => n.attrs);
+    if (!notes.length) return;
+    for (const n of notes) delete n.attrs;
     this.s.commit('notes');
   }
   splitNote(n, beat) {
@@ -1445,22 +1575,36 @@ class PianoRoll {
     if (refocus && document.activeElement === this.input) this.input.blur();
     this.invalidate();
   }
+  /** Split typed text into one lyric per note; an explicit phoneme group like "[s t aa r]" stays one lyric. */
+  async splitLyricText(text, language) {
+    const tokens = [];
+    for (const part of text.match(/\[[^\]]*\]?|[^[]+/g) || []) {
+      if (part.startsWith('[')) { tokens.push(part.trim()); continue; }
+      if (!part.trim()) continue;
+      let toks;
+      try { toks = (await Api.splitLyrics(part, language)).tokens; } catch { toks = null; }
+      tokens.push(...(toks && toks.length ? toks : part.trim().split(/\s+/)));
+    }
+    return tokens;
+  }
   async commitLyric(advance = 0) {
     const ed = this.editing;
     if (!ed) return;
     this.editing = null;
-    const track = this.s.trackById(ed.trackId);
-    const note = track && track.notes.find((n) => n.id === ed.noteId);
+    let track = this.s.trackById(ed.trackId);
+    let note = track && track.notes.find((n) => n.id === ed.noteId);
     const text = this.input.value.trim();
     if (!advance) { this.input.hidden = true; this.input.blur(); }
     if (!note) { this.invalidate(); return; }
     let idx = track.notes.indexOf(note);
     let last = idx;
     if (text && text !== note.lyric) {
-      if (/\s/.test(text)) {
-        let tokens;
-        try { tokens = (await Api.splitLyrics(text, track.language)).tokens; } catch { tokens = null; }
-        if (!tokens || !tokens.length) tokens = text.split(/\s+/);
+      if (/\s/.test(text) && !/^\[[^\]]*\]$/.test(text)) {
+        const tokens = await this.splitLyricText(text, track.language);
+        // The project may have been reloaded or merged while splitting: find the note again.
+        track = this.s.trackById(ed.trackId);
+        note = track && track.notes.find((n) => n.id === ed.noteId);
+        if (!note) { this.invalidate(); return; }
         idx = track.notes.indexOf(note);
         let i = idx;
         for (const tok of tokens) {
@@ -1871,15 +2015,45 @@ function makeSlider(label, value, { min, max, step, def = 0, fmt, set, key, onCo
   return el('div', { class: 'tc-row' }, el('span', { class: 'tc-lbl' }, label), r, val);
 }
 
+/**
+ * Defers a panel's DOM rebuild while a pointer button is held inside it. A rebuild between
+ * pointerdown and pointerup (a commit from the blur of the field being left, a PUT response,
+ * a phoneme refresh) replaces the pressed button, so its click would never fire.
+ */
+class PressGuard {
+  constructor(host, rerender) {
+    this.down = false;
+    this.deferred = false;
+    host.addEventListener('pointerdown', () => { this.down = true; }, true);
+    const release = () => {
+      if (!this.down) return;
+      this.down = false;
+      // after the click that follows this pointerup has been dispatched
+      setTimeout(() => { if (this.deferred && !this.down) { this.deferred = false; rerender(); } }, 0);
+    };
+    window.addEventListener('pointerup', release, true);
+    window.addEventListener('pointercancel', release, true);
+    window.addEventListener('blur', release);
+    host.addEventListener('change', (e) => { if (e.target.tagName === 'SELECT') release(); }); // native popups swallow pointerup
+  }
+  /** True (and remembers to re-render later) while the pointer is held inside the panel. */
+  hold() {
+    if (this.down) this.deferred = true;
+    return this.down;
+  }
+}
+
 class TrackList {
   constructor(store, host) {
     this.s = store;
     this.host = host;
+    this.guard = new PressGuard(host, () => this.render());
     for (const ev of ['project', 'tracks']) store.on(ev, () => this.render());
     store.on('selection', () => this.markActive());
     $('#btn-add-track').addEventListener('click', () => this.addTrack());
   }
   render() {
+    if (this.guard.hold()) return;
     const keepFocus = this.host.contains(document.activeElement) ? document.activeElement.dataset.key : null;
     this.host.innerHTML = '';
     const meta = this.s.meta;
@@ -1994,7 +2168,21 @@ class Inspector {
       const b = e.target.closest('button[data-tab]');
       if (b) this.setTab(b.dataset.tab);
     });
-    for (const ev of ['project', 'notes', 'tracks', 'song', 'selection', 'phonemes', 'history']) store.on(ev, () => this.schedule());
+    this.guard = new PressGuard(host, () => this.render());
+    this._shown = { phonemes: null, history: null };
+    for (const ev of ['project', 'notes', 'tracks', 'song', 'selection']) store.on(ev, () => this.schedule());
+    // Phoneme refreshes and history updates follow every edit; rebuild only when they change what is shown.
+    store.on('phonemes', () => { if (this.phonemeKey() !== this._shown.phonemes) this.schedule(); });
+    store.on('history', () => { if (this.historyKey() !== this._shown.history) this.schedule(); });
+  }
+  phonemeKey() {
+    const t = this.s.track;
+    if (this.tab !== 'note' || !t) return '';
+    const ph = this.s.phonemes[t.id] || {}, errs = this.s.phonemeErrors[t.id] || {};
+    return JSON.stringify(this.s.selectedNotes().map((n) => [ph[n.id], errs[n.id]]));
+  }
+  historyKey() {
+    return this.tab === 'project' ? `${this.s.history.undo}/${this.s.history.redo}/${this.s.path}` : '';
   }
   setTab(tab) {
     this.tab = tab;
@@ -2006,10 +2194,12 @@ class Inspector {
     this._t = requestAnimationFrame(() => { this._t = 0; this.render(); });
   }
   render() {
-    // Do not rebuild under the user's fingers while they are typing in the inspector.
+    // Do not rebuild under the user's fingers while they are typing in or clicking the inspector.
+    if (this.guard.hold()) return;
     const active = document.activeElement;
     const focusKey = this.host.contains(active) ? active.dataset.key : null;
     if (focusKey && active.dataset.editing === '1') return;
+    this._shown = { phonemes: this.phonemeKey(), history: this.historyKey() };
     const scroll = this.host.scrollTop;
     this.host.innerHTML = '';
     if (this.tab === 'note') this.renderNote();
@@ -2299,6 +2489,14 @@ class Transport {
     this.s.emit('transport');
     this.updateButtons();
     status(L.on ? `Loop on: ${this.s.fmtBeat(L.start)} - ${this.s.fmtBeat(L.end)}` : 'Loop off');
+    this.loopChanged();
+  }
+  /** The loop region or switch changed: the playing source was built for the old one, so restart it. */
+  loopChanged() {
+    if (!this.playing) return;
+    this.stopSource();
+    this.playing = false;
+    this.play(true);
   }
   updateButtons() {
     $('#btn-loop').classList.toggle('on', this.s.loop.on);
@@ -2313,10 +2511,10 @@ class Transport {
   findCached(version, start, end) {
     return this.cache.find((c) => c.version === version && c.end === end && (end === null ? c.start <= start + EPS : Math.abs(c.start - start) < EPS));
   }
-  async play() {
+  async play(keepPosition = false) {
     try { this.ensureCtx(); } catch (e) { toast(e.message, 'err'); return; }
     if (!this.s.project.tracks.some((t) => t.notes.length)) { toast('Nothing to play yet: draw some notes first.', 'warn'); return; }
-    await this.s.flush();
+    if (!(await App.ensureSynced('Playback'))) return;
     const L = this.s.loop;
     const loop = L.on && L.end > L.start;
     const bpb = this.s.beatsPerBar;
@@ -2352,21 +2550,27 @@ class Transport {
       this.updateButtons();
       if (this.cancelled) { status('Render finished (playback cancelled)'); return; }
     }
-    const offsetBeat = loop ? start : Math.max(start, from);
+    const inLoop = keepPosition && from >= start - EPS && from < end;
+    const offsetBeat = loop ? (inLoop ? from : start) : Math.max(start, from);
     this.startSource(entry, offsetBeat, loop);
   }
   startSource(entry, fromBeat, loop) {
     this.stopSource();
     const ctx = this.ctx;
     const tm = this.s.tempo;
-    const src = ctx.createBufferSource();
-    src.buffer = entry.buffer;
-    src.connect(this.out);
     const renderStartSec = entry.report && entry.report.start_seconds != null ? entry.report.start_seconds : tm.beatToSec(entry.start);
     const offset = Math.max(0, tm.beatToSec(fromBeat) - renderStartSec);
     this.loopLen = 0;
     if (loop) {
-      this.loopLen = Math.min(entry.buffer.duration, tm.beatToSec(entry.end) - renderStartSec);
+      // The render stops after the last note's tail; pad it with silence so the loop wraps at the region end.
+      const regionLen = tm.beatToSec(entry.end) - renderStartSec;
+      if (regionLen > entry.buffer.duration + 1e-3) entry.buffer = this.padBuffer(entry.buffer, regionLen);
+      this.loopLen = Math.min(entry.buffer.duration, regionLen);
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = entry.buffer;
+    src.connect(this.out);
+    if (loop) {
       src.loop = true;
       src.loopStart = 0;
       src.loopEnd = this.loopLen;
@@ -2394,6 +2598,11 @@ class Transport {
       this._raf = requestAnimationFrame(tick);
     };
     this._raf = requestAnimationFrame(tick);
+  }
+  padBuffer(buf, seconds) {
+    const out = this.ctx.createBuffer(buf.numberOfChannels, Math.round(seconds * buf.sampleRate), buf.sampleRate);
+    for (let ch = 0; ch < buf.numberOfChannels; ch++) out.copyToChannel(buf.getChannelData(ch).subarray(0, out.length), ch);
+    return out;
   }
   stopSource() {
     if (this.src) {
@@ -2526,14 +2735,22 @@ class Chat {
       }
       this.setStatus({ available: true });
     }
-    await this.s.flush();
+    if (!(await this.s.sync())) {
+      // The director works on the server's copy; sending now would lose the unsynced edit.
+      typing.remove();
+      this.add('error', `Not sent: your last edit has not reached the server yet (${this.s.syncError ? this.s.syncError.message : 'sync pending'}). Try again in a moment.`);
+      this.text.value = msg;
+      this.sending = false;
+      $('#chat-send').disabled = false;
+      return;
+    }
     App.setBusy(true, 'AI Director is working…');
     try {
       const r = await Api.ai(msg, this.reset);
       this.reset = false;
       typing.remove();
       this.add('assistant', r.reply, r.actions);
-      if (r.project) this.s.setProject(r.project);
+      if (r.project) this.s.adopt(r.project, r.history && r.history.revision);
       else await this.s.reload();
       if (r.history) this.s.setHistory(r.history);
       App.transport.invalidateCache();
@@ -2581,18 +2798,19 @@ const App = {
     s.on('notes', () => { this.updateSelInfo(); this.transport.invalidateCache(); });
     s.on('project', () => { this.syncSongProps(); this.updateSelInfo(); });
     s.on('song', () => this.syncSongProps());
+    s.isInteracting = () => !!(this.roll.drag || this.lane.drag);
     // ResizeObserver misses devicePixelRatio changes (moving between monitors, browser zoom).
     window.addEventListener('resize', () => { this.roll.resize(); this.lane.resize(); });
     window.addEventListener('beforeunload', () => {
       if (s.pending) navigator.sendBeacon('/api/project', new Blob([JSON.stringify(s.project)], { type: 'application/json' }));
     });
     try {
-      const [meta, project] = await Promise.all([Api.meta(), Api.getProject()]);
+      const [meta, { project, revision }] = await Promise.all([Api.meta(), Api.getProjectRev()]);
       s.meta = meta;
       this.buildKeySelect();
       this.lane.buildTabs();
       this.chat.setStatus(meta.director);
-      s.setProject(project, { keepView: false });
+      s.adopt(project, revision, { keepView: false });
       await s.refreshHistory();
       this.roll.centerOnNotes();
       status(`Loaded "${s.project.title}"`);
@@ -2607,16 +2825,21 @@ const App = {
   /* ---- server sync */
   async poll() {
     const s = this.store;
-    if (s.pending || s.busy || this.roll.drag || this.lane.drag || this.roll.editing || this._polling) return;
+    const idle = () => !(s.pending || s.busy || this.roll.drag || this.lane.drag || this.roll.editing);
+    if (!idle() || this._polling) return;
     this._polling = true;
     try {
+      const rev = s.revision, version = s.version;
       const h = await Api.history();
-      const changed = s.revision != null && h.revision != null && h.revision !== s.revision;
-      s.setHistory(h);
-      if (changed && !s.pending) {
-        s.setProject(await Api.getProject());
-        this.transport.invalidateCache();
-        status('Project updated on the server (tool call) - reloaded');
+      s.setHistory(h); // counts only: the revision moves together with the project it belongs to
+      if (rev != null && h.revision != null && h.revision !== rev && idle()) {
+        const { project, revision } = await Api.getProjectRev();
+        // An edit made meanwhile is merged with the server's change by its own PUT; reloading would drop it.
+        if (idle() && s.version === version && s.revision === rev) {
+          s.adopt(project, revision);
+          this.transport.invalidateCache();
+          status('Project updated on the server (tool call) - reloaded');
+        }
       }
     } catch { /* connection status already updated */ }
     this._polling = false;
@@ -2845,9 +3068,23 @@ const App = {
   pickColor(current, onPick) {
     const inp = $('#color-input');
     inp.value = /^#[0-9a-f]{6}$/i.test(current) ? current : '#5eead4';
-    const handler = () => { onPick(inp.value); inp.removeEventListener('change', handler); };
-    inp.addEventListener('change', handler);
+    // One listener for the page's lifetime: a dismissed picker fires no change event, so a
+    // per-request listener would linger and later recolor the wrong track.
+    if (!this._colorBound) {
+      this._colorBound = true;
+      inp.addEventListener('change', () => { const cb = this._colorCb; this._colorCb = null; if (cb) cb(inp.value); });
+    }
+    this._colorCb = onPick;
     inp.click();
+  },
+  /** Flush pending edits; false (with a message) when the server still lacks one, so `what` would use a stale project. */
+  async ensureSynced(what) {
+    const s = this.store;
+    if (await s.sync()) return true;
+    const why = s.syncError ? s.syncError.message : 'sync pending';
+    toast(`${what} cancelled: your last edit has not reached the server yet (${why}). It is retried automatically.`, 'err', 6000);
+    status(`${what} cancelled: not synced with the server`, true);
+    return false;
   },
   async newProject() {
     if (!confirm('Start a new project? The current one stays in the undo history.')) return;
@@ -2857,7 +3094,7 @@ const App = {
       this.store.playhead = 0;
       this.store.loop = { on: false, start: 0, end: 0 };
       this.store.view.scrollX = 0;
-      this.store.setProject(r.project, { keepView: false });
+      this.store.adopt(r.project, r.history && r.history.revision, { keepView: false });
       this.transport.updateButtons();
       this.store.setHistory(r.history || {});
       this.store.dirty = false;
@@ -2872,7 +3109,7 @@ const App = {
     try {
       const buf = await file.arrayBuffer();
       const r = await Api.importFile(file.name, buf);
-      this.store.setProject(r.project, { keepView: false });
+      this.store.adopt(r.project, r.history && r.history.revision, { keepView: false });
       this.store.setHistory(r.history || {});
       this.transport.invalidateCache();
       this.roll.zoomFit();
@@ -2885,7 +3122,7 @@ const App = {
     }
   },
   async exportAs(fmt) {
-    await this.store.flush();
+    if (!(await this.ensureSynced('Export'))) return;
     try {
       const { blob, filename } = await Api.download('/api/export?format=' + encodeURIComponent(fmt));
       downloadBlob(blob, filename);
@@ -2893,7 +3130,7 @@ const App = {
     } catch (e) { toast(`Export (${fmt}) failed: ${e.message}`, 'err', 6000); }
   },
   async bounce() {
-    await this.store.flush();
+    if (!(await this.ensureSynced('Render'))) return;
     status('Rendering the full song\u2026');
     this.transport.btnPlay.classList.add('rendering');
     try {
@@ -2911,7 +3148,7 @@ const App = {
   },
   async save(askPath = false) {
     const s = this.store;
-    await s.flush();
+    if (!(await this.ensureSynced('Save'))) return;
     let path = null;
     if (askPath || !s.path) {
       const def = s.path || `${(s.project.title || 'untitled').replace(/[^\w.-]+/g, '_')}.s2p.json`;

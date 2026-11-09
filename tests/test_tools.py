@@ -808,3 +808,469 @@ def test_director_with_real_sdk_against_local_stub():
     assert body["model"] == "claude-opus-5-5" and body["fallbacks"] == "default"
     assert [m["role"] for m in body["messages"]] == ["user", "assistant", "user"]
     assert body["messages"][2]["content"][0]["tool_use_id"] == "toolu_1"
+
+
+# ================================================================== regressions (MCP server, director)
+
+def _serve_lines(srv, *lines):
+    import io
+
+    from synth2.ai.mcp_server import serve
+
+    out = io.BytesIO()
+    serve(srv, io.BytesIO(b"".join(ln + b"\n" for ln in lines)), out)
+    return [json.loads(x) for x in out.getvalue().decode("ascii").splitlines()]
+
+
+def test_mcp_lone_surrogate_and_internal_errors_do_not_end_the_session(monkeypatch):
+    from synth2.ai.mcp_server import INTERNAL_ERROR, MCPServer
+
+    srv = MCPServer(Session())
+    ping = b'{"jsonrpc":"2.0","id":9,"method":"ping"}'
+    out = _serve_lines(
+        srv,
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_project",'
+        b'"arguments":{"title":"Love \\ud83d"}}}',
+        b'{"jsonrpc":"2.0","id":"\\ud83d","method":"ping"}',  # surrogate in the id
+        b'{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"x\\ud83d"}}',  # echoed in the error
+        ping)
+    assert [r["id"] for r in out] == [1, "\ud83d", 3, 9]
+    assert out[0]["result"]["isError"] is False and srv.session.project.title == "Love \ud83d"
+    assert out[2]["error"]["code"] == -32602 and out[3]["result"] == {}
+    # any unexpected failure while handling a line is answered and the loop goes on
+    real = srv.handle
+    monkeypatch.setattr(srv, "handle", lambda msg: 1 / 0 if msg.get("id") == 1 else real(msg))
+    out = _serve_lines(srv, b'{"jsonrpc":"2.0","id":1,"method":"ping"}', ping)
+    assert out[0] == {"jsonrpc": "2.0", "id": 1, "error": {"code": INTERNAL_ERROR,
+                                                             "message": "internal error: ZeroDivisionError"}}
+    assert out[1]["result"] == {}
+
+
+def test_mcp_batches_do_not_nest_and_deep_nesting_is_rejected():
+    from synth2.ai.mcp_server import INVALID_REQUEST, PARSE_ERROR, MCPServer
+
+    srv = MCPServer(Session())
+    ping = {"jsonrpc": "2.0", "id": 6, "method": "ping"}
+    assert srv.handle([[ping]]) == [{"jsonrpc": "2.0", "id": None,
+                                     "error": {"code": INVALID_REQUEST, "message": "invalid JSON-RPC 2.0 message"}}]
+    assert srv.handle([ping, [ping]])[0] == {"jsonrpc": "2.0", "id": 6, "result": {}}
+    deep = ("[" * 600 + json.dumps(ping) + "]" * 600).encode()
+    out = _serve_lines(srv, deep, b"[" * 100000, json.dumps(ping).encode())
+    assert out[0][0]["error"]["code"] == INVALID_REQUEST
+    assert out[1]["error"]["code"] == PARSE_ERROR and out[1]["id"] is None
+    assert out[2] == {"jsonrpc": "2.0", "id": 6, "result": {}}
+
+
+def test_mcp_initialize_answers_only_supported_protocol_versions():
+    from synth2.ai.mcp_server import DEFAULT_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, MCPServer
+
+    srv = MCPServer(Session())
+
+    def negotiated(v):
+        return srv.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": v}})["result"]["protocolVersion"]
+
+    assert DEFAULT_PROTOCOL_VERSION in SUPPORTED_PROTOCOL_VERSIONS
+    for v in SUPPORTED_PROTOCOL_VERSIONS:
+        assert negotiated(v) == v
+    for v in ("1999-01-01", "garbage", "2099-01-01", 123, ["2025-06-18"], None):
+        assert negotiated(v) == DEFAULT_PROTOCOL_VERSION
+
+
+def test_mcp_autosave_follows_undo_and_redo(tmp_path, monkeypatch):
+    from synth2.ai import mcp_server
+
+    # the server must not rely on the tool registry listing undo/redo as mutating
+    monkeypatch.setattr(mcp_server, "MUTATING_TOOLS", set(MUTATING_TOOLS) - {"undo", "redo"})
+    path = tmp_path / "song.s2p.json"
+    srv = mcp_server.MCPServer(Session(path=path), autosave=True)
+
+    def tool(name, args=None):
+        r = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": name, "arguments": args or {}}})
+        assert r["result"]["isError"] is False, r
+
+    def saved_notes():
+        return len(Project.load(path).tracks[0].notes)
+
+    tool("write_melody", {"score": "@ 4 C4 q a D4 q b E4 q c"})
+    assert saved_notes() == 3
+    tool("undo")
+    assert not srv.session.project.tracks[0].notes and saved_notes() == 0
+    tool("redo")
+    assert saved_notes() == 3
+
+
+class _ScriptedStream(_FakeStream):
+    def get_final_message(self):
+        if isinstance(self.msg, BaseException):
+            raise self.msg
+        return self.msg
+
+
+class ScriptedClient(FakeClient):
+    """FakeClient whose scripted responses may also be exceptions (raised by get_final_message)."""
+
+    def _stream(self, **params):
+        self.calls.append(json.loads(json.dumps(params, default=lambda o: o.__dict__)))
+        return _ScriptedStream(self.responses.pop(0))
+
+
+def _user_texts(call):
+    return [b["text"] for m in call["messages"] if m["role"] == "user" for b in m["content"] if b.get("text")]
+
+
+def test_director_reissues_request_when_streamed_tool_json_is_unparseable():
+    from synth2.ai.director import MAX_STREAM_RETRIES, Director
+
+    bad = ValueError("Unable to parse tool parameter JSON from model. Please retry your request")
+    client = ScriptedClient([bad, _msg("end_turn", _text("Done."))])
+    d = Director(Session(), client=client)
+    assert d.chat("go")["reply"] == "Done." and len(client.calls) == 2
+    assert client.calls[0]["messages"] == client.calls[1]["messages"]
+    # retries are bounded; when they run out the error surfaces and the history is left clean
+    client = ScriptedClient([bad] * (MAX_STREAM_RETRIES + 2))
+    d = Director(Session(), client=client)
+    with pytest.raises(ValueError, match="Unable to parse"):
+        d.chat("go")
+    assert len(client.calls) == MAX_STREAM_RETRIES + 1 and d.history == []
+    # other errors (the SDK's typed API errors, connection errors...) are never retried here
+    client = ScriptedClient([RuntimeError("overloaded"), _msg("end_turn", _text("x"))])
+    with pytest.raises(RuntimeError):
+        Director(Session(), client=client).chat("go")
+    assert len(client.calls) == 1
+    anthropic = pytest.importorskip("anthropic")
+
+    class TypedValueError(anthropic.AnthropicError, ValueError):
+        pass
+
+    client = ScriptedClient([TypedValueError("api"), _msg("end_turn", _text("x"))])
+    with pytest.raises(TypedValueError):
+        Director(Session(), client=client).chat("go")
+    assert len(client.calls) == 1
+
+
+def test_director_failed_chat_is_not_resent_with_the_next_message(monkeypatch):
+    from synth2.ai import director as dmod
+
+    # the first request fails before anything happened: the request is forgotten
+    client = ScriptedClient([RuntimeError("529 overloaded"), _msg("end_turn", _text("Lowered."))])
+    d = dmod.Director(Session(), client=client)
+    with pytest.raises(RuntimeError):
+        d.chat("delete every track except the lead")
+    assert d.history == []
+    d.chat("never mind, just lower the harmony gain by 3 dB")
+    texts = _user_texts(client.calls[-1])
+    assert len(texts) == 1 and "never mind" in texts[0] and "delete every track" not in texts[0]
+    # it fails after some tool calls completed: they stay in the history and the turn is closed
+    sess = Session()
+    client = ScriptedClient([_msg("tool_use", _tool("t1", "write_melody", {"score": "@ 4 C4 q la D4 q la"})),
+                             RuntimeError("connection reset"), _msg("end_turn", _text("ok"))])
+    d = dmod.Director(sess, client=client)
+    with pytest.raises(RuntimeError):
+        d.chat("add a harmony track")
+    assert len(sess.project.tracks[0].notes) == 2
+    assert [m["role"] for m in d.history] == ["user", "assistant", "user", "assistant"]
+    assert "RuntimeError" in d.history[-1]["content"][0]["text"]
+    d.chat("try again")
+    roles = [m["role"] for m in client.calls[-1]["messages"]]
+    assert roles == ["user", "assistant", "user", "assistant", "user"]  # never two user turns in a row
+    # Ctrl-C while a tool runs: the tool_use without a tool_result is dropped so later requests stay valid
+    client = ScriptedClient([_msg("tool_use", _tool("t1", "write_melody", {"score": "C4 q la"}))])
+    d = dmod.Director(Session(), client=client, include_state=False)
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dmod, "call_tool", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        d.chat("write")
+    assert d.history == []
+
+
+def _stub_anthropic(replies):
+    """A real ``anthropic`` client talking to a local HTTP stub that answers with scripted (status, body) pairs."""
+    anthropic = pytest.importorskip("anthropic")
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append(json.loads(self.rfile.read(int(self.headers["content-length"]))))
+            status, body = replies.pop(0)
+            self.send_response(status)
+            self.send_header("content-type", "text/event-stream" if status == 200 else "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = anthropic.Anthropic(api_key="test", base_url=f"http://127.0.0.1:{srv.server_port}",
+                                 http_client=anthropic.DefaultHttpxClient(trust_env=False), max_retries=0)
+    return anthropic, client, seen, srv
+
+
+def _sse(*events):
+    start = {"type": "message_start", "message": {
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [],
+        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 1}}}
+    ev = [start, *events, {"type": "message_stop"}]
+    return 200, "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in ev).encode()
+
+
+def _sse_text(text, stop="end_turn"):
+    return _sse({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+                 "usage": {"output_tokens": 5}})
+
+
+def test_director_with_real_sdk_retries_bad_tool_json_and_recovers_from_overload():
+    from synth2.ai.director import Director
+
+    bad_tool = _sse({"type": "content_block_start", "index": 0, "content_block": {
+                        "type": "tool_use", "id": "toolu_1", "name": "write_melody", "input": {}}},
+                    {"type": "content_block_delta", "index": 0,
+                     "delta": {"type": "input_json_delta", "partial_json": "not json at all"}},
+                    {"type": "content_block_stop", "index": 0},
+                    {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                     "usage": {"output_tokens": 5}})
+    overloaded = (529, json.dumps({"type": "error", "error": {"type": "overloaded_error",
+                                                              "message": "Overloaded"}}).encode())
+    anthropic, client, seen, srv = _stub_anthropic([bad_tool, _sse_text("Fixed it."), overloaded,
+                                                    _sse_text("Lowered.")])
+    try:
+        d = Director(Session(), client=client)
+        assert d.chat("write a melody")["reply"] == "Fixed it."  # the unparseable stream was re-issued
+        assert len(seen) == 2 and seen[0]["messages"] == seen[1]["messages"]
+        with pytest.raises(anthropic.OverloadedError):
+            d.chat("delete every track except the lead")
+        d.chat("never mind, just lower the harmony gain by 3 dB")
+    finally:
+        srv.shutdown()
+    body = seen[-1]
+    assert [m["role"] for m in body["messages"]] == ["user", "assistant", "user"]
+    last = body["messages"][-1]["content"][0]["text"]
+    assert "never mind" in last and "delete every track" not in json.dumps(body["messages"])
+
+
+# ================================================================== regressions (tools review)
+
+def _saved_song(tmp_path, name, score):
+    sess = Session()
+    call_tool(sess, "new_project", {"title": name})
+    call_tool(sess, "write_melody", {"score": score})
+    path = tmp_path / f"{name}.s2p.json"
+    call_tool(sess, "save_project", {"path": str(path)})
+    return sess, path
+
+
+def test_undo_of_load_and_new_project_restores_the_file_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    sa, path_a = _saved_song(tmp_path, "SongA", "@ 4 C4 q a")
+    _, path_b = _saved_song(tmp_path, "SongB", "@ 4 G4 h bee")
+    call_tool(sa, "load_project", {"path": str(path_b)})
+    assert sa.path == str(path_b)
+    r = call_tool(sa, "undo", {})
+    assert sa.path == str(path_a) and r["path"] == str(path_a) and sa.project.title == "SongA"
+    call_tool(sa, "save_project", {})  # must write A's own file, never over B
+    assert Project.load(path_b).title == "SongB" and Project.load(path_a).title == "SongA"
+    call_tool(sa, "redo", {})
+    assert sa.path == str(path_b) and sa.project.title == "SongB"
+    call_tool(sa, "undo", {})
+    call_tool(sa, "new_project", {"title": "Fresh"})
+    assert sa.path is None
+    call_tool(sa, "undo", {})
+    assert sa.path == str(path_a) and sa.project.title == "SongA"
+    # an ordinary edit does not touch the path, even after a "save as"
+    call_tool(sa, "set_tempo", {"bpm": 100})
+    call_tool(sa, "save_project", {"path": str(tmp_path / "copy.s2p.json")})
+    call_tool(sa, "undo", {})
+    assert sa.path == str(tmp_path / "copy.s2p.json")
+    # a failed call restores the path along with the project
+    sa.path = str(path_a)
+    with pytest.raises(ToolError):
+        call_tool(sa, "load_project", {"path": str(tmp_path / "missing.s2p.json")})
+    assert sa.path == str(path_a)
+
+
+def test_mcp_autosave_after_undo_writes_the_restored_file(tmp_path):
+    from synth2.ai.mcp_server import MCPServer
+
+    assert {"undo", "redo"} <= MUTATING_TOOLS
+    sa, path_a = _saved_song(tmp_path, "SongA", "@ 4 C4 q a")
+    _, path_b = _saved_song(tmp_path, "SongB", "@ 4 G4 h bee")
+    srv = MCPServer(sa, autosave=True)
+
+    def tool(name, args, i=[0]):
+        i[0] += 1
+        r = srv.handle({"jsonrpc": "2.0", "id": i[0], "method": "tools/call",
+                        "params": {"name": name, "arguments": args}})
+        assert not r["result"]["isError"], r
+        return json.loads(r["result"]["content"][0]["text"])
+
+    tool("load_project", {"path": str(path_b)})
+    tool("undo", {})
+    tool("set_tempo", {"bpm": 90})
+    a, b = Project.load(path_a), Project.load(path_b)
+    assert b.title == "SongB" and [n.lyric for n in b.tracks[0].notes] == ["bee"]
+    assert a.title == "SongA" and a.bpm == 90
+
+
+def test_history_and_rollback_keep_exact_triplet_timing(s):
+    call_tool(s, "write_melody", {"score": "@ 4 C4 e3 la D4 e3 la E4 e3 la F4 q la"})
+    query = {"start_beat": 4 + 1 / 3, "end_beat": 5}
+    assert call_tool(s, "get_notes", query)["count"] == 2
+    with pytest.raises(ToolError):
+        call_tool(s, "add_notes", {"notes": [{"pitch": "C4", "onset": 10, "duration": "zz"}]})
+    assert call_tool(s, "get_notes", query)["count"] == 2  # rollback did not round onsets to 1e-6
+    call_tool(s, "set_tempo", {"bpm": 90})
+    call_tool(s, "undo", {})
+    call_tool(s, "redo", {})
+    call_tool(s, "undo", {})
+    assert call_tool(s, "get_notes", query)["count"] == 2
+    assert s.project.tracks[0].notes[1].onset == 4 + 1 / 3
+
+
+def test_lyric_language_also_sets_pronunciation(s):
+    from synth2.phonemes import resolve_notes
+
+    t = s.project.tracks[0]
+    assert t.language == "en"
+    call_tool(s, "write_melody", {"score": "@ 4 C4 q la D4 q la E4 q la"})
+    call_tool(s, "set_lyrics", {"text": "sakura", "language": "ja"})
+    assert [n.attrs.get("language") for n in t.notes] == ["ja"] * 3
+    assert [x.phones for x in resolve_notes(t.notes, t.language)] == [["s", "a"], ["k", "u"], ["dx", "a"]]
+    call_tool(s, "set_lyrics", {"text": "hello world +"})  # back to the track's language: attr removed
+    assert all("language" not in n.attrs for n in t.notes)
+    r = call_tool(s, "write_melody", {"language": "ja", "score": "@ 8 C4 q sa D4 q ku E4 q ra"})
+    new = [n for n in t.notes if n.id in r["note_ids"]]
+    assert [x.phones for x in resolve_notes(new, t.language)] == [["s", "a"], ["k", "u"], ["dx", "a"]]
+    call_tool(s, "write_melody", {"score": "@ 12 C4 q hi"})  # same language as the track: no attr
+    assert "language" not in t.notes[-1].attrs
+
+
+def test_voice_param_ranges(s, monkeypatch):
+    for vp in ({"formant_scale": 0}, {"formant_scale": -1.2}, {"loudness_db": 1e6}, {"bandwidth_scale": 0},
+               {"jitter": 0.5}, {"source_corner": 0}, {"tension": 2}):
+        with pytest.raises(ToolError, match="out of range"):
+            call_tool(s, "apply_expression", {"voice_params": vp})
+        with pytest.raises(ToolError, match="out of range"):
+            call_tool(s, "add_track", {"voice_params": vp})
+    with pytest.raises(ToolError, match="range_high"):
+        call_tool(s, "update_track", {"track": 0, "voice_params": {"range_low": 80, "range_high": 70}})
+    assert s.project.tracks[0].voice_params == {} and len(s.project.tracks) == 1
+    call_tool(s, "update_track", {"track": 0, "voice_params": {"formant_scale": 1.3, "loudness_db": -6}})
+    params = call_tool(s, "list_parameters", {})["voice_params"]
+    assert params["formant_scale"]["min"] > 0
+    # a loaded project with a bad value is refused at render time instead of writing a silent/NaN file
+    call_tool(s, "write_melody", {"score": "@ 1 A4 q la"})
+    s.project.tracks[0].voice_params["formant_scale"] = 0.0
+    with pytest.raises(ToolError, match="formant_scale"):
+        call_tool(s, "render", {})
+    # and non-finite audio from the engine is reported, not saved
+    import numpy as np
+    import synth2.engine as engine
+
+    s.project.tracks[0].voice_params["formant_scale"] = 1.2
+    bad = SimpleNamespace(audio=np.full((100, 2), np.nan, dtype=np.float32), sample_rate=44100, report={},
+                          save=lambda *a, **k: pytest.fail("NaN render must not be saved"))
+    monkeypatch.setattr(engine, "render_project", lambda *a, **k: bad)
+    with pytest.raises(ToolError, match="NaN"):
+        call_tool(s, "render", {})
+    assert s.last_render is None
+
+
+def test_diatonic_transpose_keeps_chromatic_lines(s):
+    src = [Note(i, 1, note_to_midi(p)) for i, p in enumerate(["E4", "Eb4", "D4", "F4", "F#4", "G4"])]
+    assert names(composer.transpose(src, steps=2, key="C major")) == ["G4", "F#4", "F4", "A4", "A#4", "B4"]
+    assert names(composer.transpose(src, steps=1, key="C major"))[3:] == ["G4", "G#4", "A4"]
+    call_tool(s, "write_melody", {"score": "@ 4 E4 q a Eb4 q b D4 q c F4 q d F#4 q e G4 q f"})
+    call_tool(s, "transpose", {"steps": 2})
+    assert names(s.project.tracks[0].notes) == ["G4", "F#4", "F4", "A4", "A#4", "B4"]
+
+
+def test_add_harmony_into_track_fits_the_target_voice(s):
+    call_tool(s, "write_melody", {"score": "@ 4 C5 q a D5 q b E5 q c C5 q d"})
+    call_tool(s, "add_track", {"name": "Bass", "voice": "basso"})
+    r = call_tool(s, "add_harmony", {"steps": -2, "into_track": "Bass"})
+    bass = s.project.tracks[1]
+    assert bass.voice == "basso" and r["warnings"] == [] and r["octave_shifted_notes"] == 4
+    assert names(bass.notes) == ["A3", "B3", "C4", "A3"]
+
+
+def test_add_harmony_octave_is_not_undone_by_range_fitting(s):
+    call_tool(s, "write_melody", {"score": "@ 4 C5 q a D5 q b E5 q c C5 q d"})
+    call_tool(s, "add_harmony", {"steps": 0, "octave": 1})
+    assert names(s.project.tracks[-1].notes) == ["C6", "D6", "E6", "C6"]
+    call_tool(s, "add_harmony", {"steps": 2, "octave": -1})
+    assert names(s.project.tracks[-1].notes) == ["E4", "F4", "G4", "E4"]
+    src = [Note(i, 1, note_to_midi(p)) for i, p in enumerate(["C5", "E5"])]
+    assert names(composer.harmonize(src, 2, "C major", voice_range=(55, 86), octave=1)) == ["E6", "G6"]
+    # a harmony the range fitting folds back onto the melody is refused, not silently doubled
+    call_tool(s, "write_melody", {"track": 0, "score": "@ 12 E5 q a G5 q b A5 q c"})
+    n_tracks = len(s.project.tracks)
+    with pytest.raises(ToolError, match="identical to the source"):
+        call_tool(s, "add_harmony", {"steps": 7, "start_beat": 12})
+    assert len(s.project.tracks) == n_tracks
+
+
+def test_set_lyrics_breaths_and_empty_text(s):
+    call_tool(s, "write_melody", {"score": "@ 4 C4 q a D4 q b E4 q c F4 q d"})
+    r = call_tool(s, "set_lyrics", {"text": "hello br world"})
+    assert [a["lyric"] for a in r["assigned"]] == ["hello", "+", "br", "world"]
+    assert r["notes"] == 4 and "warning" not in r and "info" not in r
+    for text in ("", "!!!", "  "):
+        with pytest.raises(ToolError, match="no singable syllables"):
+            call_tool(s, "set_lyrics", {"text": text})
+    assert [n.lyric for n in s.project.tracks[0].notes] == ["hello", "+", "br", "world"]
+    with pytest.raises(ToolError, match="breaths"):
+        call_tool(s, "set_lyrics", {"text": "oh", "start_beat": 6, "end_beat": 7})
+    r = call_tool(s, "set_lyrics", {"text": "oh", "start_beat": 6, "end_beat": 7, "keep_breaths": False})
+    assert r["assigned"][0]["lyric"] == "oh"
+
+
+def test_duplicate_track_rejects_negative_onsets_and_edit_checks_only_changed_onsets(s):
+    call_tool(s, "write_melody", {"score": "@ 0.25 C4 q a"})
+    with pytest.raises(ToolError, match="before beat 0"):
+        call_tool(s, "duplicate_track", {"track": 0, "delay_beats": -0.5})
+    assert len(s.project.tracks) == 1
+    r = call_tool(s, "duplicate_track", {"track": 0, "delay_beats": -0.25})
+    assert r["track"]["start_beat"] == 0.0
+    # a note that already sits before beat 0 (e.g. from an imported file) can still be edited
+    s.project.tracks[1].notes[0].onset = -0.25
+    nid = s.project.tracks[1].notes[0].id
+    call_tool(s, "edit_notes", {"track": 1, "edits": [{"id": nid, "lyric": "oh"}]})
+    assert s.project.tracks[1].notes[0].lyric == "oh"
+    with pytest.raises(ToolError, match="negative"):
+        call_tool(s, "edit_notes", {"track": 1, "edits": [{"id": nid, "move_by": -0.5}]})
+
+
+def test_quantize_selection_and_half_grid_rounding(s):
+    call_tool(s, "add_notes", {"notes": [{"pitch": "C4", "onset": 0, "duration": 2},
+                                         {"pitch": "D4", "onset": 1, "duration": 1},
+                                         {"pitch": "E4", "onset": 8.1, "duration": 1}]})
+    call_tool(s, "quantize", {"grid": 0.5, "start_beat": 8, "end_beat": 12})
+    assert [(n.onset, n.duration) for n in s.project.tracks[0].notes] == [(0.0, 2.0), (1.0, 1.0), (8.0, 1.0)]
+    q = composer.quantize([Note(0.25 + 0.5 * i, 0.5, 60) for i in range(6)], 0.5)
+    assert [(n.onset, n.duration) for n in q] == [(0.5 + 0.5 * i, 0.5) for i in range(6)]
+
+
+def test_lyric_tokens_hyphenation_and_overflow():
+    from synth2.phonemes import resolve_notes
+
+    assert composer.lyric_tokens("beau-ti-ful well-known") == ["beautiful", "+", "+", "well", "known"]
+    notes = composer.fit_lyrics([Note(i, 1, 60) for i in range(3)], "beau-ti-ful")
+    assert [x.phones for x in resolve_notes(notes)] == [["b", "y", "uw"], ["t", "ax"], ["f", "ax", "l"]]
+    two = [Note(0, 1, 60), Note(1, 1, 60)]
+    out = composer.fit_lyrics(two, "oh my [s t aa r] shine")
+    assert out[1].lyric.startswith("[") and "s t aa r" in out[1].lyric and "sh" in out[1].lyric
+    assert [n.lyric for n in composer.fit_lyrics(two, "oh my br shine")] == ["oh", "my shine"]
+    assert [n.lyric for n in composer.fit_lyrics(two, "oh br br")] == ["oh", "br"]

@@ -39,8 +39,11 @@ note ``detune`` (cents)   ``detune``
 
 Everything else that matters for a lossless SynthV -> Synth2 -> SynthV round
 trip (raw note attributes, unsupported phoneme strings, singer database and
-voice settings, track colour, render config) is kept in
-``project.metadata["svp"]`` and reused by :func:`write_svp`.  The original
+voice settings, track colour, render config, meter changes) is kept in
+``project.metadata["svp"]`` and reused by :func:`write_svp`; the project's own
+sample rate, title and time signature win over the stored values.  Explicit
+phoneme lyrics (``"[s t aa r]"``) are written with their phonemes in the
+``phonemes`` field and the lyric in SynthV's ``".s t aa r"`` form.  The original
 singer name is recorded per track (``metadata["svp"]["tracks"][track_id]["singer"]``);
 the Synth2 voice stays the default ``"aurora"``.
 """
@@ -94,6 +97,18 @@ def _valid_phonemes(s: str) -> bool:
 
     toks = s.split()
     return bool(toks) and all(is_valid(t) for t in toks)
+
+
+def _explicit_phonemes(lyric: str) -> str | None:
+    """The phonemes of a ``"[s t aa r]"`` / ``".s t aa r"`` lyric (space separated), else ``None``."""
+    from ..phonemes import explicit_phones
+
+    s = lyric.strip()
+    try:
+        phones = explicit_phones(s)
+    except ValueError:  # symbols we do not know: pass them on as written
+        phones = s[1:-1].split() if s.startswith("[") else s[1:].replace(",", " ").split()
+    return " ".join(phones) if phones else None
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +208,7 @@ def project_from_svp_dict(d: dict, title: str | None = None) -> Project:
     meta: dict[str, Any] = {"version": d.get("version", SVP_VERSION), "tracks": {}}
     if render:
         meta["renderConfig"] = render
+        meta["title"] = project.title  # a later rename replaces renderConfig["filename"] on export
     if len(meters) > 1:
         meta["meters"] = meters
     library = {str(g.get("uuid")): g for g in d.get("library") or [] if isinstance(g, dict)}
@@ -312,11 +328,18 @@ def _take() -> dict:
 def _sv_note(note: Note, meta: dict) -> dict:
     raw_attrs = (meta.get("note_attributes") or {}).get(note.id) or {}
     phonemes = note.phonemes or (meta.get("note_phonemes") or {}).get(note.id) or ""
+    lyric = note.lyric
+    explicit = _explicit_phonemes(lyric)
+    if explicit is not None:
+        # SynthV does not read "[s t aa r]": put the phonemes in the phoneme field and write the
+        # lyric in SynthV's own phoneme-input form ".s t aa r" (which Synth2 reads back too)
+        phonemes = phonemes or explicit
+        lyric = "." + explicit
     d = {
         "musicalType": "singing",
         "onset": _blicks(note.onset),
         "duration": max(1, _blicks(note.duration)),
-        "lyrics": note.lyric,
+        "lyrics": lyric,
         "phonemes": phonemes,
         "accent": "",
         "pitch": int(note.pitch),
@@ -377,13 +400,27 @@ def project_to_svp_dict(project: Project) -> dict:
             },
             "groups": [],
         })
+    # the imported render config fills in SynthV-only settings; the current project values win
     render = {"destination": "", "filename": project.title, "numChannels": 1, "aspirationFormat": "noAspiration",
-              "bitDepth": 16, "sampleRate": int(project.sample_rate), "exportMixDown": True, "exportPitch": False}
+              "bitDepth": 16, "exportMixDown": True, "exportPitch": False}
     render.update(meta.get("renderConfig") or {})
+    render["sampleRate"] = int(project.sample_rate)
+    if meta.get("title", project.title) != project.title:  # renamed since import
+        render["filename"] = project.title
+    # the project time signature is the first meter; later meter changes come from the import
+    meters = {0: {"index": 0, "numerator": int(num), "denominator": int(den)}}
+    for m in meta.get("meters") or []:
+        try:
+            index = int(m.get("index", 0))
+            if index > 0:
+                meters[index] = {"index": index, "numerator": int(m.get("numerator", 4)),
+                                 "denominator": int(m.get("denominator", 4))}
+        except (AttributeError, TypeError, ValueError):
+            continue
     return {
         "version": version,
         "time": {
-            "meter": [{"index": 0, "numerator": int(num), "denominator": int(den)}],
+            "meter": [meters[k] for k in sorted(meters)],
             "tempo": [{"position": _blicks(p.beat), "bpm": _num(p.bpm)} for p in project.tempo.points],
         },
         "library": [],

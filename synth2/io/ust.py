@@ -22,8 +22,11 @@ A UST file is an INI-like list of sections::
     [#TRACKEND]
 
 Notes are strictly sequential.  A ``Tempo=`` entry inside a note section
-changes the tempo from that note on.  Files are decoded as UTF-8 and fall
-back to Shift-JIS (cp932), the historical UTAU encoding.  VCV lyrics such as
+changes the tempo from that note on, so the writer splits rests at tempo
+changes and gives a note with tempo changes inside it its average tempo (the
+note keeps its real length in seconds, and everything after it stays in
+time).  Files are decoded as UTF-8 and fall back to Shift-JIS (cp932), the
+historical UTAU encoding.  VCV lyrics such as
 ``"a か"`` / ``"- か"`` are reduced to the kana.  ``Intensity`` maps to the
 ``velocity`` attribute (``Intensity / 100``) and the ``VBR`` vibrato fields
 (length %, cycle ms, depth cents) map to ``vibrato_start`` / ``vibrato_rate`` /
@@ -200,21 +203,22 @@ def dumps_ust(project: Project, track: int | str = 0) -> str:
     changes = [(int(round(p.beat * TICKS)), p.bpm) for p in project.tempo.points[1:]]
     if changes and max(c[0] for c in changes) >= cursor:  # trailing rest so late changes land on a boundary
         entries.append([cursor, max(c[0] for c in changes) + TICKS, None])
-    # rests can be split at tempo changes; changes inside notes move to the nearest boundary
+    # rests can be split at tempo changes; an entry (a note) with changes inside gets its
+    # average tempo, which keeps its real duration and so the timing of everything after it
     for tick, _ in changes:
         for k, (s, e, n) in enumerate(entries):
             if s < tick < e and n is None:
                 entries[k:k + 1] = [[s, tick, None], [tick, e, None]]
                 break
-    starts = [e[0] for e in entries]
-    tempo_at: dict[int, float] = {}
-    for tick, bpm in changes:
-        best = min(range(len(starts)), key=lambda k: abs(starts[k] - tick)) if starts else None
-        if best is not None:
-            tempo_at[best] = bpm
+    tempo_of: list[str] = []
+    for s, e, _ in entries:
+        secs = project.tempo.beat_to_sec(e / TICKS) - project.tempo.beat_to_sec(s / TICKS)
+        bpm = (e - s) / TICKS * 60.0 / secs if secs > 0 else project.tempo.bpm_at(s / TICKS)
+        tempo_of.append(_fmt(bpm))
+    tempo0 = tempo_of[0] if tempo_of else _fmt(project.tempo.bpm_at(0.0))
 
     nl = "\r\n"
-    lines = ["[#VERSION]", "UST Version1.2", "Charset=UTF-8", "[#SETTING]", f"Tempo={_fmt(project.tempo.bpm_at(0.0))}",
+    lines = ["[#VERSION]", "UST Version1.2", "Charset=UTF-8", "[#SETTING]", f"Tempo={tempo0}",
              "Tracks=1", f"ProjectName={project.title}", "VoiceDir=%VOICE%uta", "OutFile=", "CacheDir=",
              "Tool1=wavtool.exe", "Tool2=resampler.exe", "Mode2=True"]
     for k, (s, e, n) in enumerate(entries):
@@ -230,10 +234,8 @@ def dumps_ust(project: Project, track: int | str = 0) -> str:
             vel = n.attrs.get("velocity")
             lines.append(f"Intensity={int(round(float(vel) * 100)) if vel is not None else 100}")
             lines.append("Modulation=0")
-        if k == 0:
-            lines.append(f"Tempo={_fmt(project.tempo.bpm_at(0.0))}")
-        elif k in tempo_at:
-            lines.append(f"Tempo={_fmt(tempo_at[k])}")
+        if k == 0 or tempo_of[k] != tempo_of[k - 1]:
+            lines.append(f"Tempo={tempo_of[k]}")
         if n is not None and n.attrs.get("vibrato_depth") is not None:
             depth = float(n.attrs["vibrato_depth"])
             if depth <= 0:

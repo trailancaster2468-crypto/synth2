@@ -27,6 +27,9 @@ from .. import __version__
 from .tools import MUTATING_TOOLS, TOOLS, Session, ToolError, call_tool
 
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+# protocol revisions this server speaks; any other requested version is answered with the default (MCP spec:
+# the server replies with a version it supports and the client decides whether to continue)
+SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
 SERVER_NAME = "synth2"
 
 INSTRUCTIONS = (
@@ -58,11 +61,14 @@ class MCPServer:
 
     # -- dispatch ----------------------------------------------------------------
     def handle(self, msg: Any) -> dict | list | None:
-        if isinstance(msg, list):  # JSON-RPC batch (older protocol revisions)
+        if isinstance(msg, list):  # JSON-RPC batch (older protocol revisions); batches never nest
             if not msg:
                 return _error(None, INVALID_REQUEST, "empty batch")
-            out = [r for r in (self.handle(m) for m in msg) if r is not None]
+            out = [r for r in (self._handle_one(m) for m in msg) if r is not None]
             return out or None
+        return self._handle_one(msg)
+
+    def _handle_one(self, msg: Any) -> dict | None:
         if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
             return _error(msg.get("id") if isinstance(msg, dict) else None, INVALID_REQUEST,
                           "invalid JSON-RPC 2.0 message")
@@ -97,7 +103,7 @@ class MCPServer:
     # -- methods -----------------------------------------------------------------
     def m_initialize(self, params: dict) -> dict:
         requested = params.get("protocolVersion")
-        self.protocol_version = requested if isinstance(requested, str) and requested else DEFAULT_PROTOCOL_VERSION
+        self.protocol_version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else DEFAULT_PROTOCOL_VERSION
         client = (params.get("clientInfo") or {}).get("name", "unknown client")
         log(f"initialize from {client} (protocol {self.protocol_version})")
         return {
@@ -134,7 +140,8 @@ class MCPServer:
         except Exception as exc:
             log(f"tool {name} failed:", traceback.format_exc())
             return _tool_error(f"{type(exc).__name__}: {exc}")
-        if self.autosave and name in MUTATING_TOOLS and self.session.path:
+        # undo/redo change the project too, so the file must follow them
+        if self.autosave and (name in MUTATING_TOOLS or name in ("undo", "redo")) and self.session.path:
             try:
                 call_tool(self.session, "save_project", {})
             except Exception as exc:  # pragma: no cover - disk errors
@@ -157,20 +164,38 @@ def _tool_error(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
+def _encode(resp: Any) -> bytes:
+    # ASCII escapes keep lone UTF-16 surrogates (valid in JSON strings, e.g. from a client that cut an emoji in
+    # half) encodable; UTF-8 output would raise on them
+    return (json.dumps(resp) + "\n").encode("ascii")
+
+
+def respond(server: MCPServer, line: str) -> bytes | None:
+    """The encoded response line for one input line (``None`` for notifications). Never raises."""
+    try:
+        msg = json.loads(line)
+    except (ValueError, RecursionError) as exc:  # RecursionError: absurdly deep nesting
+        return _encode(_error(None, PARSE_ERROR, f"parse error: {exc}"))
+    try:
+        resp = server.handle(msg)
+        return None if resp is None else _encode(resp)
+    except Exception as exc:  # one bad message must never end the session
+        log("internal error:", traceback.format_exc())
+        mid = msg.get("id") if isinstance(msg, dict) else None
+        if not isinstance(mid, (str, int, float)):
+            mid = None
+        return _encode(_error(mid, INTERNAL_ERROR, f"internal error: {type(exc).__name__}"))
+
+
 def serve(server: MCPServer, stdin: BinaryIO, stdout: BinaryIO):
     """Read newline-delimited JSON-RPC from ``stdin`` and write responses to ``stdout`` until EOF."""
     for raw in stdin:
         line = raw.decode("utf-8", errors="replace").strip()
         if not line:
             continue
-        try:
-            msg = json.loads(line)
-        except ValueError as exc:
-            resp: Any = _error(None, PARSE_ERROR, f"parse error: {exc}")
-        else:
-            resp = server.handle(msg)
-        if resp is not None:
-            stdout.write((json.dumps(resp, ensure_ascii=False) + "\n").encode("utf-8"))
+        out = respond(server, line)
+        if out is not None:
+            stdout.write(out)
             stdout.flush()
 
 

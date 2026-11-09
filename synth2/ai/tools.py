@@ -33,7 +33,7 @@ from .. import score as score_mod
 from ..engine.expression import STYLES, Style, get_style
 from ..phonemes import english, japanese, lyric_phonemes, parse_phoneme_string, split_lyrics
 from ..phonemes.inventory import PHONEMES
-from ..project import CURVE_SPECS, NOTE_ATTRIBUTES, Note, Project, Track, _new_id
+from ..project import CURVE_SPECS, NOTE_ATTRIBUTES, Note, Project, Track, _new_id, iter_active_tracks
 from ..timing import TempoPoint, midi_to_note, note_to_midi, parse_duration
 from ..voices import VOICES, Voice
 from ..voices import list_voices as _list_voices
@@ -60,8 +60,10 @@ class Session:
         self.last_render_path: str | None = None
         self.last_render_state: str | None = None  # fingerprint of the project that was rendered
         self.last_render_range: tuple[float | None, float | None] = (None, None)  # beats
-        self.undo_stack: list[tuple[str, dict]] = []
-        self.redo_stack: list[tuple[str, dict]] = []
+        # history entries: (label, project snapshot, path change). The path change is (old, new) for steps that
+        # switched the project file (load_project, new_project) so undo/redo also switch it back; else None.
+        self.undo_stack: list[tuple[str, Project, tuple[str | None, str | None] | None]] = []
+        self.redo_stack: list[tuple[str, Project, tuple[str | None, str | None] | None]] = []
         self.max_history = MAX_HISTORY
         self.lock = threading.RLock()
 
@@ -74,15 +76,24 @@ class Session:
         return cls(project, p if _is_native(p) else p.with_name(_stem(p) + ".s2p.json"))
 
     # -- history --------------------------------------------------------------------
-    def snapshot(self) -> dict:
-        return copy.deepcopy(self.project.to_dict())
+    def snapshot(self) -> Project:
+        """An exact deep copy of the current project (``to_dict`` would round times to 6 decimals)."""
+        return copy.deepcopy(self.project)
 
-    def restore(self, snap: dict):
-        self.project = Project.from_dict(copy.deepcopy(snap))
+    def restore(self, snap: Project | dict):
+        if isinstance(snap, Project):
+            self.project = copy.deepcopy(snap)
+        else:
+            self.project = Project.from_dict(copy.deepcopy(snap))
 
-    def push_undo(self, label: str, snap: dict | None = None):
-        """Record ``snap`` (default: the current state) as the state to return to on undo."""
-        self.undo_stack.append((label, snap if snap is not None else self.snapshot()))
+    def push_undo(self, label: str, snap: Project | dict | None = None,
+                  path_change: tuple[str | None, str | None] | None = None):
+        """Record ``snap`` (default: the current state) as the state to return to on undo.
+
+        ``path_change=(old_path, new_path)`` marks a step that switched the project file: undo
+        restores ``old_path`` and redo ``new_path``, so a later save never writes into the wrong file.
+        """
+        self.undo_stack.append((label, snap if snap is not None else self.snapshot(), path_change))
         if len(self.undo_stack) > self.max_history:
             del self.undo_stack[: len(self.undo_stack) - self.max_history]
         self.redo_stack.clear()
@@ -97,18 +108,22 @@ class Session:
         with self.lock:
             if not self.undo_stack:
                 return None
-            label, snap = self.undo_stack.pop()
-            self.redo_stack.append((label, self.snapshot()))
+            label, snap, path_change = self.undo_stack.pop()
+            self.redo_stack.append((label, self.snapshot(), path_change))
             self.restore(snap)
+            if path_change is not None:
+                self.path = path_change[0]
             return label
 
     def redo(self) -> str | None:
         with self.lock:
             if not self.redo_stack:
                 return None
-            label, snap = self.redo_stack.pop()
-            self.undo_stack.append((label, self.snapshot()))
+            label, snap, path_change = self.redo_stack.pop()
+            self.undo_stack.append((label, self.snapshot(), path_change))
             self.restore(snap)
+            if path_change is not None:
+                self.path = path_change[1]
             return label
 
     def call(self, name: str, args: dict | None = None) -> dict:
@@ -180,19 +195,26 @@ def call_tool(session: Session, name: str, args: dict | None = None) -> dict:
             except (ValueError, KeyError, LookupError) as exc:
                 raise ToolError(f"{name}: {_exc_text(exc)}") from exc
         before = session.snapshot()
+        path_before = session.path
+
+        def rollback():
+            session.restore(before)
+            session.path = path_before
+
         try:
             result = tool.handler(session, args)
         except ToolError:
-            session.restore(before)
+            rollback()
             raise
         except (ValueError, KeyError, LookupError) as exc:
-            session.restore(before)
+            rollback()
             raise ToolError(f"{name}: {_exc_text(exc)}") from exc
         except Exception:
-            session.restore(before)
+            rollback()
             raise
-        if session.snapshot() != before:
-            session.push_undo(_label(name, args), before)
+        path_change = (path_before, session.path) if session.path != path_before else None
+        if path_change is not None or session.project.to_dict() != before.to_dict():
+            session.push_undo(_label(name, args), before, path_change)
         return _jsonable(result)
 
 
@@ -413,6 +435,17 @@ VOICE_PARAM_DOCS: dict[str, str] = {
 }
 VOICE_PARAM_FIELDS = [f.name for f in fields(Voice)
                       if f.name not in ("id", "name", "description", "tags", "gender", "default_style")]
+# accepted voice_params ranges: generous around the built-in voices, but they keep out values the vocoder
+# cannot synthesise (formant_scale 0 renders NaN/silence, a huge loudness_db overflows)
+VOICE_PARAM_RANGES: dict[str, tuple[float, float]] = {
+    "tension": (-1.0, 1.0), "breathiness": (-1.0, 1.0), "robotic": (-1.0, 1.0),
+    "formant_scale": (0.5, 2.0), "bandwidth_scale": (0.25, 4.0), "f4": (2000.0, 8000.0), "f5": (2500.0, 10000.0),
+    "brightness_db": (-24.0, 24.0), "singer_formant_db": (-24.0, 24.0), "loudness_db": (-48.0, 24.0),
+    "aspiration_db": (-96.0, 0.0), "shimmer_db": (0.0, 6.0), "jitter": (0.0, 0.1),
+    "source_tilt": (0.0, 30.0), "source_corner": (50.0, 2000.0),
+    "vibrato_rate": (0.0, 12.0), "vibrato_depth": (0.0, 3.0),
+    "range_low": (0.0, 127.0), "range_high": (0.0, 127.0),
+}
 
 LYRIC_CONVENTIONS = (
     "Lyric conventions (one token per note): a word ('love', 'star'); '+' = next syllable of the previous word "
@@ -870,7 +903,9 @@ def _list_parameters_tool(s: Session, a: dict) -> dict:
                  **({"min": ATTR_RANGES[k][0], "max": ATTR_RANGES[k][1]} if k in ATTR_RANGES else {})}
              for k, v in NOTE_ATTRIBUTES.items()}
     base = VOICES["aurora"]
-    voice_params = {k: {"description": VOICE_PARAM_DOCS.get(k, ""), "aurora_value": getattr(base, k)}
+    voice_params = {k: {"description": VOICE_PARAM_DOCS.get(k, ""), "aurora_value": getattr(base, k),
+                        **({"min": VOICE_PARAM_RANGES[k][0], "max": VOICE_PARAM_RANGES[k][1]}
+                           if k in VOICE_PARAM_RANGES else {})}
                     for k in VOICE_PARAM_FIELDS}
     return {
         "curves": curves, "note_attributes": attrs, "voice_params": voice_params,
@@ -1034,7 +1069,7 @@ _TRACK_SETTINGS = {
     "reverb_send": {"type": "number", "minimum": 0, "maximum": 1, "description": "Reverb send 0..1 (default 0.25)."},
     "mute": {"type": "boolean"}, "solo": {"type": "boolean"},
     "voice_params": {"type": "object", "description": "Voice tweaks merged into the track, e.g. {\"breathiness\": 0.3, "
-                     "\"tension\": -0.2}; null removes a key. See list_parameters for names."},
+                     "\"tension\": -0.2}; null removes a key. See list_parameters for names and valid ranges."},
 }
 
 
@@ -1047,11 +1082,27 @@ def _apply_voice_params(t: Track, vp: dict):
         if v is None:
             t.voice_params.pop(k, None)
             continue
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
-            raise ToolError(f"voice parameter {k!r} must be a number, got {v!r}")
-        if k in ("tension", "breathiness", "robotic") and not -1 <= v <= 1:
-            raise ToolError(f"voice parameter {k!r} must be between -1 and 1")
+        err = _voice_param_error(k, v)
+        if err:
+            raise ToolError(err)
         t.voice_params[k] = float(v)
+    voice = VOICES.get(t.voice)
+    if voice is not None and ("range_low" in vp or "range_high" in vp):
+        lo = t.voice_params.get("range_low", voice.range_low)
+        hi = t.voice_params.get("range_high", voice.range_high)
+        if hi <= lo:
+            raise ToolError(f"voice parameter range_high ({hi:g}) must be above range_low ({lo:g})")
+
+
+def _voice_param_error(k: str, v) -> str | None:
+    """Why ``v`` is not a valid value for voice parameter ``k`` (None when it is)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return f"voice parameter {k!r} must be a number, got {v!r}"
+    lo, hi = VOICE_PARAM_RANGES.get(k, (-math.inf, math.inf))
+    if not lo <= v <= hi:
+        return (f"voice parameter {k!r}={v:g} is out of range {lo:g}..{hi:g}"
+                + (f" ({VOICE_PARAM_DOCS[k]})" if k in VOICE_PARAM_DOCS else ""))
+    return None
 
 
 def _apply_track_settings(t: Track, a: dict):
@@ -1132,13 +1183,19 @@ def _duplicate_track(s: Session, a: dict) -> dict:
     t.solo = False
     if a.get("voice"):
         t.voice = _check_voice(a["voice"])
+    delay = float(a.get("delay_beats", 0.0))
+    first = min((n.onset for n in src.notes), default=0.0)
+    if first + delay < -1e-9:
+        raise ToolError(f"delay_beats={delay:g} would move the first note (beat {first:g}) before beat 0; use "
+                        f"delay_beats >= {-first:g}, or a small positive delay")
     try:
-        t.notes = composer.double(src.notes, float(a.get("detune_cents", 0.0)), float(a.get("delay_beats", 0.0)))
+        t.notes = composer.double(src.notes, float(a.get("detune_cents", 0.0)), delay)
         if a.get("transpose"):
             t.notes = composer.transpose(t.notes, int(a["transpose"]))
     except ValueError as exc:
         raise ToolError(str(exc)) from None
     for n in t.notes:
+        n.onset = max(0.0, n.onset)  # float dust from a delay of exactly -first
         if not n.attrs.get("detune"):
             n.attrs.pop("detune", None)
     for k in ("gain_db", "pan"):
@@ -1222,7 +1279,9 @@ end_beat (where the next phrase would start), plus warnings to check.
       "score": {"type": "string", "description": "Score-notation note lines."},
       "start_beat": {"type": "number", "minimum": 0, "description": "Beat where the first note starts (default: append)."},
       "replace": {"type": "boolean", "description": "Delete existing notes overlapping the written span first."},
-      "language": {"type": "string", "enum": list(LANGUAGES), "description": "Lyric language (default: the track's)."}},
+      "language": {"type": "string", "enum": list(LANGUAGES),
+                   "description": "Lyric language (default: the track's). When it differs from the track's, the "
+                                  "new notes get a per-note 'language' attribute so they are pronounced in it."}},
     required=("score",), mutating=True)
 def _write_melody(s: Session, a: dict) -> dict:
     p = s.project
@@ -1235,6 +1294,9 @@ def _write_melody(s: Session, a: dict) -> dict:
         raise ToolError(f"score error: {exc}") from None
     if not snip.notes and not snip.curves and not snip.tempos:
         raise ToolError("the score contained no notes; write notes like 'C4 q la  D4 q la  E4 h la'")
+    if lang != t.language:  # sing these notes in the requested language, not the track's
+        for n in snip.notes:
+            n.attrs.setdefault("language", lang)
     removed = 0
     if snip.notes:
         lo = min(n.onset for n in snip.notes)
@@ -1293,7 +1355,7 @@ def _apply_changes(n: Note, ch: dict, where: str):
         n.onset = float(ch["onset"])
     if "move_by" in ch:
         n.onset += float(ch["move_by"])
-    if n.onset < 0:
+    if ("onset" in ch or "move_by" in ch) and n.onset < 0:  # only judge onsets this edit changes
         raise ToolError(f"{where}: onset would become negative ({n.onset:g}); beats start at 0")
     if "duration" in ch:
         n.duration = _duration(ch["duration"], f"{where}.duration")
@@ -1364,9 +1426,12 @@ more syllables than notes, the extra words are sung together on the last note; i
 '-' (melisma). Notes whose lyric is 'br' are skipped (kept as breaths) unless keep_breaths=false.
 You can embed tokens directly: '-' (melisma), '+' (continue the word), 'br', '[phonemes]', and hyphenate words
 yourself ('beau-ti-ful') to control the split. Japanese: kana or romaji, one mora per note.
+language (default: the track's) decides both the split and the pronunciation: notes lyriced in another language
+than the track's get a per-note 'language' attribute.
 """, {"track": _TRACK_REF, "text": {"type": "string", "description": "The words to sing."},
       "ids": _IDS, "start_beat": _START, "end_beat": _END,
-      "language": {"type": "string", "enum": list(LANGUAGES), "description": "Default: the track's language."},
+      "language": {"type": "string", "enum": list(LANGUAGES),
+                   "description": "Lyric language for splitting and pronunciation. Default: the track's language."},
       "keep_breaths": {"type": "boolean", "description": "Skip notes whose lyric is 'br' (default true)."}},
     required=("text",), mutating=True)
 def _set_lyrics(s: Session, a: dict) -> dict:
@@ -1376,16 +1441,31 @@ def _set_lyrics(s: Session, a: dict) -> dict:
         raise ToolError(f"no notes selected in track {t.name!r}; write notes first or check start_beat/end_beat")
     lang = a.get("language") or t.language
     keep_breaths = a.get("keep_breaths", True)
+    # the notes that receive syllables: the same filter fit_lyrics uses, taken BEFORE fitting (a 'br' token
+    # from the text lands on a target note and must not shrink the count afterwards)
+    target_ids = [n.id for n in sel if not (keep_breaths and (n.lyric or "").strip().lower() in ("br", "breath"))]
+    if not target_ids:
+        raise ToolError(f"all {len(sel)} selected note(s) are breaths ('br'), which keep_breaths skips; select "
+                        f"other notes or pass keep_breaths=false to re-lyric them")
     try:
         tokens = composer.lyric_tokens(a["text"], lang)
+        if not tokens:
+            raise ToolError(f"text {a['text']!r} contains no singable syllables; give words (e.g. 'hello world'), "
+                            f"'-' for melismas or '[phonemes]' (use delete_notes to remove notes)")
         fitted = composer.fit_lyrics(sel, a["text"], lang, keep_breaths=keep_breaths)
     except ValueError as exc:
         raise ToolError(str(exc)) from None
     by_id = {n.id: n for n in fitted}
+    relyriced = set(target_ids)
     for n in t.notes:
         if n.id in by_id:
             n.lyric, n.phonemes = by_id[n.id].lyric, by_id[n.id].phonemes
-    targets = [n for n in fitted if not (keep_breaths and n.lyric.strip().lower() in ("br", "breath"))]
+            if n.id in relyriced:  # pronounce the new lyric in the language it was split in
+                if lang != t.language:
+                    n.attrs["language"] = lang
+                else:
+                    n.attrs.pop("language", None)
+    targets = [by_id[i] for i in target_ids]
     out = {"track": t.name, "notes": len(targets), "syllables": len(tokens),
            "assigned": [{"id": n.id, "onset": round(n.onset, 6), "note": n.note_name, "lyric": n.lyric} for n in fitted]}
     if len(tokens) > len(targets):
@@ -1399,7 +1479,8 @@ def _set_lyrics(s: Session, a: dict) -> dict:
 @_tool("transpose", """
 Transpose notes of a track (selected by ids or start_beat/end_beat; default all). semitones shifts chromatically
 (12 = one octave up). steps shifts diatonically within the key (project key unless `key` is given): steps=1 moves
-each note to the next scale tone, keeping the melody in key.
+each note to the next scale tone, keeping the melody in key; notes outside the key keep their alteration (Eb in C
+major moved up 2 steps becomes F#), so chromatic passing tones stay distinct.
 """, {"track": _TRACK_REF, "semitones": {"type": "integer", "minimum": -60, "maximum": 60},
       "steps": {"type": "integer", "minimum": -21, "maximum": 21}, "key": {"type": "string"},
       "ids": _IDS, "start_beat": _START, "end_beat": _END}, mutating=True)
@@ -1410,7 +1491,8 @@ def _transpose(s: Session, a: dict) -> dict:
     sel = _select(t, a)
     key = _key_of(s, a.get("key")) if a.get("steps") else None
     try:
-        moved = composer.transpose(sel, int(a.get("semitones", 0)), steps=int(a.get("steps", 0)), key=key)
+        moved = composer.transpose(sel, int(a.get("semitones", 0)), steps=int(a.get("steps", 0)), key=key,
+                                   chromatic="parallel")
     except ValueError as exc:
         raise ToolError(str(exc)) from None
     by_id = {n.id: n for n in moved}
@@ -1443,7 +1525,8 @@ def _quantize(s: Session, a: dict) -> dict:
                 changed += 1
             n.onset, n.duration = m.onset, m.duration
     before = {n.id: (n.onset, n.duration) for n in t.notes}
-    composer.resolve_overlaps(t.notes, min_length=min(grid, 0.0625))
+    # only collisions with the quantized notes: overlaps elsewhere in the track are not this call's business
+    composer.resolve_overlaps(t.notes, min_length=min(grid, 0.0625), only=set(by_id))
     fixed = sum(1 for n in t.notes
                 if abs(before[n.id][0] - n.onset) > 1e-9 or abs(before[n.id][1] - n.duration) > 1e-9)
     return {"track": t.name, "quantized": len(sel), "changed": changed, "overlaps_resolved": fixed, "grid": grid}
@@ -1608,7 +1691,8 @@ song. into_track writes into an existing track instead (its notes in that span a
       "key": {"type": "string"}, "name": {"type": "string"}, "voice": {"type": "string"}, "style": {"type": "string"},
       "chromatic": {"type": "string", "enum": ["smart", "parallel", "snap"]},
       "fit_range": {"type": "boolean"}, "range_low": _PITCH, "range_high": _PITCH,
-      "octave": {"type": "integer", "minimum": -3, "maximum": 3, "description": "Extra octaves to add."},
+      "octave": {"type": "integer", "minimum": -3, "maximum": 3,
+                 "description": "Extra octaves to add (applied after the range fitting, so it always takes effect)."},
       "gain_db": {"type": "number", "minimum": -60, "maximum": 24},
       "pan": {"type": "number", "minimum": -1, "maximum": 1},
       "keep_lyrics": {"type": "boolean"}, "into_track": _TRACK_REF,
@@ -1623,7 +1707,13 @@ def _add_harmony(s: Session, a: dict) -> dict:
     sel = _select(src, a)
     if not sel:
         raise ToolError(f"source track {src.name!r} has no notes in the selection")
-    voice_id = _check_voice(a["voice"]) if a.get("voice") else src.voice
+    target = None
+    if a.get("into_track") is not None:
+        target = _track(s, a["into_track"])
+        if target is src:
+            raise ToolError("into_track must be a different track than source_track")
+    # fit to the voice that will sing the part: the explicit voice, else the target track's own voice
+    voice_id = _check_voice(a["voice"]) if a.get("voice") else (target.voice if target is not None else src.voice)
     voice = VOICES.get(voice_id)
     vr = None
     if a.get("range_low") is not None or a.get("range_high") is not None:
@@ -1637,10 +1727,13 @@ def _add_harmony(s: Session, a: dict) -> dict:
     stats: dict = {}
     notes = composer.harmonize(sel, steps, key, voice_range=vr, chromatic=a.get("chromatic", "smart"),
                                keep_lyrics=a.get("keep_lyrics", True), octave=int(a.get("octave", 0)), stats=stats)
-    if a.get("into_track") is not None:
-        t = _track(s, a["into_track"])
-        if t is src:
-            raise ToolError("into_track must be a different track than source_track")
+    if [n.pitch for n in notes] == [n.pitch for n in sel]:
+        raise ToolError(f"the harmony came out identical to the source melody (steps={steps}"
+                        + (" was folded back into the voice's range" if vr is not None else "")
+                        + "); use duplicate_track for a unison double, or pass octave=1/-1, fit_range=false or "
+                          "another voice/range")
+    if target is not None:
+        t = target
         lo_b, hi_b = min(n.onset for n in notes), max(n.end for n in notes)
         t.notes = [n for n in t.notes if not (n.onset < hi_b - 1e-9 and n.end > lo_b + 1e-9)]
         if a.get("voice"):
@@ -1774,6 +1867,7 @@ def _check_project(s: Session, a: dict) -> dict:
                     run_start = y
         if t.language == "en":
             unknown = sorted({w for n in notes if not n.phonemes and not n.lyric.startswith(("[", "."))
+                              and n.attrs.get("language", "en") == "en"  # per-note Japanese is not English
                               for w in re.findall(r"[A-Za-z']+", n.lyric)
                               if len(w) > 1 and w.lower() not in ("br",) and english.lookup(w) is None})
             if unknown:
@@ -1820,7 +1914,23 @@ def _render(s: Session, a: dict) -> dict:
     sb, eb = a.get("start_beat"), a.get("end_beat")
     if sb is not None and eb is not None and eb <= sb:
         raise ToolError("end_beat must be greater than start_beat")
-    res = render_project(p, sample_rate=a.get("sample_rate"), track_ids=track_ids, start_beat=sb, end_beat=eb)
+    sung = [t for t in p.tracks if t.id in track_ids] if track_ids is not None else list(iter_active_tracks(p))
+    for t in sung:  # e.g. a loaded file with voice_params the tools would have refused
+        for k, v in t.voice_params.items():
+            err = None if k.startswith("style.") or k not in VOICE_PARAM_FIELDS else _voice_param_error(k, v)
+            if err:
+                raise ToolError(f"track {t.name!r}: {err}; fix it with update_track(voice_params={{{k!r}: ...}}) "
+                                f"or remove it with null")
+    try:
+        res = render_project(p, sample_rate=a.get("sample_rate"), track_ids=track_ids, start_beat=sb, end_beat=eb)
+    except (OverflowError, FloatingPointError, ZeroDivisionError) as exc:
+        raise ToolError(f"render failed with a numeric error ({exc}); check extreme voice_params, "
+                        f"style_overrides or curve values") from None
+    import numpy as np
+
+    if not np.isfinite(res.audio).all():
+        raise ToolError("render produced invalid (NaN/inf) audio; check extreme voice_params, style_overrides or "
+                        "curve values (see list_parameters for the valid ranges)")
     path = Path(a["path"]) if a.get("path") else _default_render_path(s)
     if path.suffix.lower() != ".wav":
         path = path.with_name(path.name + ".wav")
@@ -1971,7 +2081,7 @@ def _undo(s: Session, a: dict) -> dict:
         done.append(label)
     if not done:
         raise ToolError("nothing to undo")
-    return {"undone": done, "undo_left": len(s.undo_stack), "redo_available": len(s.redo_stack)}
+    return {"undone": done, "undo_left": len(s.undo_stack), "redo_available": len(s.redo_stack), "path": s.path}
 
 
 @_tool("redo", "Redo change(s) previously undone. steps = how many (default 1).",
@@ -1985,4 +2095,10 @@ def _redo(s: Session, a: dict) -> dict:
         done.append(label)
     if not done:
         raise ToolError("nothing to redo")
-    return {"redone": done, "undo_left": len(s.undo_stack), "redo_available": len(s.redo_stack)}
+    return {"redone": done, "undo_left": len(s.undo_stack), "redo_available": len(s.redo_stack), "path": s.path}
+
+
+# undo/redo change the project (and possibly its path) too, so callers that persist after edits (the MCP
+# server's autosave) must treat them as mutating; they are not registered as mutating because the generic
+# wrapper would push an undo step of their own and clear the redo stack.
+MUTATING_TOOLS.update({"undo", "redo"})

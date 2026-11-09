@@ -16,6 +16,7 @@ Pitches are MIDI note numbers, times are beats.
 from __future__ import annotations
 
 import copy
+import math
 import re
 from typing import Iterable
 
@@ -260,9 +261,12 @@ def _check_pitch(p: int, what: str = "pitch") -> int:
 
 
 def transpose(notes: Iterable[Note], semitones: int = 0, *, steps: int = 0,
-              key: str | KeyInfo | None = None, chromatic: str = "smart") -> list[Note]:
+              key: str | KeyInfo | None = None, chromatic: str = "parallel") -> list[Note]:
     """Transpose notes chromatically by ``semitones`` and/or diatonically by ``steps`` in ``key``.
 
+    Chromatic notes keep their alteration (``chromatic="parallel"``, see :func:`diatonic_shift`), so a
+    chromatic line such as E Eb D stays a chromatic line instead of collapsing onto its neighbours; the
+    ``"smart"`` consonance rule is meant for harmony lines (:func:`harmonize`), not for moving a melody.
     Note ids are kept (this is an edit, not a copy).
     """
     out = []
@@ -324,9 +328,10 @@ def harmonize(notes: Iterable[Note], steps: int, key: str | KeyInfo, *, voice_ra
 
     ``steps`` is the interval in scale steps: ``+2`` = a third above, ``-2`` = a
     third below, ``+4`` = a fifth above, ``-3`` = a fourth below, ``+5`` = a sixth
-    above, ``7`` = an octave (7-note scales).  ``octave`` adds whole octaves.
+    above, ``7`` = an octave (7-note scales).
     Chromatic source notes are handled as described in :func:`diatonic_shift`.
-    ``voice_range=(low, high)`` octave-shifts phrases into a singable range.
+    ``voice_range=(low, high)`` octave-shifts phrases into a singable range.  ``octave`` adds whole
+    octaves AFTER that fitting, so an explicitly requested octave is never undone by it.
     Returns new notes with new ids; lyrics, phoneme overrides and attributes are
     copied when ``keep_lyrics`` (so the harmony sings the same words).
     If ``stats`` is given it is filled with ``chromatic_notes`` and ``range_shifted``.
@@ -337,7 +342,7 @@ def harmonize(notes: Iterable[Note], steps: int, key: str | KeyInfo, *, voice_ra
     for n in sorted(notes, key=lambda x: x.onset):
         p, chrom = diatonic_shift(n.pitch, int(steps), k, chromatic)
         n_chrom += chrom
-        c = _copy_note(n, keep_id=False, pitch=p + 12 * int(octave))
+        c = _copy_note(n, keep_id=False, pitch=p)
         if not keep_lyrics:
             c.lyric, c.phonemes = "la", None
         out.append(c)
@@ -345,7 +350,7 @@ def harmonize(notes: Iterable[Note], steps: int, key: str | KeyInfo, *, voice_ra
     if voice_range is not None:
         out, moved = fit_range(out, int(voice_range[0]), int(voice_range[1]))
     for c in out:
-        c.pitch = max(0, min(127, c.pitch))
+        c.pitch = max(0, min(127, c.pitch + 12 * int(octave)))
     if stats is not None:
         stats.update({"chromatic_notes": n_chrom, "range_shifted": moved})
     return out
@@ -358,15 +363,19 @@ def _grid_value(grid: float | str) -> float:
     return g
 
 
-def resolve_overlaps(notes: list[Note], min_length: float = 0.0625) -> list[Note]:
+def resolve_overlaps(notes: list[Note], min_length: float = 0.0625, only: set[str] | None = None) -> list[Note]:
     """Make a note list monophonic: sort, push colliding onsets forward, trim overlapping ends.
 
     Notes are modified in place and returned sorted.  No note ever ends up with a
-    length below ``min_length`` (beats).
+    length below ``min_length`` (beats).  With ``only`` (a set of note ids), only
+    neighbouring pairs that involve one of those notes are touched, so overlaps
+    elsewhere in the list are left as they are.
     """
     notes.sort(key=lambda n: (n.onset, n.pitch))
     for i in range(1, len(notes)):
         prev, cur = notes[i - 1], notes[i]
+        if only is not None and prev.id not in only and cur.id not in only:
+            continue
         if cur.onset < prev.onset + min_length - 1e-9:
             end = cur.end
             cur.onset = prev.onset + min_length
@@ -391,7 +400,8 @@ def quantize(notes: Iterable[Note], grid: float | str, strength: float = 1.0, *,
         min_length = g if strength >= 1.0 else max(g * strength, 1e-3)
 
     def snap(x: float) -> float:
-        target = round((x - offset) / g) * g + offset
+        # round half UP (not Python's half-to-even), so evenly offset notes all move the same way
+        target = math.floor((x - offset) / g + 0.5 + 1e-9) * g + offset
         return x + (target - x) * strength
 
     out = []
@@ -420,12 +430,30 @@ def double(notes: Iterable[Note], detune_cents: float = 7.0, delay_beats: float 
 _BRACKET_RE = re.compile(r"\[[^\]]*\]|\S+")
 
 
+def _hyphenated(tok: str) -> list[str]:
+    """Tokens for an explicitly hyphenated English word such as ``beau-ti-ful``.
+
+    One note per part, but sung as the whole word when the dictionary knows it
+    (``beautiful + +``), because fragments like ``ti`` are pronounced as words of
+    their own.  Unknown joins (``well-known``, ``la-la``) keep their parts as words.
+    """
+    from ..phonemes import english
+
+    parts = [p for p in (re.sub(r"[^A-Za-z']", "", x) for x in tok.split("-")) if p]
+    joined = "".join(parts)
+    if len(parts) > 1 and english.lookup(joined) is not None:
+        return [joined] + ["+"] * (len(parts) - 1)
+    return parts
+
+
 def lyric_tokens(text: str, language: str = "en") -> list[str]:
     """Split free text into per-note lyric tokens (via :func:`synth2.phonemes.split_lyrics`).
 
     ``[...]`` explicit-phoneme groups, ``br`` breaths and ``-`` / ``+`` tokens are kept intact.
+    Hyphenated English words keep one note per part but the whole word's pronunciation
+    (``beau-ti-ful`` -> ``beautiful + +``).
     """
-    from ..phonemes import split_lyrics
+    from ..phonemes import japanese, split_lyrics
 
     out: list[str] = []
     chunk: list[str] = []
@@ -443,6 +471,9 @@ def lyric_tokens(text: str, language: str = "en") -> list[str]:
         elif tok.lower() in ("br", "breath"):
             flush()
             out.append("br")
+        elif language != "ja" and "-" in tok.strip("-") and not japanese.is_kana(tok):
+            flush()
+            out.extend(_hyphenated(tok))
         else:
             chunk.append(tok)
     flush()
@@ -454,7 +485,9 @@ def fit_lyrics(notes: Iterable[Note], text: str, language: str = "en", *, keep_b
 
     Multi-syllable English words become ``word`` + ``+`` continuation notes.
     More syllables than notes: the remaining words are joined onto the last
-    note's lyric (sung together on it).  Fewer: remaining notes get ``-``
+    note's lyric (sung together on it; ``br`` tokens there are dropped, and when
+    ``[...]`` phoneme groups are among them everything becomes one explicit
+    phoneme lyric, since a lyric cannot mix words and phonemes).  Fewer: remaining notes get ``-``
     (melisma, holding the previous vowel).  Notes whose lyric is ``br`` are
     skipped when ``keep_breaths``.  Phoneme overrides of re-lyriced notes are
     cleared.  Returns copies (same ids) in onset order.
@@ -469,7 +502,14 @@ def fit_lyrics(notes: Iterable[Note], text: str, language: str = "en", *, keep_b
         if i < len(targets) - 1 or len(tokens) <= len(targets):
             n.lyric = tokens[i] if i < len(tokens) else "-"
         else:
-            rest = tokens[i:]
+            rest = [t for t in tokens[i:] if t != "br"]
             words = [t for t in rest if t not in ("+", "-", "~", "+~", "ー")]
-            n.lyric = " ".join(words) if words else rest[0]
+            if not rest:
+                n.lyric = "br"
+            elif any(w.startswith("[") for w in words):
+                from ..phonemes import lyric_phonemes
+
+                n.lyric = "[" + " ".join(ph for w in words for ph in lyric_phonemes(w, language)) + "]"
+            else:
+                n.lyric = " ".join(words) if words else rest[0]
     return out

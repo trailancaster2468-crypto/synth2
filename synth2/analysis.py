@@ -10,10 +10,34 @@ import numpy as np
 from .timing import midi_to_note
 
 
-def _frames(x: np.ndarray, size: int, hop: int) -> np.ndarray:
+def _frames(x: np.ndarray, size: int, hop: int, start: int = 0, stop: int | None = None) -> np.ndarray:
+    """Frames ``start..stop`` (frame indices) of ``x``; all frames by default."""
     n = 1 + max(0, (len(x) - size) // hop)
-    idx = np.arange(size)[None, :] + hop * np.arange(n)[:, None]
+    stop = n if stop is None else min(stop, n)
+    idx = np.arange(size)[None, :] + hop * np.arange(start, stop)[:, None]
     return x[idx]
+
+
+_F0_BLOCK = 512  # frames analysed per vectorised block: keeps memory flat for long audio
+
+
+def _cmnd_block(fr: np.ndarray, half: int, tau_max: int, nfft: int) -> tuple[np.ndarray, np.ndarray]:
+    """YIN cumulative-mean-normalised difference for a block of frames, plus each frame's energy."""
+    A = np.fft.rfft(fr[:, :half], nfft)
+    Bf = np.fft.rfft(fr, nfft)
+    cross = np.fft.irfft(np.conj(A) * Bf, nfft)[:, :tau_max]
+    del A, Bf
+    sq = fr ** 2
+    cs = np.concatenate([np.zeros((len(fr), 1)), np.cumsum(sq, axis=1)], axis=1)
+    e0 = cs[:, half][:, None]
+    taus = np.arange(tau_max)
+    et = cs[:, taus + half] - cs[:, taus]
+    d = e0 + et - 2 * cross
+    d[:, 0] = 0
+    cum = np.cumsum(d[:, 1:], axis=1) / np.arange(1, tau_max)[None, :]
+    cmnd = np.ones_like(d)
+    cmnd[:, 1:] = d[:, 1:] / np.maximum(cum, 1e-12)
+    return cmnd, e0[:, 0] / half
 
 
 def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 60.0, fmax: float = 1200.0,
@@ -34,29 +58,18 @@ def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 6
     hop = max(1, int(hop_s * sr))
     if len(x) < W:
         x = np.pad(x, (0, W - len(x)))
-    fr = _frames(x, W, hop)
+    n_frames = 1 + (len(x) - W) // hop
     nfft = 1 << int(np.ceil(np.log2(2 * W)))
-    A = np.fft.rfft(fr[:, :half], nfft)
-    Bf = np.fft.rfft(fr, nfft)
-    cross = np.fft.irfft(np.conj(A) * Bf, nfft)[:, :tau_max]
-    sq = fr ** 2
-    cs = np.concatenate([np.zeros((len(fr), 1)), np.cumsum(sq, axis=1)], axis=1)
-    e0 = cs[:, half][:, None]
-    taus = np.arange(tau_max)
-    et = cs[:, taus + half] - cs[:, taus]
-    d = e0 + et - 2 * cross
-    d[:, 0] = 0
-    cum = np.cumsum(d[:, 1:], axis=1) / np.arange(1, tau_max)[None, :]
-    cmnd = np.ones_like(d)
-    cmnd[:, 1:] = d[:, 1:] / np.maximum(cum, 1e-12)
-    f0 = np.zeros(len(fr))
-    conf = np.zeros(len(fr))
-    energy = e0[:, 0] / half
-    silent = energy < 1e-7
-    for i in range(len(fr)):
-        if silent[i]:
+    f0 = np.zeros(n_frames)
+    conf = np.zeros(n_frames)
+    cmnd = energy = None
+    for i in range(n_frames):
+        row = i % _F0_BLOCK
+        if row == 0:  # analyse the next block of frames at once (memory stays bounded for long audio)
+            cmnd, energy = _cmnd_block(_frames(x, W, hop, i, i + _F0_BLOCK), half, tau_max, nfft)
+        if energy[row] < 1e-7:  # silent
             continue
-        c = cmnd[i]
+        c = cmnd[row]
         below = np.nonzero(c[tau_min:] < threshold)[0]
         if len(below) == 0:
             # YIN fallback: accept the global minimum when it is still clearly periodic
@@ -93,7 +106,7 @@ def estimate_f0(mono: np.ndarray, sr: int, hop_s: float = 0.005, fmin: float = 6
             shift = 0.0
         f0[i] = sr / (t + shift)
         conf[i] = 1.0 - float(c[t])
-    times = (np.arange(len(fr)) * hop + half / 2) / sr
+    times = (np.arange(n_frames) * hop + half / 2) / sr
     if return_confidence:
         return times, f0, conf
     return times, f0

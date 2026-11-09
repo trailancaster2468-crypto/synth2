@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -13,11 +14,44 @@ def _load(path: str):
     return load_any(path)
 
 
+def _error(msg: str) -> int:
+    print(f"error: {msg}", file=sys.stderr)
+    return 2
+
+
+def _track_ids(project, refs) -> list[str]:
+    """Resolve --track names/ids/indexes exactly like the tool layer (raises ToolError for unknown tracks)."""
+    from .ai.tools import Session, _track
+
+    session = Session(project)
+    return [_track(session, r).id for r in refs]
+
+
+def _filter_to_range(pa: dict, start, end) -> dict:
+    """Keep only notes inside the rendered beat range [start, end) (same rule as the analyze_render tool)."""
+    if start is None and end is None:
+        return pa
+    lo = -math.inf if start is None else start
+    hi = math.inf if end is None else end
+    for tr in pa.get("tracks", []):
+        for key in ("worst", "unvoiced_notes"):
+            if isinstance(tr.get(key), list):
+                tr[key] = [w for w in tr[key] if lo - 1e-9 <= float(w.get("beat", lo)) < hi]
+    return pa
+
+
 def cmd_render(a):
+    from .ai.tools import ToolError
     from .analysis import pitch_accuracy
     from .engine import render_project
 
+    if a.start is not None and a.end is not None and a.end <= a.start:
+        return _error("--end must be greater than --start")
     project = _load(a.input)
+    try:
+        track_ids = _track_ids(project, a.track) if a.track else None
+    except ToolError as exc:
+        return _error(str(exc))
     out = Path(a.output or Path(a.input).with_suffix(".wav"))
 
     def progress(f, msg):
@@ -25,7 +59,7 @@ def cmd_render(a):
             print(f"\r[{int(f * 100):3d}%] {msg:40s}", end="", file=sys.stderr, flush=True)
 
     res = render_project(project, sample_rate=a.sample_rate, start_beat=a.start, end_beat=a.end,
-                         track_ids=a.track or None, progress=progress)
+                         track_ids=track_ids, progress=progress)
     if not a.quiet:
         print(file=sys.stderr)
     res.save(out, bits=a.bits)
@@ -35,7 +69,7 @@ def cmd_render(a):
     for t in report.get("tracks", []):
         t.pop("phonemes", None)
     if a.check:
-        report["pitch_accuracy"] = pitch_accuracy(project, res)
+        report["pitch_accuracy"] = _filter_to_range(pitch_accuracy(project, res), a.start, a.end)
     print(json.dumps({"output": str(out), **report}, indent=2, ensure_ascii=False))
 
 
@@ -109,51 +143,70 @@ def cmd_studio(a):
 def cmd_mcp(a):
     from .ai import mcp_server
 
-    sys.argv = ["synth2-mcp"] + (["--project", a.project] if a.project else [])
-    mcp_server.main()
+    return mcp_server.main((["--project", a.project] if a.project else []) + (["--autosave"] if a.autosave else []))
 
 
 def cmd_director(a):
     from .ai.director import Director, DirectorUnavailable
-    from .ai.tools import Session
+    from .ai.tools import Session, ToolError
 
     try:
-        _director_main(a, Director, Session)
-    except DirectorUnavailable as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        sys.exit(2)
+        return _director_main(a, Director, Session)
+    except (DirectorUnavailable, ToolError) as exc:
+        return _error(str(exc))
 
 
-def _director_main(a, Director, Session):
+def _director_turn(director, msg: str) -> bool:
+    """Send one message; API errors are reported and do not end the session."""
+    try:
+        out = director.chat(msg)
+    except Exception as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+    for act in out.get("actions", []):
+        print(f"  [{'ok' if act.get('ok') else 'error'}] {act.get('tool')}", file=sys.stderr)
+    print(out.get("reply", ""))
+    return True
+
+
+def _director_main(a, Director, Session) -> int:
+    from .ai.tools import call_tool
+
     session = Session()
-    if a.project and Path(a.project).exists():
-        from .ai.tools import call_tool
-
+    target = a.project
+    create = bool(a.project) and not Path(a.project).exists()
+    if a.project and not create:
         call_tool(session, "load_project", {"path": a.project})
+        # the session path is the file itself for native projects and <stem>.s2p.json next to an imported
+        # .svp/.mid/.musicxml/.ust, which is never overwritten with a lossy re-export
+        target = session.path
+        if Path(target) != Path(a.project):
+            print(f"note: {a.project} is imported; changes are saved to {target}", file=sys.stderr)
+    before = session.project.to_dict()
     director = Director(session, model=a.model)
-    messages = [a.message] if a.message else []
-    interactive = not messages
-    while True:
-        if interactive:
-            try:
-                msg = input("you> ").strip()
-            except EOFError:
-                break
-            if msg in ("exit", "quit", ""):
-                break
-            messages = [msg]
-        if not messages:
-            break
-        out = director.chat(messages.pop(0))
-        for act in out.get("actions", []):
-            print(f"  [{'ok' if act.get('ok') else 'error'}] {act.get('tool')}", file=sys.stderr)
-        print(out.get("reply", ""))
-        if not interactive:
-            break
-    if a.project:
-        from .ai.tools import call_tool
-
-        call_tool(session, "save_project", {"path": a.project})
+    ok = True
+    try:
+        if a.message:
+            ok = _director_turn(director, a.message)
+        else:
+            while True:
+                try:
+                    msg = input("you> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print(file=sys.stderr)
+                    break
+                if msg in ("exit", "quit", ""):
+                    break
+                try:
+                    _director_turn(director, msg)
+                except KeyboardInterrupt:
+                    print("\n(interrupted)", file=sys.stderr)
+    finally:
+        # always keep the session's work, also after an API error or Ctrl-C
+        if a.project and (create or session.project.to_dict() != before):
+            saved = call_tool(session, "save_project", {"path": target})
+            print(f"saved {saved['path']}", file=sys.stderr)
+    return 0 if ok else 1
 
 
 def cmd_demo(a):
@@ -223,6 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     m = sub.add_parser("mcp", help="run the MCP server on stdio (for Claude and other AI clients)")
     m.add_argument("--project")
+    m.add_argument("--autosave", action="store_true", help="save the project after every editing tool call")
     m.set_defaults(func=cmd_mcp)
 
     d = sub.add_parser("director", help="produce vocals from natural language (needs ANTHROPIC_API_KEY)")
@@ -237,9 +291,12 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-def main(argv=None):
+def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    args.func(args)
+    code = args.func(args) or 0
+    if code:
+        sys.exit(code)
+    return 0
 
 
 if __name__ == "__main__":

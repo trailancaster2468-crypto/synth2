@@ -17,44 +17,65 @@ for cons, row in _H_ROWS.items():
 KANA.update({
     "や": "ya", "ゆ": "yu", "よ": "yo", "わ": "wa", "を": "o", "ん": "N", "ゐ": "i", "ゑ": "e",
     "ゔ": "vu", "っ": "cl", "ー": "-", "ぁ": "a", "ぃ": "i", "ぅ": "u", "ぇ": "e", "ぉ": "o",
+    "ゃ": "ya", "ゅ": "yu", "ょ": "yo",  # stray small y-kana: sung as their full-size mora
 })
 _SMALL_Y = {"ゃ": "a", "ゅ": "u", "ょ": "o"}
 _SMALL_V = {"ぁ": "a", "ぃ": "i", "ぅ": "u", "ぇ": "e", "ぉ": "o"}
+# consonant stems that combine with a following small vowel into one (mostly loanword) mora
+_SMALL_V_STEMS = ("ts", "f", "v", "t", "d", "sh", "ch", "j", "w")
+# loanword morae whose Hepburn spelling romaji_to_phonemes reads the Kunrei way (ti = chi, tu = tsu,
+# si = shi, zi = ji) get IME-style codes instead, so ティ is sung t-i and not chi
+_LOAN_CODES = {"ti": "thi", "tu": "twu", "si": "swi", "zi": "zwi"}
 
 
 def kata_to_hira(text: str) -> str:
     return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in text)
 
 
-def kana_to_romaji(text: str) -> list[str]:
-    """Convert kana to a list of romaji morae."""
-    text = kata_to_hira(text)
-    out: list[str] = []
+def _kana_units(text: str) -> list[tuple[str, str]]:
+    """Split kana into morae: ``(kana spelling, romaji code)`` pairs (non-kana characters are skipped)."""
+    hira = kata_to_hira(text)
+    out: list[tuple[str, str]] = []
     i = 0
-    while i < len(text):
-        c = text[i]
-        nxt = text[i + 1] if i + 1 < len(text) else ""
+    while i < len(hira):
+        c = hira[i]
+        nxt = hira[i + 1] if i + 1 < len(hira) else ""
         base = KANA.get(c)
         if base is None:
             i += 1
             continue
-        if nxt in _SMALL_Y and base.endswith("i") and base not in ("i",):
+        code = None
+        if nxt in _SMALL_Y and base.endswith("i") and base != "i":
             stem = base[:-1]
-            if stem in ("sh", "ch", "j"):
-                out.append(stem + _SMALL_Y[nxt])
-            else:
-                out.append(stem + "y" + _SMALL_Y[nxt])
+            code = stem + _SMALL_Y[nxt] if stem in ("sh", "ch", "j") else stem + "y" + _SMALL_Y[nxt]
+        elif nxt in _SMALL_Y and base in ("te", "de", "fu", "vu"):  # テュ デュ フュ ヴュ
+            code = base[0] + "y" + _SMALL_Y[nxt]
+        elif nxt in _SMALL_V and base == "u" and nxt != "ぅ":  # ウィ ウェ ウォ (ウァ)
+            code = "w" + _SMALL_V[nxt]
+        elif nxt == "ぇ" and base == "i":  # イェ
+            code = "ye"
+        elif nxt in _SMALL_V and base not in ("a", "i", "u", "e", "o"):
+            stem = base[:-1] if base[-1] in "aiueo" else base
+            if stem in _SMALL_V_STEMS or base in ("su", "zu"):  # ティ トゥ ファ シェ スィ ...
+                code = stem + _SMALL_V[nxt]
+                code = _LOAN_CODES.get(code, code)
+        if code is not None:
+            out.append((text[i:i + 2], code))
             i += 2
             continue
-        if nxt in _SMALL_V and base not in ("a", "i", "u", "e", "o"):
-            stem = base[:-1] if base[-1] in "aiueo" else base
-            if stem == "ts" or stem == "f" or stem == "v" or stem in ("t", "d", "sh", "ch", "j", "w"):
-                out.append(stem + _SMALL_V[nxt])
-                i += 2
-                continue
-        out.append(base)
+        out.append((text[i], base))
         i += 1
     return out
+
+
+def kana_to_romaji(text: str) -> list[str]:
+    """Convert kana to a list of romaji morae."""
+    return [r for _, r in _kana_units(text)]
+
+
+def kana_morae(text: str) -> list[str]:
+    """Split kana into morae, keeping the kana spelling (``"きって"`` -> ``["き", "っ", "て"]``)."""
+    return [k for k, _ in _kana_units(text)]
 
 
 _CONS = {
@@ -63,8 +84,15 @@ _CONS = {
     "sh": ["sh"], "ch": ["ch"], "ts": ["ts"], "j": ["jh"], "f": ["ph"], "v": ["v"],
     "ky": ["k", "y"], "gy": ["g", "y"], "ny": ["n", "y"], "hy": ["c"], "by": ["b", "y"],
     "py": ["p", "y"], "my": ["m", "y"], "ry": ["dx", "y"], "dy": ["d", "y"], "ty": ["t", "y"],
+    "fy": ["ph", "y"], "vy": ["v", "y"],
+    # loanword codes (see _LOAN_CODES): plain consonant before i/u
+    "th": ["t"], "tw": ["t"], "sw": ["s"], "zw": ["z"],
 }
-_MORA_RE = re.compile(r"(ky|gy|sh|ch|ts|ny|hy|by|py|my|ry|dy|ty|[kgsztdnhbpmyrwjfv]?)([aiueo])")
+_CONS_ALT = "|".join(sorted((c for c in _CONS if c), key=len, reverse=True))
+_MORA_RE = re.compile(rf"({_CONS_ALT}|)([aiueo])")
+# one romaji mora; a doubled consonant ("kitte", "matcha") is the closure mora "cl" (っ)
+_ROMAJI_MORA_RE = re.compile(
+    rf"(?:{_CONS_ALT})?[aiueo]|n(?![aiueoy])|(?P<gem>(?P<c>[kgsztdhbpfjcv])(?=(?P=c))|t(?=ch))")
 
 
 def romaji_to_phonemes(romaji: str) -> list[str]:
@@ -83,8 +111,8 @@ def romaji_to_phonemes(romaji: str) -> list[str]:
             continue
         m = _MORA_RE.match(s, pos)
         if not m:
-            # geminate consonant (e.g. "tte") -> glottal closure
-            if pos + 1 < len(s) and s[pos] == s[pos + 1]:
+            # geminate consonant (e.g. "tte", "tch") -> glottal closure
+            if pos + 1 < len(s) and s[pos] == s[pos + 1] or s.startswith("tch", pos):
                 out.append("q")
             pos += 1
             continue
@@ -126,4 +154,4 @@ def morae(text: str) -> list[str]:
     """Split a kana string into morae (each typically sung on its own note)."""
     if is_kana(text):
         return kana_to_romaji(text)
-    return [m.group(0) for m in re.finditer(r"(?:ky|gy|sh|ch|ts|ny|hy|by|py|my|ry|[kgsztdnhbpmyrwjfv])?[aiueo]|n(?![aiueoy])", text.lower())]
+    return ["cl" if m.group("gem") else m.group(0) for m in _ROMAJI_MORA_RE.finditer(text.lower())]

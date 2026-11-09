@@ -254,3 +254,111 @@ def test_project_load_s2s(tmp_path):
     path.write_text(PLAN_EXAMPLE, encoding="utf-8")
     p = Project.load(path)
     assert p.title == "Twinkle" and len(p.tracks[0].notes) == 18
+
+
+# --------------------------------------------------------------- regression tests
+
+@pytest.mark.parametrize("text", [
+    "C4 q {tension=0.3}D4",                      # D4 used to be swallowed into the attribute value
+    "C4 q la {velocity=1.5}{tension=0.2}",
+    "track: A\nC4 q la {velocity=1.2}|  D4 q la",
+])
+def test_standalone_attrs_with_trailing_text_is_an_error(text):
+    with pytest.raises(ScoreError, match="unexpected text after {attributes}") as ei:
+        parse_score(text)
+    assert ei.value.token.startswith("{")
+
+
+def test_standalone_attrs_still_work():
+    notes = parse_notes("C4 q la {velocity=1.5,tension=0.2}  D4 q la")
+    assert notes[0].attrs == {"velocity": 1.5, "tension": 0.2} and notes[1].note_name == "D4"
+
+
+@pytest.mark.parametrize("attrs", ["velocity=loud", "tension=true", "detune=nan", "vibrato_rate=inf",
+                                   'velocity="1"', "language=5"])
+def test_known_note_attributes_are_type_checked(attrs):
+    with pytest.raises(ScoreError, match="attribute") as ei:
+        parse_notes(f"C4 q la  D4 q la{{{attrs}}}")
+    assert ei.value.line == 1 and ei.value.token == f"{{{attrs}}}"
+    with pytest.raises(ScoreError):
+        parse_notes(f"C4 q la {{{attrs}}}")
+
+
+def test_valid_and_unknown_note_attributes_are_kept():
+    sn = parse_snippet("C4 q la{velocity=1,language=ja,tension=null,foo=bar}  D4 q la{language=fr}")
+    assert sn.notes[0].attrs == {"velocity": 1.0, "language": "ja", "tension": None, "foo": "bar"}
+    assert sn.notes[1].attrs == {"language": "fr"}
+    text = "\n".join(sn.warnings)
+    assert "unknown note attribute 'foo'" in text and "language 'fr' is not supported" in text
+
+
+def test_invalid_note_fields_are_dropped_on_export_so_the_score_loads():
+    p = Project.from_dict({"title": "x", "tracks": [{"name": "A", "notes": [
+        {"onset": 0, "duration": 1, "pitch": 60, "lyric": "star", "phonemes": "s t ar",
+         "attrs": {"velocity": "loud", "tension": 0.2}},
+        {"onset": 1, "duration": 1, "pitch": 62, "lyric": "x", "phonemes": 's]"\u2028{'},
+        {"onset": 2, "duration": 1, "pitch": 64, "lyric": "star", "phonemes": "s t aa r"}]}]})
+    text = project_to_score(p)
+    assert "star[s t ar]" not in text
+    assert '# dropped invalid phoneme override "s t ar", attribute velocity="loud" of C4 at beat 0' in text
+    notes = parse_score(text).tracks[0].notes
+    assert [(n.lyric, n.phonemes, n.attrs) for n in notes] == [
+        ("star", None, {"tension": 0.2}), ("x", None, {}), ("star", "s t aa r", {})]
+
+
+def test_only_real_newlines_split_lines():
+    # \f, \v, \x1c-\x1e, \x85, U+2028/9 are whitespace inside a line, not line breaks
+    for sep in ["\x0c", "\x0b", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]:
+        p = parse_score(f"track: A\nC4 q la   # old:{sep}D4 q la\nE4 q la")
+        assert [n.note_name for n in p.tracks[0].notes] == ["C4", "E4"], repr(sep)
+        assert [n.onset for n in p.tracks[0].notes] == [0, 1]
+    with pytest.raises(ScoreError) as ei:
+        parse_score("track: A\nC4 q la # see\u2028note\nX9 q la")
+    assert ei.value.line == 3 and ei.value.token == "X9"
+    p = parse_score("track: A\r\nC4 q la\rD4 q la\n")
+    assert [n.note_name for n in p.tracks[0].notes] == ["C4", "D4"]
+
+
+def test_line_separators_in_strings_round_trip():
+    p = Project(title="x\u2028y")
+    t = p.add_track("A\x85B")
+    t.add_note(0, 1, 60, "line\u2029sep")
+    t.add_note(1, 1, 62, "la").attrs = {"text": "a\u2028b"}
+    text = project_to_score(p)
+    assert not any(ch in text for ch in "\x85\u2028\u2029")
+    p2 = parse_score(text)
+    assert _strip_ids(p2.to_dict()) == _strip_ids(p.to_dict())
+
+
+def test_long_curves_parse_fast_and_merge_duplicates():
+    import time
+
+    p = Project()
+    t = p.add_track("A")
+    t.curves["pitchDelta"] = Curve([(i * 0.125, float(i % 50 - 25)) for i in range(20000)], "linear")
+    text = project_to_score(p)
+    t0 = time.perf_counter()
+    p2 = parse_score(text)
+    assert time.perf_counter() - t0 < 2.0  # was ~15 s (quadratic)
+    assert p2.tracks[0].curves["pitchDelta"].points == t.curves["pitchDelta"].points
+    sn = parse_snippet("curve: loudness 4:1 0:2 4:3\ncurve: loudness 0:5 2:0")
+    assert sn.curves["loudness"].points == [(0.0, 5.0), (2.0, 0.0), (4.0, 3.0)]
+
+
+def test_bad_json_in_track_style_option_is_a_score_error():
+    with pytest.raises(ScoreError) as ei:
+        parse_score('title: x\ntempo: 100\ntrack: A style.vibrato_depth="\\x"\nC4 q la')
+    assert ei.value.line == 3 and ei.value.token == 'style.vibrato_depth="\\x"'
+    assert "must be a number" in str(ei.value)
+
+
+def test_track_subset_keeps_seed():
+    p = Project()
+    p.add_track("A")
+    b = p.add_track("B")  # default seed for index 1
+    c = p.add_track("C")
+    c.seed = 17           # equals the default for index 0
+    assert parse_score(project_to_score(p, [b])).tracks[0].seed == b.seed
+    assert parse_score(project_to_score(p, [c])).tracks[0].seed == 17
+    assert [t.seed for t in parse_score(project_to_score(p, [b, c])).tracks] == [b.seed, 17]
+    assert [t.seed for t in parse_score(project_to_score(p)).tracks] == [t.seed for t in p.tracks]

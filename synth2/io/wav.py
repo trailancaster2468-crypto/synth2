@@ -1,4 +1,8 @@
-"""WAV file reading/writing (16/24-bit PCM, 32-bit float) using only the stdlib + numpy."""
+"""WAV file reading/writing (16/24-bit PCM, 32-bit float) using only the stdlib + numpy.
+
+:func:`read_wav` also reads 8/32-bit PCM, 64-bit float and ``WAVE_FORMAT_EXTENSIBLE``
+files (the sample format comes from the ``SubFormat`` GUID).
+"""
 from __future__ import annotations
 
 import struct
@@ -52,6 +56,7 @@ def read_wav(path: str | Path) -> tuple[np.ndarray, int]:
         raise ValueError("not a RIFF/WAVE file")
     pos = 12
     fmt = None
+    sub_tag = None
     data = None
     while pos + 8 <= len(raw):
         cid = raw[pos:pos + 4]
@@ -59,15 +64,21 @@ def read_wav(path: str | Path) -> tuple[np.ndarray, int]:
         body = raw[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
             fmt = struct.unpack("<HHIIHH", body[:16])
+            if len(body) >= 26:  # WAVE_FORMAT_EXTENSIBLE: the SubFormat GUID starts with the real tag
+                sub_tag = struct.unpack("<H", body[24:26])[0]
         elif cid == b"data":
             data = body
         pos += 8 + size + (size & 1)
     if fmt is None or data is None:
         raise ValueError("missing fmt or data chunk")
     tag, channels, sr, _, _, bits = fmt
-    if tag == 0xFFFE:  # WAVE_FORMAT_EXTENSIBLE: assume PCM unless 32-bit float
-        tag = 3 if bits == 32 else 1
+    if tag == 0xFFFE:  # WAVE_FORMAT_EXTENSIBLE (1 = PCM, 3 = float); guess when the fmt chunk is truncated
+        tag = sub_tag if sub_tag is not None else (3 if bits == 32 else 1)
+    if tag not in (1, 3):
+        raise ValueError(f"unsupported WAV format tag {tag:#06x}")
     if tag == 3:
+        if bits not in (32, 64):
+            raise ValueError(f"unsupported float bit depth {bits}")
         a = np.frombuffer(data, dtype="<f4" if bits == 32 else "<f8").astype(np.float64)
     elif bits == 16:
         a = np.frombuffer(data, dtype="<i2") / 32768.0

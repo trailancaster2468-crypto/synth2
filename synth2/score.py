@@ -273,6 +273,20 @@ def _parse_value(v: str):
     return v
 
 
+def _attr_problem(k: str, v) -> str | None:
+    """Why ``v`` is not a valid value for the known note attribute ``k`` (``None`` if it is fine).
+
+    Unknown attributes are not checked (the engine ignores them); ``null`` is always allowed.
+    """
+    if k not in NOTE_ATTRIBUTES or v is None:
+        return None
+    if k == "language":
+        return None if isinstance(v, str) else f"attribute {k!r} must be a language code such as en or ja"
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return f"attribute {k!r} must be a finite number, got {v!r} - {NOTE_ATTRIBUTES[k][1]}"
+    return None
+
+
 def _split_commas(s: str) -> list[str]:
     parts, cur, i = [], [], 0
     while i < len(s):
@@ -311,6 +325,9 @@ class _Parser:
         self.curves: dict[str, Curve] = {}
         self.tempos: list[tuple[float, float]] = []
         self._header_tempo_set = False
+        # curve points collected while parsing, keyed by id(curve): (curve, {round(beat, 9): (beat, value)});
+        # written back sorted once at the end of parse() (per-point list rebuilds were quadratic)
+        self._curve_points: dict[int, tuple[Curve, dict]] = {}
 
     # -- helpers ---------------------------------------------------------------
     def warn(self, lineno, msg):
@@ -332,7 +349,9 @@ class _Parser:
     def parse(self, text: str):
         if text.startswith("﻿"):
             text = text[1:]
-        for lineno, raw in enumerate(text.splitlines(), 1):
+        # split on real newlines only: str.splitlines() also breaks on \f, \v, \x1c-\x1e, \x85, U+2028/9,
+        # which would turn comment text into notes and shift line numbers
+        for lineno, raw in enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1):
             line = _strip_comment(raw).strip()
             if not line:
                 continue
@@ -341,6 +360,8 @@ class _Parser:
                 self.directive(m.group(1).lower(), m.group(2).strip(), lineno, raw)
             else:
                 self.note_line(line, lineno, raw)
+        for curve, merged in self._curve_points.values():
+            curve.points = sorted(merged.values(), key=lambda p: p[0])
         if self.mode == "score":
             for t in self.project.tracks:
                 t.sort()
@@ -479,7 +500,10 @@ class _Parser:
                 if f not in style_fields:
                     raise ScoreError(f"unknown style parameter {f!r}; valid: {', '.join(sorted(style_fields))}",
                                      lineno, tok, raw)
-                val = _parse_value(v)
+                try:
+                    val = _parse_value(v)
+                except ValueError:  # bad JSON string, e.g. "\x"
+                    raise ScoreError(f"{k} must be a number", lineno, tok, raw) from None
                 if isinstance(val, bool):
                     val = float(val)
                 if not isinstance(val, float):
@@ -537,6 +561,10 @@ class _Parser:
         curve = target.get(name)
         if curve is None:
             curve = target[name] = Curve()
+        entry = self._curve_points.get(id(curve))
+        if entry is None:
+            entry = self._curve_points[id(curve)] = (curve, {round(b, 9): (b, v) for b, v in curve.points})
+        merged = entry[1]
         for tok in toks[1:]:
             low = tok.strip("()").lower()
             if tok.startswith("(") or low in INTERPOLATIONS or low.startswith("interp"):
@@ -554,9 +582,7 @@ class _Parser:
             if not spec[1] <= val <= spec[2]:
                 self.warn(lineno, f"{name} value {val:g} is outside {spec[1]:g}..{spec[2]:g} {spec[3]} "
                                   f"and will be clamped when rendering")
-            curve.points = [p for p in curve.points if abs(p[0] - beat) > 1e-9]
-            curve.points.append((beat, val))
-        curve.sort()
+            merged[round(beat, 9)] = (beat, val)  # a later point at the same beat replaces the earlier one
 
     # -- notes -------------------------------------------------------------------------
     def note_line(self, line, lineno, raw):
@@ -579,6 +605,10 @@ class _Parser:
             if tok.startswith("{"):
                 if self.last_note is None:
                     raise ScoreError("note attributes {...} must follow a note", lineno, tok, raw)
+                end = _scan_group(tok, 0)
+                if end != len(tok):
+                    raise ScoreError("unexpected text after {attributes}; put all attributes in one {...} group "
+                                     "and separate notes with spaces", lineno, tok, raw)
                 self.last_note.attrs.update(self._attrs(tok, lineno, raw))
                 i += 1
                 continue
@@ -701,9 +731,15 @@ class _Parser:
                 self.warn(lineno, f"unknown note attribute {k!r} (kept, but the engine ignores it); "
                                   f"valid: {', '.join(NOTE_ATTRIBUTES)}")
             try:
-                out[k] = _parse_value(v)
+                val = _parse_value(v)
             except ValueError:
                 raise ScoreError(f"invalid value for attribute {k!r}", lineno, tok, raw) from None
+            problem = _attr_problem(k, val)
+            if problem:
+                raise ScoreError(problem, lineno, tok, raw)
+            if k == "language" and val is not None and val not in ("en", "ja"):
+                self.warn(lineno, f"language {val!r} is not supported; use 'en' or 'ja'")
+            out[k] = val
         return out
 
     def _check_lyric(self, note: Note, lineno):
@@ -813,16 +849,55 @@ def _lyric_token(n: Note) -> str:
             parse_phoneme_string(lyric[1:-1])
             tok = lyric
         except ValueError:
-            tok = json.dumps(lyric, ensure_ascii=False)
+            tok = _quote(lyric)
     elif lyric and _SAFE_WORD_RE.match(lyric) and not _is_pitch_like(lyric):
         tok = lyric
     else:
-        tok = json.dumps(lyric, ensure_ascii=False)
-    if n.phonemes:
+        tok = _quote(lyric)
+    if n.phonemes and _override_problem(n.phonemes) is None:
         tok += "[" + " ".join(re.split(r"[\s,]+", n.phonemes.strip())) + "]"
-    if n.attrs:
-        tok += "{" + ",".join(f"{k}={_attr_value(v)}" for k, v in n.attrs.items()) + "}"
+    attrs = [(k, v) for k, v in n.attrs.items() if _attr_problem(k, v) is None]
+    if attrs:
+        tok += "{" + ",".join(f"{k}={_attr_value(v)}" for k, v in attrs) + "}"
     return tok
+
+
+def _override_problem(phonemes: str) -> str | None:
+    """Why the phoneme override would not parse back from ``word[...]`` (``None`` if it would)."""
+    if re.search(r"[\[\]{}\"]", phonemes):
+        return "it contains brackets or quotes"
+    from .phonemes import parse_phoneme_string
+
+    try:
+        parse_phoneme_string(phonemes)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _dropped_comment(n: Note) -> str | None:
+    """A ``#`` comment naming the note fields :func:`_lyric_token` left out because they would not parse back."""
+    dropped = []
+    if n.phonemes and _override_problem(n.phonemes) is not None:
+        dropped.append(f"phoneme override {json.dumps(n.phonemes)}")
+    for k, v in n.attrs.items():
+        if _attr_problem(k, v) is not None:
+            dropped.append(f"attribute {k}={json.dumps(v, default=str)}")
+    if not dropped:
+        return None
+    # json.dumps (ensure_ascii) keeps user text on this one line
+    return f"# dropped invalid {', '.join(dropped)} of {midi_to_note(n.pitch)} at beat {_num(n.onset)}"
+
+
+_LINE_SEPARATORS = {"\x85": "\\u0085", "\u2028": "\\u2028", "\u2029": "\\u2029"}
+
+
+def _quote(s: str) -> str:
+    """JSON-quote ``s``; also escape the line separators ``json.dumps(ensure_ascii=False)`` leaves raw."""
+    q = json.dumps(s, ensure_ascii=False)
+    for ch, esc in _LINE_SEPARATORS.items():
+        q = q.replace(ch, esc)
+    return q
 
 
 def _attr_value(v) -> str:
@@ -835,23 +910,24 @@ def _attr_value(v) -> str:
     s = str(v)
     if _SAFE_VALUE_RE.match(s) and s.lower() not in ("true", "false", "null", "none", "inf", "nan", "infinity"):
         return s
-    return json.dumps(s, ensure_ascii=False)
+    return _quote(s)
 
 
 def _name_token(s: str) -> str:
     if s and _SAFE_NAME_RE.match(s) and "=" not in s:
         return s
-    return json.dumps(s, ensure_ascii=False)
+    return _quote(s)
 
 
 def _value_token(s: str) -> str:
-    return s if s and _SAFE_VALUE_RE.match(s) else json.dumps(s, ensure_ascii=False)
+    return s if s and _SAFE_VALUE_RE.match(s) else _quote(s)
 
 
 def notes_to_score(notes: list[Note], start_beat: float = 0.0, beats_per_bar: float = 4.0) -> list[str]:
     """Serialise notes as score lines (one line per bar), starting from position ``start_beat``."""
     lines: list[str] = []
     cur: list[str] = []
+    comments: list[str] = []  # notes about the current line, written after it
     cur_bar = None
     pos = float(start_beat)
     bpb = beats_per_bar if beats_per_bar > 0 else 4.0
@@ -859,12 +935,18 @@ def notes_to_score(notes: list[Note], start_beat: float = 0.0, beats_per_bar: fl
     def bar_of(x: float) -> int:
         return int(math.floor(x / bpb + 1e-9))
 
+    def flush():
+        if cur:
+            lines.append("  ".join(cur))
+            cur.clear()
+        lines.extend(comments)
+        comments.clear()
+
     def emit(token: str, at: float):
         nonlocal cur_bar
         b = bar_of(at)
         if cur and b != cur_bar:
-            lines.append("  ".join(cur))
-            cur.clear()
+            flush()
         if not cur:
             cur_bar = b
         cur.append(token)
@@ -877,16 +959,16 @@ def notes_to_score(notes: list[Note], start_beat: float = 0.0, beats_per_bar: fl
                 emit(f"r {tok}", pos)
                 pos += parse_duration(tok)
             else:
-                if cur:
-                    lines.append("  ".join(cur))
-                    cur.clear()
+                flush()
                 lines.append(f"@ {_num(n.onset)}")
                 pos = n.onset
         dtok = duration_token(n.duration)
         emit(f"{midi_to_note(n.pitch)} {dtok} {_lyric_token(n)}", n.onset)
+        dropped = _dropped_comment(n)
+        if dropped:
+            comments.append(dropped)
         pos += parse_duration(dtok)  # track the position exactly the way the parser will
-    if cur:
-        lines.append("  ".join(cur))
+    flush()
     return lines
 
 
@@ -925,11 +1007,13 @@ def project_to_score(project: Project, tracks: list[Track] | None = None) -> str
         out.append(f"master: gain={_num(m.gain_db)} room={_num(m.reverb_room)} wet={_num(m.reverb_wet)} "
                    f"normalize={'true' if m.normalize else 'false'} limiter={'true' if m.limiter else 'false'}")
     bpb = p.beats_per_bar()
-    for i, t in enumerate(p.tracks):
+    emitted = 0  # the parser derives default seeds from the track's position in *this* text
+    for t in p.tracks:
         if tracks is not None and t not in tracks:
             continue
         out.append("")
-        out.append(_track_line(t, i))
+        out.append(_track_line(t, emitted))
+        emitted += 1
         out.extend(notes_to_score(t.notes, 0.0, bpb))
         for name, c in t.curves.items():
             if not c.points:

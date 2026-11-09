@@ -8,13 +8,16 @@ track per ``<part>`` (``score-partwise``; ``score-timewise`` is converted):
   monophonic line; chords keep their top note; grace and cue notes are skipped;
 * tied notes are merged (a tied continuation without a lyric extends the
   note it is tied to);
-* lyrics (verse 1): ``syllabic`` ``single`` -> the word, ``begin`` -> the full
-  word joined from its syllables, ``middle`` / ``end`` -> ``"+"``; notes without
-  a lyric inside a slur, under an ``<extend/>`` or inside an unfinished word
-  become ``"-"`` melismas; other lyric-less notes sing ``"la"``;
+* lyrics (verse 1, or the lowest verse number when no lyric is numbered 1;
+  other verses are ignored): ``syllabic`` ``single`` -> the word, ``begin`` ->
+  the full word joined from its syllables, ``middle`` / ``end`` -> ``"+"``;
+  notes without a lyric inside a slur, under an ``<extend/>``, inside an
+  unfinished word or carrying only another verse's syllable right after a sung
+  note become ``"-"`` melismas; other lyric-less notes sing ``"la"``;
 * tempo from ``<sound tempo>`` (preferred) or ``<metronome>``; the first time
   signature and key (``fifths`` + ``mode`` -> ``"D major"``) set the project's;
-* microtonal ``<alter>`` values become the ``detune`` attribute (cents).
+* microtonal ``<alter>`` values become the ``detune`` attribute (cents), and
+  the writer turns ``detune`` back into a decimal ``<alter>``.
 
 Writing (:func:`write_musicxml`, :func:`dumps_musicxml`) produces MusicXML 4.0
 partwise with ``divisions`` 480: one part per track, proper measures from the
@@ -132,15 +135,25 @@ def _clean_syllable(text: str) -> str:
     return s
 
 
-def _lyric_of(els: list[ET.Element]) -> ET.Element | None:
+def _verse(ly: ET.Element) -> str:
+    return (ly.get("number") or "1").strip() or "1"
+
+
+def _primary_verse(notes: list[ET.Element]) -> str:
+    """The verse a part's line sings: ``"1"`` when used, else the lowest (or first) number."""
+    numbers = list(dict.fromkeys(_verse(ly) for n in notes for ly in n.findall("lyric")))
+    if not numbers or "1" in numbers:
+        return "1"
+    digits = [v for v in numbers if v.isdigit()]
+    return min(digits, key=int) if digits else numbers[0]
+
+
+def _lyric_of(els: list[ET.Element], verse: str = "1") -> ET.Element | None:
+    """The first ``<lyric>`` of verse ``verse`` on the notes ``els`` (other verses are ignored)."""
     for e in els:
-        lyrics = e.findall("lyric")
-        if not lyrics:
-            continue
-        for ly in lyrics:
-            if (ly.get("number") or "1") == "1":
+        for ly in e.findall("lyric"):
+            if _verse(ly) == verse:
                 return ly
-        return lyrics[0]
     return None
 
 
@@ -183,6 +196,7 @@ class _PartReader:
         voices = [v for v in voices if v]
         self.main_voice = "1" if "1" in voices else (voices[0] if voices else None)
         self.has_lyrics = any(n.find("lyric/text") is not None for n in notes)
+        self.verse = _primary_verse(notes)
 
     # -- word handling ----------------------------------------------------
     def _finish_word(self):
@@ -210,7 +224,8 @@ class _PartReader:
         el, pitch, detune = max(pitched, key=lambda x: x[1] + x[2] / 100.0)
         ties = {t.get("type") for t in el.findall("tie")} | {t.get("type") for t in el.findall("notations/tied")}
         tie_stop = bool(ties & {"stop", "continue"})
-        ly = _lyric_of([el] + [e for e in group if e is not el])
+        ly = _lyric_of([el] + [e for e in group if e is not el], self.verse)
+        other_verse = ly is None and any(e.find("lyric") is not None for e in group)
         text = None
         syllabic = "single"
         has_extend = False
@@ -244,7 +259,7 @@ class _PartReader:
                 self.extend = has_extend
             elif ly is not None and (has_extend or extend_stop):
                 note.lyric = "-"
-            elif self.has_lyrics and self.out and (in_slur or (self.phrase and (self.extend or self.word_idx is not None or tie_stop))):
+            elif self.has_lyrics and self.out and (in_slur or (self.phrase and (self.extend or self.word_idx is not None or tie_stop or other_verse))):
                 note.lyric = "-"  # a slur still marks a melisma when it spans a rest
             self.out.append(note)
             if text is not None and syllabic == "end" and self.word_idx is not None:
@@ -589,12 +604,16 @@ def _part_xml(part: ET.Element, track: Track, project: Project, n_measures: int,
             n = notes[idx]
             is_first = first_piece[idx] == (mi, k)
             is_last = last_piece[idx] == (mi, k)
-            pitch = max(0, min(127, int(n.pitch)))
+            # detune (cents) becomes a microtonal <alter>; whole semitones move the written note
+            cents = float(n.attrs.get("detune") or 0.0)
+            shift = math.floor(cents / 100.0 + 0.5)
+            pitch = max(0, min(127, int(n.pitch) + shift))
             step, alter = names[pitch % 12]
+            alter_v = round(alter + (int(n.pitch) + cents / 100.0 - pitch), 4)
             p = ET.SubElement(el, "pitch")
             ET.SubElement(p, "step").text = step
-            if alter:
-                ET.SubElement(p, "alter").text = str(alter)
+            if alter_v:
+                ET.SubElement(p, "alter").text = _fmt_num(alter_v)
             ET.SubElement(p, "octave").text = str(pitch // 12 - 1)
             ET.SubElement(el, "duration").text = str(length)
             if not is_first:
