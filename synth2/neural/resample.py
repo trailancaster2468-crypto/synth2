@@ -27,7 +27,7 @@ import numpy as np
 PASSBAND = 0.85       # flat up to this fraction of the lower Nyquist frequency
 ATTEN_DB = 90.0       # design stop-band attenuation
 BLOCK = 1 << 16       # output samples computed per block
-_TABLE_LIMIT = 1 << 22  # largest tap table (phases x taps) kept in memory
+_TABLE_LIMIT = 1 << 22  # largest tap table (phases x taps) kept in memory; above it taps are computed per block
 
 
 def _ratio(sr_in: int, sr_out: int) -> tuple[int, int]:
@@ -93,7 +93,7 @@ def _taps(frac: np.ndarray, half: int, cutoff: float, beta: float) -> np.ndarray
     return h / h.sum(axis=1, keepdims=True)
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=4)
 def _table(up: int, down: int) -> np.ndarray:
     half, cutoff, beta = _design(up, down)
     tab = np.ascontiguousarray(_taps(np.arange(up) / up, half, cutoff, beta))
@@ -167,5 +167,6 @@ def resample(x, sr_in: int, sr_out: int, *, in_start: int = 0,
             s = (first * down) // up - q_lo
             win = np.lib.stride_tricks.as_strided(seg[s:], (cnt, width), (down * step, step),
                                                   writeable=False)
-            out[first - n0::up] = win @ table[r]
+            # einsum, not BLAS: a row's sum must not depend on where the row is in the block
+            out[first - n0::up] = np.einsum("ij,j->i", win, table[r])
     return y
