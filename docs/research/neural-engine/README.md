@@ -15,6 +15,7 @@ speech recognisers (tiny.en / base.en / small.en) and voice-quality measures fro
 | `q5-pitch-predictor.md` | Should the bank's own pitch predictor replace Synth2's curves? | Yes where the bank has one, scaled by style (`expr` 0.5 robotic, 1.0 otherwise); it is sung more clearly than flat or hand-built pitch. |
 | `q4-voicebanks-and-licences.md` | Are there clearer voicebanks, and what do their terms allow? | Nishiren v2.1 is much clearer, but its terms need the author's approval for use in another program, for commercial use, and restrict use with AI-generated lyrics and music. Qixuan is the only bank found whose terms plainly allow commercial works. |
 | `v1-combined-engine.md`, `v1-config.json` | Do the fixes hold together, on both banks? | Yes. Qixuan verse 0.64 / 0.57 / 0.42 to 0.44 / 0.42 / 0.26; the register is the strongest control. |
+| `demo3-song-demo.md`, `demo3/` | How far does Qixuan go on the showcase song with every fix? | Verse 0.64 / 0.57 / 0.42 to 0.42 / 0.27 / 0.24 with the song 5 semitones lower; vowel-only breathiness is a trade between tone and words; low voices need the acoustic model an octave above the rendered pitch; the lead EQ and balance for a neural voice. `demo3/` has the backend, cast and song-build copies the demo was made with. |
 
 `prototype/` holds the research engine the production code in `synth2/neural/` is ported
 from (`dsinfer.py`, `dspitch.py`) and the voice-quality measure (`voiceq.py`). It is not
