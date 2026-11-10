@@ -1,0 +1,78 @@
+{
+  "about": "Recommended options of v67/dsinfer.py render_track_ds per bank. Measured on verse1, chorus1, verse2 (AI track of select_all_invaders, 168 BPM, robotic), plain and twinkle; three noise seeds each; see VERDICT.md.",
+  "engine": "v67/dsinfer.py (imports v67/dspitch.py); DS(root, vocoder, threads, speaker), render_track_ds(ds, project, track, **options)",
+  "expr_by_style": {"robotic": 0.5, "soft": 0.75, "default": 1.0, "rule": "clip(expr[style] * (1 - 0.5 * voice.robotic), 0.5, 1); pass expr=None to get it"},
+  "banks": {
+    "nishiren": {
+      "name": "Nishiren v2.1 (Gardanana)",
+      "root": "q4/dl/nishiren/x/Nishiren Diffsinger v2.1",
+      "vocoder": "bundled: dsvocoder/gda_pc-hifigan.onnx (pass vocoder=None)",
+      "lead_mode": "Standard",
+      "options": {
+        "slow_note": 0.25,
+        "slow_max": 2.0,
+        "voicing_floor": 6.0,
+        "pitch_source": "bank",
+        "expr": null,
+        "pitch_steps": 10,
+        "steps": 10,
+        "var_steps": 10,
+        "velocity": 1.0,
+        "tension_off": 0.0,
+        "breath_off": 0.0,
+        "voicing_off": 0.0,
+        "gender": 0.0,
+        "min_vowel": null,
+        "seed": "the track seed (per-phrase sessions are seeded from it and the phrase's first frame and length)"
+      },
+      "fixes": {
+        "slow_motion": "ON. Helps: verse1 WER tiny/base/small 0.507/0.387/0.296 -> 0.455/0.344/0.178, chorus1 base 0.18 -> 0.05; dropped syllables 3.8 % -> 1.5 %; cpp +0.9 dB. Smaller gain than on Qixuan.",
+        "voicing_floor": "ON as a safety net only. No measurable effect on this bank (its variance model predicts a collapsed vowel in 1.5 % of verse1's vowels, 0 % elsewhere). Bank-specific fix for Qixuan.",
+        "pitch_predictor": "ON. No effect on the words (inside the noise in all four cases); cpp +0.3 to +0.6 dB; outlier frames are bridged. Style choice, not an intelligibility fix, on this bank.",
+        "seeded_noise": "ON. Renders repeat bit for bit, also across processes."
+      },
+      "controls_measured_without_gain": {
+        "velocity": "1.11 and 1.23 (README: 110-130 for fast songs): no effect; not a substitute for slow motion",
+        "tension_off": "+2: pressed tone (cpp +1.4, hnr -1.7), words equal; +4: worse; -2: breathier (cpp -2.9), words equal",
+        "mode_Power": "not better (small.en +0.09 on verse1, hnr -1.2 dB, level less even)",
+        "steps_20": "no effect, +25 % render time",
+        "min_vowel_0.04": "removes the last dropped syllables in level, WER not better (0.02-0.08 worse); off"
+      },
+      "register": {
+        "finding": "The lead of select_all_invaders sits at A4-E5 (MIDI 69-77). An octave lower (transpose -12, same key) verse1 goes 0.436/0.379/0.167 -> 0.246/0.159/0.095 and chorus1 base 0.08 -> 0.01; 5 semitones lower 0.356/0.235/0.136. hnr falls 2.3-2.5 dB at -12 and not at -5. plain (C#4-A4) gains nothing from going lower.",
+        "recommendation": "Write leads for this bank at or below about E5; for this song sing the AI lead an octave lower (transpose -12) or move the song down 5 semitones. A song-level decision, not an engine default."
+      },
+      "level": "Output is 5-6 dB hotter than Qixuan's (verse1 -18.6 vs -23.2 LUFS, chorus1 -15.4 vs -21.7); peaks reach 0.91 of full scale in a phrase. Give the bank a gain of about -5 dB or normalise per track."
+    },
+    "qixuan": {
+      "name": "Qixuan v2.7.0",
+      "root": "models/installed/qixuan/files/Qixuan_v2.7.0_DiffSinger_OpenUtau",
+      "vocoder": "models/installed/pc-nsf-hifigan/files/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02.onnx",
+      "lead_mode": null,
+      "options": {
+        "slow_note": 0.25,
+        "slow_max": 2.0,
+        "voicing_floor": 6.0,
+        "pitch_source": "bank",
+        "expr": null,
+        "pitch_steps": 10,
+        "steps": 10,
+        "var_steps": 10,
+        "depth": 0.6,
+        "velocity": 1.0,
+        "breath_off": 0.0,
+        "voicing_off": 0.0,
+        "gender": 0.0,
+        "min_vowel": null,
+        "seed": "the track seed"
+      },
+      "fixes": {
+        "slow_motion": "ON. Helps (Q1 reproduced): verse1 0.637/0.568/0.417 -> median 0.49/0.39/0.32.",
+        "voicing_floor": "ON. Helps (Q6 reproduced): whispered vowels 12.3 % -> 2.6 % of verse1, worst -36 -> -14 dB; with slow motion 0 %.",
+        "pitch_predictor": "ON, with one known cost. chorus1 tiny.en 0.64 -> 0.35 (all three fixes); twinkle (pop, expr 1.0) loses about one word in ten on tiny.en and base.en (0.367/0.217 -> 0.450/0.350, six seeds), small.en equal.",
+        "seeded_noise": "ON."
+      },
+      "combined_vs_stock": "verse1 0.637/0.568/0.417 -> 0.443/0.424/0.261; chorus1 0.638/0.190/0.181 -> 0.353/0.200/0.114; plain unchanged 0.111/0.042/0.042; twinkle 0.367/0.217/0.117 -> 0.450/0.350/0.133"
+    }
+  }
+}
