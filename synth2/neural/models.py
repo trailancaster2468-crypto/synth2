@@ -1,4 +1,4 @@
-"""Installed neural models (voicebanks and vocoders).
+"""Installed neural models (voicebanks and vocoders) and the installer that puts them there.
 
 Model weights are never part of Synth2. They are installed into a per-user directory
 (:func:`models_dir`), one folder per model::
@@ -6,8 +6,14 @@ Model weights are never part of Synth2. They are installed into a per-user direc
     <models_dir>/<id>/synth2-model.json     manifest (see docs/NEURAL.md)
     <models_dir>/<id>/files/...             the unmodified contents of the downloaded archive
 
-This module is the read side: where the models live and which ones are there. It imports
-nothing heavy, so the rest of Synth2 can ask cheaply whether the neural engine could run.
+The read side (:func:`installed`, :func:`find`, :func:`vocoder_for`) says where the models live
+and which ones are there. The write side (:data:`REGISTRY`, :func:`install`, :func:`add_local`,
+:func:`remove`) downloads a model's official archive, checks it against a pinned SHA-256 and
+extracts it without trusting anything in it.
+
+Importing this module stays cheap, so the rest of Synth2 can ask whether the neural engine could
+run: everything the installer needs (``urllib``, ``ssl``, ``zipfile``, ``hashlib``) is imported
+inside the functions that use it.
 """
 from __future__ import annotations
 
