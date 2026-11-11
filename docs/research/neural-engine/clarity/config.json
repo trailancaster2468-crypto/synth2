@@ -1,0 +1,203 @@
+{
+ "about": "Settings of the clarity study. `before`, `flow`, `adlib`: the fourth demo's engine settings, unchanged (mix5/config.json). `dial`: per setting A | B | C what changes for the lead: `engine` = options of clar/dsinfer.py render_track_ds merged over before + flow (null removes one), `chain` = stages of clar/chain5.py merged over chain5.LEAD4 (null switches one off), `mix` = the lead's reverb send and the in-channel ducked room (run6.py).",
+ "transpose": -5,
+ "before": {
+  "slow_note": 0.25,
+  "voicing_floor": 6.0,
+  "pitch_source": "bank",
+  "vowel_breath_off": -3.0,
+  "detune": 7.0
+ },
+ "flow": {
+  "cons_cap": {
+   "stop": 0.035,
+   "vstop": 0.035,
+   "aff": 0.06,
+   "fric": 0.05,
+   "vfric": 0.05,
+   "nasal": 0.06,
+   "glide": 0.05
+  },
+  "cons_cap_keep": 0.5,
+  "onset_keep": true,
+  "cons_voicing_floor": {
+   "vfric": 8.0,
+   "nasal": 8.0,
+   "glide": 8.0,
+   "vstop": 11.0
+  },
+  "breath": {
+   "min_gap": 0.12,
+   "fill": 0.45,
+   "length": 0.3,
+   "min_len": 0.1,
+   "breathiness": -44.0,
+   "first": true
+  }
+ },
+ "adlib": {
+  "AI Adlib": {
+   "split": "word",
+   "pitch": "flat",
+   "stamp": true
+  },
+  "Alien Adlib": {
+   "split": "word",
+   "pitch": {
+    "default": "flat",
+    "ha": "fall",
+    "ouch": "fall"
+   },
+   "stamp": true,
+   "vibrato": true
+  },
+  "Alien Chant": {
+   "split": "syllable",
+   "pitch": "flat",
+   "stamp": true,
+   "vibrato": true,
+   "chop": {
+    "hz": 11,
+    "depth_db": -9
+   },
+   "glottal": true
+  },
+  "Crowd Shout": {
+   "split": "word",
+   "pitch": {
+    "default": "flat",
+    "what": "rise",
+    "huh": "rise"
+   },
+   "stamp": true
+  }
+ },
+ "dial": {
+  "A": {
+   "engine": {},
+   "chain": {},
+   "mix": {},
+   "ver": "v0",
+   "engine_ver": "v0"
+  },
+  "B": {
+   "ver": "v4",
+   "engine": {
+    "cons_cap": {
+     "stop": 0.045,
+     "vstop": 0.04,
+     "aff": 0.07,
+     "fric": 0.065,
+     "vfric": 0.05,
+     "nasal": 0.06,
+     "glide": 0.05
+    },
+    "cons_cap_share": 0.35,
+    "cons_voicing_floor": {
+     "vfric": 8.0,
+     "nasal": 8.0,
+     "glide": 8.0,
+     "vstop": 14.0
+    }
+   },
+   "chain": {
+    "rider": {
+     "range_db": 5.0,
+     "strength": 0.6
+    },
+    "comp1": {
+     "ratio": 1.25
+    },
+    "cons": {
+     "replace": true,
+     "target_db": -10.0,
+     "ratio": 2.0,
+     "max_up_db": 0.0,
+     "max_down_db": 6.0,
+     "floor_db": -24.0,
+     "width_db": 6.0
+    },
+    "lift": {
+     "db": 2.0,
+     "hf": 2500.0,
+     "floor_db": -24.0,
+     "width_db": 6.0,
+     "detector": "tilt",
+     "sustain": 0.03,
+     "ceiling_db": -5.0
+    }
+   },
+   "mix": {
+    "reverb_send": 0.25
+   },
+   "engine_ver": "v3"
+  },
+  "C": {
+   "ver": "v4",
+   "engine": {
+    "cons_cap": {
+     "stop": 0.05,
+     "vstop": 0.045,
+     "aff": 0.08,
+     "fric": 0.08,
+     "vfric": 0.06,
+     "nasal": 0.07,
+     "glide": 0.06
+    },
+    "cons_cap_share": 0.4,
+    "cons_voicing_floor": {
+     "vfric": 11.0,
+     "nasal": 8.0,
+     "glide": 8.0,
+     "vstop": 16.0
+    },
+    "slow_cons_min": {
+     "stop": 0.09,
+     "aff": 0.12
+    },
+    "squeeze": {
+     "stop": "burst",
+     "aff": "burst"
+    }
+   },
+   "chain": {
+    "rider": {
+     "range_db": 4.0,
+     "strength": 0.5
+    },
+    "comp1": null,
+    "comp2": {
+     "ratio": 2.0
+    },
+    "cons": null,
+    "trans": {
+     "lo": 2000.0,
+     "amount": 0.4,
+     "max_db": 5.0
+    },
+    "lift": {
+     "db": 2.5,
+     "hf": 2500.0,
+     "floor_db": -24.0,
+     "width_db": 6.0,
+     "detector": "tilt",
+     "sustain": 0.03,
+     "ceiling_db": -5.0
+    },
+    "cons2": {
+     "replace": true,
+     "target_db": -10.0,
+     "ratio": 2.0,
+     "max_up_db": 0.0,
+     "max_down_db": 6.0,
+     "floor_db": -24.0,
+     "width_db": 6.0
+    }
+   },
+   "mix": {
+    "reverb_send": 0.15
+   },
+   "engine_ver": "v2"
+  }
+ }
+}
