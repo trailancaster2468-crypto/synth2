@@ -440,63 +440,6 @@ def _specs() -> list[SoundSpec]:
                      "kinwie, CC BY 3.0.",),
         ),
         SoundSpec(
-            id="splendid-grand-piano", kind="sfz", name="Splendid Grand Piano",
-            version="2024-05-06", publisher="AKAI (samples), SFZ mapping by kinwie",
-            homepage="https://github.com/sfzinstruments/SplendidGrandPiano",
-            description="Steinway grand in four velocity layers. FLAC samples: the sampler needs "
-                        "the optional soundfile package; the mapping uses #include, #define and "
-                        "ARIA extensions.",
-            tags=("piano", "flac"), files=("Splendid Grand Piano.sfz",),
-            presets=_presets("piano", ("Splendid Grand Piano", "Splendid Grand Piano.sfz")),
-            listing="splendid_grand_piano", size=76_861_250,
-            license="Public domain (as stated by the packager)",
-            license_file="files/README.md",
-            license_source="README.md in github.com/sfzinstruments/SplendidGrandPiano "
-                           "(commit 1c595d8)",
-            commercial_use=None,
-            commercial_use_statement="Public Domain samples by AKAI. This samples set was "
-                                     "released as public domain in early 2000 by Akai company.",
-            unclear="The statement is the packager's; no document from AKAI comes with the "
-                    "files. The repository has no licence file for the SFZ mapping; its README "
-                    "asks that a redistributed derivative says it is derived from this "
-                    "instrument.",
-            credits=("Piano: Splendid Grand Piano, samples by AKAI (public domain), SFZ mapping "
-                     "by kinwie.",),
-        ),
-        SoundSpec(
-            id="drum-machines-oramics", kind="drumkit",
-            name="Drum machines (CR-78, LinnDrum, TR-505, Rhythm King)", version="2017-03-05",
-            publisher="oramics/sampled collection (danigb); recordings by others",
-            homepage="https://github.com/oramics/sampled",
-            description="One-shot samples of four vintage drum machines: Roland CR-78, LinnDrum "
-                        "LM-2, Roland TR-505 and Maestro Rhythm King MRK-2. One folder of WAV "
-                        "files per machine, named kick, snare, hihat and so on.",
-            tags=("drums", "electronic", "percussion"), root="files/DM",
-            files=("LM-2/samples", "TR-505/samples", "CR-78/samples", "MRK-2/samples"),
-            presets=(
-                {"name": "LinnDrum LM-2", "file": "LM-2/samples", "category": "drums"},
-                {"name": "Roland TR-505", "file": "TR-505/samples", "category": "drums"},
-                {"name": "Roland CR-78", "file": "CR-78/samples", "category": "drums"},
-                {"name": "Maestro Rhythm King MRK-2", "file": "MRK-2/samples",
-                 "category": "drums"},
-            ),
-            listing="oramics_drum_machines", size=2_452_025,
-            license="Public Domain (as stated by the collection)",
-            license_file="files/DM/LM-2/README.md",
-            license_source="the README.md of each machine in github.com/oramics/sampled (commit "
-                           "84d3405), which reads \"license: Public Domain\" and names the "
-                           "source of the recordings",
-            commercial_use=None,
-            commercial_use_statement="license: Public Domain",
-            unclear="The statement is the collector's, not the recordists'. The READMEs name "
-                    "the sources (boxedear.com, machines.hyperreal.org, submodern.com, "
-                    "progsounds.com); those pages were not reachable and their terms were not "
-                    "read.",
-            credits=("Drum machine samples: oramics/sampled collection (CR-78 from boxedear.com, "
-                     "LinnDrum from machines.hyperreal.org, MRK-2 from submodern.com, TR-505 "
-                     "from progsounds.com).",),
-        ),
-        SoundSpec(
             id="voxengo-ir", kind="impulse", name="Voxengo free reverb impulse responses",
             version="IMreverbs", publisher="Voxengo (Aleksey Vaneev)",
             homepage="https://www.voxengo.com/impulses/",

@@ -123,7 +123,6 @@ not legal advice. Sizes are download sizes.
 | `musescore-general-hq` | soundfont | 274 MB (490 MB installed) | large General MIDI set | MIT | yes |
 | `fluidr3-gm` | soundfont | 135 MB | the classic General MIDI set, with a GS bank | MIT | yes |
 | `avl-drumkits` | soundfont | 152 MB | five acoustic drum and percussion kits | CC BY-SA 3.0 with an exception for produced music | yes; share-alike for sample libraries |
-| `drum-machines-oramics` | drumkit | 2.5 MB | CR-78, LinnDrum, TR-505, Rhythm King one-shots | "Public Domain" as stated by the collection | not stated by the recordists |
 | `karoryfer-growlybass` | sfz | 167 MB | electric bass | CC0 1.0 | yes |
 | `karoryfer-meatbass` | sfz | 255 MB | upright bass, plucked and bowed | CC0 1.0 | yes |
 | `karoryfer-black-and-green-guitars` | sfz | 482 MB | two clean electric guitars | CC0 1.0 | yes |
@@ -131,7 +130,6 @@ not legal advice. Sizes are download sizes.
 | `jrhodes3d` | sfz | 236 MB | Rhodes Mark I electric piano | free for music; samples CC BY-NC 4.0 | yes (music); redistribution of the samples non-commercial |
 | `greg-sullivan-e-pianos` | sfz | 21 MB | Wurlitzer EP200, CP80, Pianet T (FLAC) | CC BY 3.0 | yes |
 | `upright-piano-kw` | sfz | 33 MB | Kawai upright piano (FLAC) | CC0 1.0 | yes |
-| `splendid-grand-piano` | sfz | 77 MB | Steinway grand (FLAC) | "Public Domain" as stated by the packager | not stated by AKAI |
 | `vsco2-strings` | sfz | 755 MB | violin, viola, cello sections, solo violin, contrabass, harp | CC0 1.0 | yes |
 | `vsco2-brass` | sfz | 330 MB | trumpet, French horn, trombone, tuba | CC0 1.0 | yes |
 | `vsco2-woodwinds` | sfz | 334 MB | flute, piccolo, oboe, clarinet, bassoon | CC0 1.0 | yes |
@@ -174,12 +172,6 @@ What the publishers say, in their own words, and where it was read:
   page was not read.
 - **Upright Piano KW** (`README.md` in github.com/freepats/upright-piano-kw): "Published
   under the terms of Creative Commons CC0 public domain dedication".
-- **Splendid Grand Piano** (`README.md` in github.com/sfzinstruments/SplendidGrandPiano):
-  "This samples set was released as public domain in early 2000 by Akai company." This is
-  the packager's statement; no document from AKAI comes with the files.
-- **Drum machines** (`README.md` of each machine in github.com/oramics/sampled): "license:
-  Public Domain", with the page each recording came from. This is the collector's
-  statement; the pages of the people who made the recordings were not read.
 - **Voxengo impulse responses** (`LICENSE.txt` of the pack): "Permission is granted to
   anyone to use these impulse files royalty-free for any purpose, including commercial
   usage." and "You may not sell these impulse files or earn any direct or indirect profit
@@ -197,12 +189,10 @@ description or liner notes:
 | `musescore-general-hq` | Instruments: MuseScore General HQ soundfont 0.2.1 (MIT): Fluid R3 by Frank Wen, mono conversion by Michael Cowgill, adaptation by S. Christian Collins, temple blocks by Ethan Winer, drumline cymbals by Michael Schorsch. | for copies of the soundfont; a courtesy for music |
 | `fluidr3-gm` | Instruments: Fluid (R3) SoundFont, Copyright (c) 2000-2002, 2008 Frank Wen (MIT). | for copies of the soundfont; a courtesy for music |
 | `avl-drumkits` | Drums: AVL Drumkits by Glen MacArthur (bandshed.net/avldrumkits), CC BY-SA 3.0. | yes (attribution) |
-| `drum-machines-oramics` | Drum machine samples: oramics/sampled collection (CR-78 from boxedear.com, LinnDrum from machines.hyperreal.org, MRK-2 from submodern.com, TR-505 from progsounds.com). | not stated |
 | `karoryfer-*` | Electric bass: Growlybass / Upright bass: Meatbass / Electric guitars: Black And Green Guitars / Guitar: Shinyguitar, by Karoryfer Samples (CC0). | no, a courtesy |
 | `jrhodes3d` | Electric piano: jRhodes3d by Jeff Learman. | no for music |
 | `greg-sullivan-e-pianos` | Electric pianos: Greg Sullivan's E-Pianos (sullivang.net), SFZ mapping by kinwie, CC BY 3.0. | yes (attribution) |
 | `upright-piano-kw` | Piano: Upright Piano KW, FreePats project (CC0). | no, a courtesy |
-| `splendid-grand-piano` | Piano: Splendid Grand Piano, samples by AKAI (public domain), SFZ mapping by kinwie. | not stated |
 | `vsco2-*` | Orchestral samples: VSCO 2 Community Edition by Versilian Studios / Sam Gossner and Ivy Audio / Simon Dalzell (CC0), vis.versilstudios.net/vsco-community.html | asked for by the publisher ("Please provide credit") |
 | `voxengo-ir` | Reverb impulse responses: Voxengo (Aleksey Vaneev), voxengo.com/impulses. | no, a courtesy |
 
@@ -257,6 +247,8 @@ before using any of them; `synth2 sounds add` registers a copy you download.
 | Versilian Community Sample Library (VCSL) | github.com/sgossner/VCSL | repository exists | not examined, licence not read |
 | Sonatina Symphonic Orchestra | github.com/peastman/sso | repository exists | not examined, licence not read |
 | The Open Source Drum Kit (Real Music Media) | github.com/crabacus/the-open-source-drumkit | 794 WAV files, 630 MB; reachable | the repository states no licence, only a link to a forum thread |
+| Splendid Grand Piano (samples by AKAI, SFZ mapping by kinwie) | github.com/sfzinstruments/SplendidGrandPiano | Steinway grand, SFZ, 77 MB of FLAC; reachable, downloaded and checked | the only licence statement is the packager's ("released as public domain in early 2000 by Akai company"); no document from AKAI comes with the files |
+| Drum machines: Roland CR-78, LinnDrum LM-2, Roland TR-505, Maestro Rhythm King | github.com/oramics/sampled | one-shot WAV samples, 2.5 MB; reachable, downloaded and checked | "license: Public Domain" is the collector's statement; the pages of the people who made the recordings were not reachable |
 | TR-808 and TR-909 samples, EMT 140 plate impulses, Pearl Master Studio kit | github.com/oramics/sampled | small WAV sets; reachable | no licence stated for the 808 and 909; the plate says "Creative Commons Attibution-Any", the Pearl kit "Creative Commons Attribution 3.0", both the collector's words |
 | TR-808 samples (fluid-music/open-drums) | github.com/fluid-music/open-drums | repository exists | not examined |
 | Hydrogen drum kits | archive.ubuntu.com, package `hydrogen-drumkits` (source archive 316 MB) | the source archive is reachable | not examined, licences not read |
