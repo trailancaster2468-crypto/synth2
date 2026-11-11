@@ -1,0 +1,594 @@
+diff -ruN a/examples/select_all_invaders/SPEC.md b/examples/select_all_invaders/SPEC.md
+--- a/examples/select_all_invaders/SPEC.md	2026-11-11 12:40:52.100014671 +0000
++++ b/examples/select_all_invaders/SPEC.md	2026-11-11 12:40:52.105868418 +0000
+@@ -68,16 +68,16 @@
+ 
+ | Role | Track(s) | Voice and character |
+ |---|---|---|
+-| **AI** (lead) | `AI`, plus `AI Double` in the choruses | `nova` with the `robotic` style: the deadpan, machine-tuned idol, Pinocchio-P style. Mostly A4-E5, chorus peaks up to G5/A5 (B5 at most in the final chorus). |
+-| **ALIENS** | `Aliens` (and optionally `Aliens 2` detuned) | An uncanny character voice built from studio parameters. For example a low voice with a tiny vocal tract (`toneShift` up), robotic, fast warbling vibrato via note attrs (`vibrato_rate` 9-12 Hz), `gender` extremes. It must stay intelligible. |
+-| **HUMANS** | `Crowd` (2-3 tracks in unison: atlas, ember, aurora) | Short gang shouts and chants ("hey!", "help!", "click!"), panned wide |
++| **AI** (lead) | `AI` (only its lines), `AI Answer` (its calls in other voices' sections), `AI Adlib` (sound words, "ハイハイ", the stutter), plus `AI Double` in the choruses | `nova` with the `robotic` style: the deadpan, machine-tuned idol, Pinocchio-P style. Mostly A4-E5, chorus peaks up to G5/A5 (B5 at most in the final chorus). |
++| **ALIENS** | `Aliens` (lines and answers), `Alien Adlib` (interjections, the laugh, the stutter), `Alien Chant` and `Alien Chant 2` (the kana chants; the second voice detuned) | An uncanny character voice built from studio parameters. For example a low voice with a tiny vocal tract (`toneShift` up), robotic, fast warbling vibrato via note attrs (`vibrato_rate` 9-12 Hz), `gender` extremes. It must stay intelligible. |
++| **HUMANS** | `Crowd` (sung lines and answers) and `Crowd Shout` (the shouts), each 3 tracks in unison: atlas, ember, aurora | Short gang shouts and chants ("hey!", "help!", "click!"), panned wide |
+ | Harmony | `Harmony` (3rd above or below the AI in choruses) | `pixel` or `aurora`, -6 dB |
+ 
+ ## Files (examples/select_all_invaders/)
+ 
+ - `SPEC.md`: this file
+ - `lyrics.md`: final lyrics with role tags per line, by section
+-- `vocals.s2s`: all vocal tracks in score notation
++- `vocals.s2s`: all vocal tracks in score notation, one job per track (an ad-lib is never written inside a line)
+ - `backing.json`: the instrumental arrangement for the arranger engine
+ - `build.py`: builds the full project (vocals, backing and mix), renders it, and writes
+   `out/select_all_invaders/` (the WAV, stems and project JSON)
+diff -ruN a/examples/select_all_invaders/build.py b/examples/select_all_invaders/build.py
+--- a/examples/select_all_invaders/build.py	2026-11-11 12:40:52.100821615 +0000
++++ b/examples/select_all_invaders/build.py	2026-11-11 12:40:52.105809725 +0000
+@@ -3,8 +3,9 @@
+ The project is put together through the studio's tool layer, the way an AI producer would drive it
+ (``synth2.ai.tools.Session`` + ``call_tool``):
+ 
+-1. ``new_project`` from the score text in ``vocals.s2s`` (the four hand-written vocal tracks),
+-2. ``vocals.apply_vocal_production``: AI Double, Harmony, Crowd 2 / 3 and the aliens' fan voice,
++1. ``new_project`` from the score text in ``vocals.s2s`` (the nine hand-written vocal tracks: lines, answers,
++   ad-libs, chants and shouts each on tracks of their own),
++2. ``vocals.apply_vocal_production``: AI Double, Harmony, the crowd's doubles and the aliens' fan voice,
+ 3. ``set_backing`` with ``backing.json`` (the arranger's band), then ``set_backing(merge=true)`` for the
+    section tweaks of the mix (:data:`BAND_TWEAKS`),
+ 4. ``duplicate_track`` / ``add_notes`` / ``delete_notes`` to put section parts (the lead in the verses,
+@@ -93,30 +94,40 @@
+ # * "Aliens Bridge": the aliens' half of the bridge dialogue ("have you tried turning your planet...", "no, you
+ #   are. Respectfully.") sits 1.5 dB over their other calls, against the crushed chaos band.
+ # * "Aliens Hook": in the final chorus the aliens sing the hook two octaves under the AI; on its own
+-#   channel it supports the lead instead of competing with it. Their answers ("click!", ワレワレハ) stay
+-#   on the main Aliens channel, at full level.
++#   channel it supports the lead instead of competing with it. Their answers ("click!", ワレワレハ) are on
++#   the Alien Adlib and Alien Chant tracks, at full level.
+ # * "Crowd Hook" (and its doubles): the crowd sings the final-chorus hook an octave under the AI, and
+-#   whispers "hurry" in the breakdown; their shouts ("click!", "hey!") stay on the main crowd channels.
++#   whispers "hurry" in the breakdown; their shouts ("click!", "hey!") are on the Crowd Shout tracks.
+ # * "Harmony Final": the final chorus is harmonized throughout, so its harmony sits 2 dB lower there.
++# * "AI Adlib Bridge": the stutter before "reboot" is the lead's own word, so it sits in the centre at the
++#   bridge lead's level; the lead's other ad-libs ("click", "ハイハイ") sit left of it and lower.
++# * "Alien Adlib Verse" / "Alien Adlib Bridge": the aliens' laugh and their stutter and "ナンデ?" follow the
++#   level of the aliens' lines in those sections.
++# "seed": a new channel's default seed comes from its position in the project. The seeds here are the ones the
++# channels had when the score held four tracks, so a track added to the score does not change their takes.
+ SPLITS: list[dict] = [
+-    {"source": "AI", "name": "AI Verses", "start": 32.0, "end": 96.0, "skip_lyrics": ()},
+-    {"source": "AI", "name": "AI Verses", "start": 208.0, "end": 272.0, "skip_lyrics": ()},
+-    {"source": "AI", "name": "AI Pre", "start": 96.0, "end": 127.5, "skip_lyrics": ()},
+-    {"source": "AI", "name": "AI Pre", "start": 272.0, "end": 303.5, "skip_lyrics": ()},
+-    {"source": "AI", "name": "AI Bridge", "start": 368.0, "end": 432.0, "skip_lyrics": ()},
+-    {"source": "AI", "name": "AI Breakdown", "start": 432.0, "end": 447.25, "skip_lyrics": ()},
+-    {"source": "AI", "name": "AI Final", "start": 447.25, "end": 512.0, "skip_lyrics": ()},
+-    {"source": "Aliens", "name": "Aliens Verse", "start": 208.0, "end": 272.0, "skip_lyrics": ()},
+-    {"source": "Aliens", "name": "Aliens Bridge", "start": 368.0, "end": 416.0, "skip_lyrics": ()},
+-    {"source": "Aliens", "name": "Aliens Hook", "start": 447.0, "end": 500.0, "skip_lyrics": ("click",)},
+-    {"source": "Crowd", "name": "Crowd Hook", "start": 446.0, "end": 512.0, "skip_lyrics": ("click", "hey")},
+-    {"source": "Crowd 2", "name": "Crowd 2 Hook", "start": 446.0, "end": 512.0, "skip_lyrics": ("click", "hey")},
+-    {"source": "Crowd 3", "name": "Crowd 3 Hook", "start": 446.0, "end": 512.0, "skip_lyrics": ("click", "hey")},
+-    {"source": "Harmony", "name": "Harmony Final", "start": 447.0, "end": 512.0, "skip_lyrics": ()},
++    {"source": "AI", "name": "AI Verses", "start": 32.0, "end": 96.0, "skip_lyrics": (), "seed": 63369},
++    {"source": "AI", "name": "AI Verses", "start": 208.0, "end": 272.0, "skip_lyrics": (), "seed": 63369},
++    {"source": "AI", "name": "AI Pre", "start": 96.0, "end": 127.5, "skip_lyrics": (), "seed": 71288},
++    {"source": "AI", "name": "AI Pre", "start": 272.0, "end": 303.5, "skip_lyrics": (), "seed": 71288},
++    {"source": "AI", "name": "AI Bridge", "start": 368.0, "end": 432.0, "skip_lyrics": (), "seed": 79207},
++    {"source": "AI", "name": "AI Breakdown", "start": 432.0, "end": 447.25, "skip_lyrics": (), "seed": 87126},
++    {"source": "AI", "name": "AI Final", "start": 447.25, "end": 512.0, "skip_lyrics": (), "seed": 95045},
++    {"source": "Aliens", "name": "Aliens Verse", "start": 208.0, "end": 272.0, "skip_lyrics": (), "seed": 102964},
++    {"source": "Aliens", "name": "Aliens Bridge", "start": 368.0, "end": 416.0, "skip_lyrics": (), "seed": 110883},
++    {"source": "Aliens", "name": "Aliens Hook", "start": 447.0, "end": 501.0, "skip_lyrics": (), "seed": 118802},
++    {"source": "Crowd", "name": "Crowd Hook", "start": 446.0, "end": 512.0, "skip_lyrics": (), "seed": 126721},
++    {"source": "Crowd 2", "name": "Crowd 2 Hook", "start": 446.0, "end": 512.0, "skip_lyrics": (), "seed": 134640},
++    {"source": "Crowd 3", "name": "Crowd 3 Hook", "start": 446.0, "end": 512.0, "skip_lyrics": (), "seed": 142559},
++    {"source": "Harmony", "name": "Harmony Final", "start": 447.0, "end": 512.0, "skip_lyrics": (), "seed": 150478},
++    {"source": "AI Adlib", "name": "AI Adlib Bridge", "start": 368.0, "end": 432.0, "skip_lyrics": (), "seed": 79221},
++    {"source": "Alien Adlib", "name": "Alien Adlib Verse", "start": 208.0, "end": 272.0, "skip_lyrics": (), "seed": 102978},
++    {"source": "Alien Adlib", "name": "Alien Adlib Bridge", "start": 368.0, "end": 416.0, "skip_lyrics": (), "seed": 110897},
+ ]
+ 
+ # Vocal faders (dB), pans and reverb sends. The AI lead is the anchor at 0 dB, dead centre; everything
+-# else supports it from the sides. The aliens and the crowd carry most of the jokes in the call-and-response
++# else supports it from the sides: its calls a little right and lower, its ad-libs left, lower and drier,
++# the aliens' ad-libs outside the aliens' lines, the two chant voices left and right, the shouts widest. The aliens and the crowd carry most of the jokes in the call-and-response
+ # gaps (post-chorus, bridge, outro), so their main channels sit 2.5-5 dB higher than their supporting parts
+ # (the verse-2 dialogue, the final-chorus hook); the second, bigger alien is loud enough that its slower
+ # warble beats against the first alien in the ワレワレハ chants.
+@@ -130,17 +141,27 @@
+     "AI Double":     {"gain_db": -6.5, "pan": -0.35, "reverb_send": 0.22},
+     "Harmony":       {"gain_db": -6.5, "pan": 0.35, "reverb_send": 0.30},
+     "Harmony Final": {"gain_db": -8.0, "pan": 0.35, "reverb_send": 0.30},
++    "AI Answer":     {"gain_db": -2.0, "pan": 0.15, "reverb_send": 0.30},
++    "AI Adlib":      {"gain_db": -3.0, "pan": -0.20, "reverb_send": 0.12},
++    "AI Adlib Bridge": {"gain_db": 2.5, "pan": 0.0, "reverb_send": 0.12},
+     "Aliens":        {"gain_db": 1.5, "pan": 0.25, "reverb_send": 0.30},
+     "Aliens Verse":  {"gain_db": -1.0, "pan": 0.25, "reverb_send": 0.30},
+     "Aliens Bridge": {"gain_db": 3.0, "pan": 0.3, "reverb_send": 0.30},
+     "Aliens Hook":   {"gain_db": -4.0, "pan": 0.25, "reverb_send": 0.30},
+-    "Aliens 2":      {"gain_db": 0.5, "pan": -0.35, "reverb_send": 0.40},
++    "Alien Adlib":   {"gain_db": 1.5, "pan": 0.50, "reverb_send": 0.20},
++    "Alien Adlib Verse": {"gain_db": -1.0, "pan": 0.50, "reverb_send": 0.20},
++    "Alien Adlib Bridge": {"gain_db": 3.0, "pan": 0.50, "reverb_send": 0.20},
++    "Alien Chant":   {"gain_db": 1.5, "pan": 0.30, "reverb_send": 0.30},
++    "Alien Chant 2": {"gain_db": 0.5, "pan": -0.35, "reverb_send": 0.40},
+     "Crowd":         {"gain_db": -2.0, "pan": -0.60, "reverb_send": 0.35},
+     "Crowd 2":       {"gain_db": -2.0, "pan": 0.60, "reverb_send": 0.35},
+     "Crowd 3":       {"gain_db": -4.0, "pan": 0.25, "reverb_send": 0.35},
+     "Crowd Hook":    {"gain_db": -7.0, "pan": -0.60, "reverb_send": 0.35},
+     "Crowd 2 Hook":  {"gain_db": -7.0, "pan": 0.60, "reverb_send": 0.35},
+     "Crowd 3 Hook":  {"gain_db": -9.0, "pan": 0.25, "reverb_send": 0.35},
++    "Crowd Shout":   {"gain_db": -2.0, "pan": -0.70, "reverb_send": 0.25},
++    "Crowd Shout 2": {"gain_db": -2.0, "pan": 0.70, "reverb_send": 0.25},
++    "Crowd Shout 3": {"gain_db": -4.0, "pan": 0.30, "reverb_send": 0.25},
+ }
+ 
+ # Master / mix settings (MasterSettings fields, set with update_project). mix_overrides are keyed by
+@@ -175,6 +196,7 @@
+     "delay_feedback": 0.3,
+     "mix_overrides": {
+         "AI": LEAD_STRIP,  # (the split lead channels inherit it)
++        "AI Answer": LEAD_STRIP, "AI Adlib": {**LEAD_STRIP, "delay": 0.3},
+         "AI Breakdown": {"eq_add": LEAD_EQ, "delay": 1.4},
+         "AI Double": {"eq_add": LEAD_EQ, "delay": 0.4},
+         # delay sends (1 = default): the lead gets the full send, the gang shouts stay dry and punchy.
+@@ -183,11 +205,15 @@
+         # Harmony: the 600 Hz cut of the lead EQ (its fundamentals were part of the 500-630 Hz honk)
+         "Harmony": {"delay": 0.5, "eq_add": [["peak", 600, -3.0, 0.9]]},
+         "Aliens": {"delay": 0.6, "crest_db": 8.0, "eq_add": ALIEN_EQ},
+-        "Aliens 2": {"delay": 0.8, "eq_add": [["peak", 280, -3.0, 1.0]]},
++        "Alien Adlib": {"delay": 0.3, "crest_db": 8.0, "eq_add": ALIEN_EQ},
++        "Alien Chant": {"delay": 0.6, "crest_db": 8.0, "eq_add": ALIEN_EQ},
++        "Alien Chant 2": {"delay": 0.8, "eq_add": [["peak", 280, -3.0, 1.0]]},
+         # the final-chorus hook two octaves under the lead: out of the lead's 300 Hz body and 2.8 kHz bite
+         "Aliens Hook": {"delay": 0.3, "crest_db": 8.0, "eq_add": [["peak", 300, -2.5, 1.0], ["peak", 2800, -3.0, 1.0]]},
+         "Crowd": {"delay": 0.0, "crest_db": 12.0}, "Crowd 2": {"delay": 0.0, "crest_db": 12.0},
+         "Crowd 3": {"delay": 0.0, "crest_db": 12.0},
++        "Crowd Shout": {"delay": 0.0, "crest_db": 12.0}, "Crowd Shout 2": {"delay": 0.0, "crest_db": 12.0},
++        "Crowd Shout 3": {"delay": 0.0, "crest_db": 12.0},
+         # band balance. The snare was the brightest, hissiest element of every section (45-70 % of the master's
+         # 5-9 kHz) and the lead's main rival in the presence band: less level and top (its spectrum rose
+         # 8-10 dB from 4 to 11 kHz), and a deeper vocal-keyed 2.6 kHz carve (3 dB instead of 1.2)
+@@ -283,9 +309,10 @@
+     return out
+ 
+ 
+-def split_track(s: Session, source: str, name: str, start: float, end: float, skip_lyrics=()) -> int:
++def split_track(s: Session, source: str, name: str, start: float, end: float, skip_lyrics=(),
++                seed: int | None = None) -> int:
+     """Move the notes of ``source`` with onsets in [start, end) to a new track ``name`` (same voice,
+-    settings and curves). Returns the number of notes moved."""
++    settings and curves; ``seed`` when given). Returns the number of notes moved."""
+     src = s.project.track(source)
+     pick = lambda n: start <= n.onset < end and (n.lyric or "").lower() not in skip_lyrics  # noqa: E731
+     moved = [n for n in src.notes if pick(n)]
+@@ -299,6 +326,8 @@
+     else:
+         call_tool(s, "duplicate_track", {"track": source, "name": name})
+         dst = s.project.track(name)
++        if seed is not None:
++            dst.seed = seed
+         keep = {(n.onset, n.pitch) for n in moved}
+         call_tool(s, "delete_notes", {"track": name, "ids": [n.id for n in dst.notes
+                                                              if (n.onset, n.pitch) not in keep]})
+@@ -334,7 +363,7 @@
+             log(f"  backing {w}")
+         log(f"  band tweaks: {BAND_TWEAKS}")
+     for sp in SPLITS:
+-        moved = split_track(s, sp["source"], sp["name"], sp["start"], sp["end"], sp["skip_lyrics"])
++        moved = split_track(s, sp["source"], sp["name"], sp["start"], sp["end"], sp["skip_lyrics"], sp.get("seed"))
+         log(f"  split {moved} notes of {sp['source']} (beats {sp['start']:g}-{sp['end']:g}) to {sp['name']}")
+     names = {t.name for t in s.project.tracks}
+     for name, mix in TRACK_MIX.items():
+diff -ruN a/examples/select_all_invaders/vocals.py b/examples/select_all_invaders/vocals.py
+--- a/examples/select_all_invaders/vocals.py	2026-11-11 12:40:52.100105131 +0000
++++ b/examples/select_all_invaders/vocals.py	2026-11-11 12:40:52.105782851 +0000
+@@ -1,9 +1,11 @@
+ """Vocal production for SELECT ALL INVADERS: the derived vocal tracks and the alien "fan voice".
+ 
+ ``build.py`` loads ``vocals.s2s`` into a :class:`synth2.ai.tools.Session` and then calls
+-:func:`apply_vocal_production`. The score holds the parts that were written by hand (``AI``, ``Aliens``,
+-``Aliens 2`` and ``Crowd``). This module derives the rest from them, so a change to the lead melody
+-carries over to its double and harmony:
++:func:`apply_vocal_production`. The score holds the parts that were written by hand, one job per track:
++the lines (``AI``, ``Aliens``, ``Crowd``), the lead's calls in other voices' sections (``AI Answer``), the
++ad-libs (``AI Adlib``, ``Alien Adlib``: sound words, interjections, the laugh, the stutters), the chants
++(``Alien Chant``, ``Alien Chant 2``) and the gang shouts (``Crowd Shout``). This module derives the rest
++from them, so a change to the lead melody carries over to its double and harmony:
+ 
+ 1. **AI Double** (``duplicate_track``): the lead in the three choruses, including their pickups.
+    It is nova again, +8 cents, 0.03 beats (~11 ms) late, -5 dB, panned left (-0.35), with a slightly
+@@ -16,17 +18,18 @@
+    lines (1, 3, 5, 7) and the tag line 8. The deadpan joke lines 2, 4 and 6 stay solo. The final
+    chorus is harmonized throughout, except its line 6 ("Funny... neither can you"): the pronoun-arc
+    payoff stays as bare as in choruses 1 and 2 (the band also stops for "can").
+-3. **Crowd 2 / Crowd 3** (``duplicate_track``): the gang shouts in unison.
++3. **Crowd 2 / Crowd 3** and **Crowd Shout 2 / Crowd Shout 3** (``duplicate_track``): the gang in unison,
++   for the crowd's lines and for its shouts.
+    - Crowd 2 is ember at the same pitch: -9 cents, +0.035 beats late, panned right (+0.6).
+    - Crowd 3 is aurora an octave up: +6 cents, +0.018 beats late, panned +0.25, at -7 dB.
+    - The written Crowd track (atlas) sits on the left (-0.6).
+    - The breakdown's whispered "hurry" is not doubled an octave up (an octave-up whisper is only hiss).
+ 4. **Fan voice**: the classic ワレワレハ ウチュウジン ダ effect, a voice speaking into a fan. Over every
+-   kana note of ``Aliens`` and ``Aliens 2``, an 11 Hz loudness chop (0 / -9 dB) is added to the
++   kana note of ``Alien Chant`` and ``Alien Chant 2``, an 11 Hz loudness chop (0 / -9 dB) is added to the
+    loudness curve. It goes on top of any curve already there, such as the outro fade. The pitch warble
+-   on those notes also deepens from the track's +-0.4 semitones (+-0.7 on Aliens 2) to +-0.6 semitones,
+-   unless the note sets its own ``vibrato_depth``. The English alien lines keep the lighter warble so
+-   they stay intelligible.
++   on those notes also deepens from the track's +-0.4 semitones (+-0.7 on Alien Chant 2) to +-0.6
++   semitones, unless the note sets its own ``vibrato_depth``. The English alien lines keep the lighter
++   warble so they stay intelligible.
+ 
+ Run it on its own to print what it does::
+ 
+@@ -72,6 +75,10 @@
+ 
+ CHORUS_STARTS = (128.0, 304.0, 448.0)  # bars 33, 77, 113
+ FINAL_CHORUS = (447.5, 512.0)
++# Seeds of the derived tracks. A new track's default seed comes from its position in the project; these are the
++# seeds AI Double, Crowd 2 and Crowd 3 had when the score held four tracks, so their takes stay what they were.
++SEEDS = {"AI Double": 4 * 7919 + 17, "Crowd 2": 6 * 7919 + 17, "Crowd 3": 7 * 7919 + 17,
++         "Crowd Shout 2": 6 * 7919 + 31, "Crowd Shout 3": 7 * 7919 + 31}
+ FINAL_LINE_6 = (488.0, 495.5)  # bars 123-124, "Funny... neither can you": left without harmony
+ WHISPER = (446.0, 447.4)       # bar 112, the crowd's whispered "hurry"
+ # chorus-relative beat ranges harmonized in choruses 1 and 2: hook lines 1, 3, 5, 7 (with pickups) and line 8
+@@ -189,9 +196,9 @@
+ 
+ 
+ def apply_vocal_production(session: Session) -> dict:
+-    """Add AI Double, Harmony, Crowd 2 and Crowd 3, and the aliens' fan chop. Safe to call twice."""
++    """Add AI Double, Harmony, the crowd's doubles (lines and shouts) and the aliens' fan chop. Safe to call twice."""
+     p = session.project
+-    derived = ("AI Double", "Harmony", "Crowd 2", "Crowd 3")
++    derived = ("AI Double", "Harmony", "Crowd 2", "Crowd 3", "Crowd Shout 2", "Crowd Shout 3")
+     _remove(session, derived)
+     lead, crowd = _track(session, "AI"), _track(session, "Crowd")
+ 
+@@ -204,6 +211,7 @@
+     dbl.curves = {k: copy.deepcopy(v) for k, v in lead.curves.items() if k == "tension"}
+     dbl.voice_params["formant_scale"] = 1.19
+     dbl.reverb_send = 0.22
++    dbl.seed = SEEDS["AI Double"]
+ 
+     # 2) Harmony: chord-aware close harmony under the lead
+     sel = [n for n in lead.notes if _in(n.onset, harmony_ranges())]
+@@ -225,12 +233,23 @@
+                                            "gain_db": -7.0, "pan": 0.25})
+     c3 = _track(session, "Crowd 3")
+     c3.notes = [n for n in c3.notes if not WHISPER[0] <= n.onset < WHISPER[1]]
++    shout = _track(session, "Crowd Shout")
++    call_tool(session, "duplicate_track", {"track": shout.id, "name": "Crowd Shout 2", "voice": "ember",
++                                           "detune_cents": -9.0, "delay_beats": 0.035, "gain_db": -5.0,
++                                           "pan": 0.6})
++    call_tool(session, "duplicate_track", {"track": shout.id, "name": "Crowd Shout 3", "voice": "aurora",
++                                           "transpose": 12, "detune_cents": 6.0, "delay_beats": 0.018,
++                                           "gain_db": -7.0, "pan": 0.25})
++
++    for name in ("Crowd 2", "Crowd 3", "Crowd Shout 2", "Crowd Shout 3"):
++        _track(session, name).seed = SEEDS[name]
+ 
+     # 4) fan voice on the alien chants
+-    chops = {name: _fan_chop(_track(session, name)) for name in ("Aliens", "Aliens 2")}
++    chops = {name: _fan_chop(_track(session, name)) for name in ("Alien Chant", "Alien Chant 2")}
+ 
+     # tidy mixer order
+-    order = ["AI", "AI Double", "Harmony", "Aliens", "Aliens 2", "Crowd", "Crowd 2", "Crowd 3"]
++    order = ["AI", "AI Double", "Harmony", "AI Answer", "AI Adlib", "Aliens", "Alien Adlib", "Alien Chant",
++             "Alien Chant 2", "Crowd", "Crowd 2", "Crowd 3", "Crowd Shout", "Crowd Shout 2", "Crowd Shout 3"]
+     p.tracks.sort(key=lambda t: order.index(t.name) if t.name in order else len(order))
+     return {
+         "tracks": [{"name": t.name, "voice": t.voice, "notes": len(t.notes), "gain_db": t.gain_db, "pan": t.pan}
+diff -ruN a/examples/select_all_invaders/vocals.s2s b/examples/select_all_invaders/vocals.s2s
+--- a/examples/select_all_invaders/vocals.s2s	2026-11-11 12:40:52.100087560 +0000
++++ b/examples/select_all_invaders/vocals.s2s	2026-11-11 12:40:52.105710076 +0000
+@@ -2,8 +2,12 @@
+ # Synth2 score notation: notes are PITCH DURATION LYRIC; '+' = next syllable of the word, '[ph ph]' = phonemes.
+ # Every section is placed with '@ <beat>' (bar k starts at beat 4*(k-1)); '|' marks bar lines.
+ # Chords and sections: SPEC.md. Lyrics: lyrics.md.
+-# examples/select_all_invaders/vocals.py derives the AI Double, the Harmony, Crowd 2 / Crowd 3
+-# and the aliens' "fan voice" chop from these tracks (apply_vocal_production).
++# One job per track: the lines (AI, Aliens, Crowd), the lead's calls in other voices' sections (AI Answer),
++# the ad-libs (AI Adlib, Alien Adlib: sound words, interjections, the laugh, the stutters), the chants
++# (Alien Chant, Alien Chant 2) and the gang shouts (Crowd Shout). An ad-lib is never written inside a line:
++# it would be sung as part of it (glided into, breathed onto, its repeats all different).
++# examples/select_all_invaders/vocals.py derives the AI Double, the Harmony, Crowd 2 / Crowd 3,
++# Crowd Shout 2 / Crowd Shout 3 and the aliens' "fan voice" chop from these tracks (apply_vocal_production).
+ title: Select All Invaders
+ tempo: 168
+ time: 4/4
+@@ -12,6 +16,7 @@
+ # =====================================================================================================
+ # AI: the deadpan, machine-tuned idol (Pinocchio-P style). Mostly A4-E5, chorus peaks F5 (G5 / B5 in
+ # the final chorus). Patter on 8ths/16ths, repeated notes, octave jumps on the joke words.
++# Only the lead's lines: its calls are on AI Answer, its sound words and stutters on AI Adlib.
+ # =====================================================================================================
+ track: AI voice=nova style=robotic lang=en gain=0 pan=0 reverb=0.22
+ 
+@@ -19,8 +24,6 @@
+ @ 8      # bar 3 (F) - bar 4 (G)
+ A4 e booting  A4 e +  F5 q up  r s  C5 e. that's  A4 q spam{consonant_length=0.55}  |
+ D5 e good  D5 q morning  B4 e +  D5 e valued  D5 e +  D5 e users  B4 e +  |
+-@ 31     # bar 8, beat 4 (E): after the second chant
+-B4 q blocked  |
+ 
+ # ----- Verse 1 (bars 9-24: (Am Am/G F E) x4)
+ @ 32     # bar 9
+@@ -64,11 +67,7 @@
+ D5 q. +  F5 q. all  E5 e invaders  E5 q +  B4 q +  r e  r q  B4 e have  D5 e a  |
+ E5 q nice  C5 e apocalypse  E5 q +  D5 e +  A4 q+h +  r h  |
+ 
+-# ----- Post-chorus (bars 49-52: Am F G E): the crowd clicks, everyone calls the buttons
+-@ 194    # bar 49, beat 3
+-C5 e accept  C5 e +{consonant_length=0.55}  E5 q all  |
+-@ 204    # bar 52 (E): everybody clicks
+-B4 e click  B4 e click  B4 e click  B4 e click  B4 e try  B4 e again  E5 q +  |
++# ----- Post-chorus (bars 49-52: Am F G E): the crowd clicks; the lead only calls (AI Answer) and clicks (AI Adlib)
+ 
+ # ----- Verse 2 (bars 53-68): dialogue, the aliens sing bars 53-54, 57-58, 61-62, 65-66
+ @ 215    # bar 54, beat 4: instant reply
+@@ -86,8 +85,8 @@
+ B4 e how  B4 e my  B4 e valued  B4 e +  B4 e users  G#4 e +  B4 q are  |
+ 
+ # ----- Pre-chorus 2 (bars 69-76: Dm E Am G | F E F G)
+-@ 280    # bar 71 (Am) - bar 72 (G): snooze button
+-E5 e ハ  C5 e イ  E5 e ハ  C5 e イ  r e  A4 e remind  C5 e +  C5 e me  |
++@ 282.5  # bar 71, beat 3.5 (Am) - bar 72 (G): snooze button, after the "ハイハイ" of AI Adlib
++A4 e remind  C5 e +  C5 e me  |
+ D5 e tomorrow  B4 e +  G4 q +  r h  |
+ @ 296    # bar 75 (F) - bar 76 (G): stop on beat 3
+ C5 e human  F5 q +  r e  A4 q sure  r e  C5 e then  |
+@@ -105,8 +104,8 @@
+ E5 q nice  C5 e apocalypse  E5 q +  D5 e +  A4 q+h +  r h  |
+ 
+ # ----- Bridge (bars 93-108: Bb Am Bb Am | Gm A Dm E | F F#dim G G#dim | Am Bb B E): chaos
+-@ 368    # bar 93 (Bb): stutter
+-D5 e [r iy]  D5 e [r iy]  D5 e [r iy]  D5 e reboot  F5 q +  r q  |
++@ 369.5  # bar 93, beat 2.5 (Bb): the word after the stutter (AI Adlib)
++D5 e reboot  F5 q +  r q  |
+ @ 376    # bar 95 (Bb) - bar 96 (Am): the aliens read the IT script solo; the AI cuts in on the noun
+ #          ("your SPACESHIP" over their "your planet") and finishes the line with them
+ r h  r e  D5 e your  Bb4 e spaceship{velocity=1.15}  D5 e +{consonant_length=0.55}  |
+@@ -153,20 +152,39 @@
+ curve: tension 447:0 447.5:0.12 511.5:0.12 512:0 (linear)
+ 
+ # =====================================================================================================
++# AI ANSWER: the lead's short calls in other voices' sections (the aliens' intro, the crowd's
++# post-chorus). Each is a phrase of its own, a little right of the lead and under it.
++# =====================================================================================================
++track: AI Answer voice=nova style=robotic lang=en seed=31 gain=-2 pan=0.15 reverb=0.3
++@ 31     # bar 8, beat 4 (E): after the second chant
++B4 q blocked  |
++@ 194    # bar 49, beat 3
++C5 e accept  C5 e +{consonant_length=0.55}  E5 q all  |
++@ 206    # bar 52, beat 3 (E): after everybody's clicks
++B4 e try  B4 e again  E5 q +  |
++
++# =====================================================================================================
++# AI ADLIB: the lead's sound words, interjections and stutters. Every word is one hit: a repeated
++# hit is the same sound each time. Left of the lead, lower and drier.
++# =====================================================================================================
++track: AI Adlib voice=nova style=robotic lang=en seed=43 gain=-3 pan=-0.2 reverb=0.12
++@ 204    # bar 52 (E): everybody clicks
++B4 e click  B4 e click  B4 e click  B4 e click
++@ 280    # bar 71 (Am): "yeah, yeah" (the snooze button)
++E5 e ハイ  C5 e +  E5 e ハイ  C5 e +
++@ 368    # bar 93 (Bb): stutter before "reboot"
++D5 e [r iy]  D5 e [r iy]  D5 e [r iy]
++
++# =====================================================================================================
+ # ALIENS: a deep voice with a tiny vocal tract (basso, formants +24%), machine-flat pitch with an
+ # 11 Hz +-0.4 semitone warble on every note (vibrato on from the first frame, also on short notes).
+-# vocals.py adds the "speaking into a fan" effect on the kana chants: an 11 Hz loudness chop and a
+-# deeper +-0.6 semitone warble.
++# Only the aliens' lines and answers: their ad-libs are on Alien Adlib, the kana chants on Alien Chant.
+ # =====================================================================================================
+-track: Aliens voice=basso style=robotic lang=en gain=-1 pan=0.25 reverb=0.3 voice.robotic=0.95 voice.formant_scale=1.12 voice.jitter=0.0008 voice.shimmer_db=0.1 voice.vibrato_rate=11 voice.vibrato_depth=0.4 style.vibrato_depth=1 style.vibrato_min_note=0.05 style.vibrato_start=0 style.vibrato_fade=0.03
++track: Aliens voice=basso style=robotic lang=en seed=7936 gain=-1 pan=0.25 reverb=0.3 voice.robotic=0.95 voice.formant_scale=1.12 voice.jitter=0.0008 voice.shimmer_db=0.1 voice.vibrato_rate=11 voice.vibrato_depth=0.4 style.vibrato_depth=1 style.vibrato_min_note=0.05 style.vibrato_start=0 style.vibrato_fade=0.03
+ 
+ # ----- Intro
+ @ 1      # bar 1, beat 2 (Am): prize-winner spam
+ A2 e congratulations  C3 e +  E3 e +  A3 e +  G3 e +  A3 q. earth  E3 e you  E3 e have  E3 e been  E3 e selected  A3 e +  E3 e +  |
+-@ 16     # bar 5 (Am Am): the chant
+-E3 q ワ  E3 e レ  E3 e ワ  E3 e レ  E3 q. ワ  |  E3 e ウ  E3 e チュ  E3 q ウ  E3 e ジ  E3 e ン  A2 q ダ  |
+-# bar 7 (F) - bar 8 (E): stuttered chant
+-C3 e ワ  C3 e ワ  F3 e ワ  F3 e レ  A3 e ワ  A3 e レ  C4 q ワ  |  B3 e ウ  B3 e チュ  G#3 e ウ  G#3 e ジ  E3 e ン  E3 e ダ  r q  |
+ 
+ # ----- Verse 1
+ @ 78     # bar 20, beat 3 (E)
+@@ -179,12 +197,10 @@
+ B2 e the  E3 e mothership  G#3 e +  B3 e +  |
+ 
+ # ----- Post-chorus
+-@ 198    # bar 50, beat 3 (F)
+-A3 q ouch  F3 e thank  F3 e you  |
++@ 199    # bar 50, beat 4 (F): after the "ouch" of Alien Adlib
++F3 e thank  F3 e you  |
+ @ 202    # bar 51, beat 3 (G)
+ D3 e did  D3 e we  G3 q pass  |
+-@ 204    # bar 52 (E): everybody clicks
+-E3 e click  E3 e click  E3 e click  E3 e click
+ 
+ # ----- Verse 2: the aliens out-bureaucrat the AI
+ @ 208    # bar 53 (Am) - bar 54 (Am/G)
+@@ -198,30 +214,24 @@
+ r e  E3 e now  E3 e we're  E3 e out  E3 e of  A2 q. space  |
+ @ 256    # bar 65 - bar 66
+ E3 e so  E3 e we'll  A3 e blend  A3 e in  E3 e we  E3 e wear  C3 e pajamas  E3 e +  |
+-E3 e +  E3 e and  E3 e we  G3 e type  A3 e ha  A3 e ha  A3 e ha  r e  |
++E3 e +  E3 e and  E3 e we  G3 e type  r h  |
+ 
+ # ----- Pre-chorus 2
+ @ 272    # bar 69 (Dm) - bar 70 (E)
+ D3 e your  F3 e planet  F3 e +  F3 e will  A3 e restart  A3 q +  A3 e in  |  B3 q five  G#3 e minutes  E3 e +  r h  |
+ @ 286    # bar 72, beat 3 (G)
+ B3 e four  G3 e minutes  D3 q +  |
+-@ 288    # bar 73 (F) - bar 74 (E): "we are... human!"
+-C3 e ワ  C3 e レ  C3 e ワ  C3 e レ  F3 q ワ  r q  |  E3 e ニ  E3 e ン  G#3 e ゲ  G#3 e ン  B3 q ダ  r q  |
+ 
+ # ----- Chorus 2
+ @ 341.5  # bar 86 (G), beat 2.5: answering "Prove you're not a robot!"
+ G3 e we  G3 e are  G3 e not  G3 s a  G3 s robot  D3 e +  |
+ 
+ # ----- Bridge
+-@ 371    # bar 93, beat 4 (Bb) - bar 94 (Am): stuttered reply-all
+-D3 e [r iy]  D3 e [r iy]  |  E3 e [r iy]  E3 e reply  A3 e +  A3 q. all  r q  |
++@ 372.5  # bar 94, beat 1.5 (Am): the words after the stutter (Alien Adlib)
++E3 e reply  A3 e +  A3 q. all  r q  |
+ @ 376    # bar 95 (Bb) - bar 96 (Am): two octaves under the AI, at the same time
+ D3 e have  D3 e you  D3 e tried  F3 e turning{consonant_length=0.55}  D3 e +  D3 e your  Bb2 e planet  D3 e +{consonant_length=0.55}  |
+ C3 e off  C3 e and  E3 e on  D3 e again  C3 q +  r q  |
+-@ 395    # bar 99, beat 4 (Dm)
+-F3 s ナ  F3 s ン  A3 e デ  |
+-@ 399    # bar 100, beat 4 (E)
+-G#3 s ナ  G#3 s ン  B3 e デ  |
+ @ 403    # bar 101, beat 4 (F) - bar 102 (F#dim)
+ A2 e no  A2 e you  |  C3 e are  r e  C3 e respectfully  Eb3 e +  C3 e +  A2 e +  r q  |
+ @ 408    # bar 103 (G) - bar 104 (G#dim): unison with the AI
+@@ -232,23 +242,56 @@
+ @ 447.5
+ B2 e select  |  D3 q. +  G3 q. all  F#3 e invaders  E3 q +  C#3 q +
+ @ 463.5
+-B2 e select  |  D3 q. +  G3 q. all  F#3 e invaders  E3 q +  C#3 q +  r e  r e  E3 e click
++B2 e select  |  D3 q. +  G3 q. all  F#3 e invaders  E3 q +  C#3 q +
+ @ 480    # bar 121
+ D3 q prove  D3 e you're  G3 q. not  F#3 e a  E3 q robot  C#3 q +
+ @ 495.5
+ B2 e select  |  E3 q. +  B3 q. all  G3 e invaders  F#3 q +  C#3 e +
+-# bar 126, beat 2: "ワレワレハ!"
+-C#3 s ワ  C#3 s レ  F#3 s ワ  F#3 s レ  A#3 q ワ
+ 
+ # ----- Outro
+ @ 520    # bar 131 (A) - bar 132 (F#)
+ E3 e one  A2 q star  r e  C#3 e would  E3 e invade  E3 e +  E3 e again  |  C#3 e +  r e  C#3 e unsubscribe  C#3 e +  F#3 q +  r q  |
+ 
+ # =====================================================================================================
+-# ALIENS 2: a second, bigger alien an octave above (atlas with a large vocal tract and a slower 8.5 Hz
+-# warble, so the two warbles beat against each other). Only on the ワレワレハ chants.
++# ALIEN ADLIB: the aliens' interjections, sound words, laugh and stutter. Every word is one hit: a
++# repeated hit is the same sound each time. Further right than the aliens' lines.
++# =====================================================================================================
++track: Alien Adlib voice=basso style=robotic lang=en seed=7950 gain=-1 pan=0.5 reverb=0.2 voice.robotic=0.95 voice.formant_scale=1.12 voice.jitter=0.0008 voice.shimmer_db=0.1 voice.vibrato_rate=11 voice.vibrato_depth=0.4 style.vibrato_depth=1 style.vibrato_min_note=0.05 style.vibrato_start=0 style.vibrato_fade=0.03
++@ 198    # bar 50, beat 3 (F)
++A3 q ouch
++@ 204    # bar 52 (E): everybody clicks
++E3 e click  E3 e click  E3 e click  E3 e click
++@ 262    # bar 66, beat 3: the typed laugh
++A3 e ha  A3 e ha  A3 e ha
++@ 371    # bar 93, beat 4 (Bb) - bar 94 (Am): stutter before "reply all"
++D3 e [r iy]  D3 e [r iy]  |  E3 e [r iy]
++@ 395    # bar 99, beat 4 (Dm): "why?"
++F3 s ナンデ  F3 s +  A3 e +  |
++@ 399    # bar 100, beat 4 (E)
++G#3 s ナンデ  G#3 s +  B3 e +  |
++@ 470.5  # bar 118, beat 3.5: the aliens click too
++E3 e click
++
++# =====================================================================================================
++# ALIEN CHANT: the ワレワレハ ウチュウジン ダ chants of the first alien, one even syllable per note.
++# vocals.py adds the "speaking into a fan" effect on the kana chants: an 11 Hz loudness chop and a
++# deeper +-0.6 semitone warble.
++# =====================================================================================================
++track: Alien Chant voice=basso style=robotic lang=en seed=7964 gain=-1 pan=0.3 reverb=0.3 voice.robotic=0.95 voice.formant_scale=1.12 voice.jitter=0.0008 voice.shimmer_db=0.1 voice.vibrato_rate=11 voice.vibrato_depth=0.4 style.vibrato_depth=1 style.vibrato_min_note=0.05 style.vibrato_start=0 style.vibrato_fade=0.03
++@ 16     # bar 5 (Am Am): the chant
++E3 q ワ  E3 e レ  E3 e ワ  E3 e レ  E3 q. ワ  |  E3 e ウ  E3 e チュ  E3 q ウ  E3 e ジ  E3 e ン  A2 q ダ  |
++# bar 7 (F) - bar 8 (E): stuttered chant
++C3 e ワ  C3 e ワ  F3 e ワ  F3 e レ  A3 e ワ  A3 e レ  C4 q ワ  |  B3 e ウ  B3 e チュ  G#3 e ウ  G#3 e ジ  E3 e ン  E3 e ダ  r q  |
++@ 288    # bar 73 (F) - bar 74 (E): "we are... human!"
++C3 e ワ  C3 e レ  C3 e ワ  C3 e レ  F3 q ワ  r q  |  E3 e ニ  E3 e ン  G#3 e ゲ  G#3 e ン  B3 q ダ  r q  |
++@ 501    # bar 126, beat 2: "ワレワレハ!"
++C#3 s ワ  C#3 s レ  F#3 s ワ  F#3 s レ  A#3 q ワ
++
++# =====================================================================================================
++# ALIEN CHANT 2: a second, bigger alien an octave above (atlas with a large vocal tract and a slower
++# 8.5 Hz warble, so the two warbles beat against each other). Only on the ワレワレハ chants.
+ # =====================================================================================================
+-track: Aliens 2 voice=atlas style=robotic lang=en gain=-7 pan=-0.35 reverb=0.4 voice.robotic=1 voice.formant_scale=0.85 voice.vibrato_rate=8.5 voice.vibrato_depth=0.7 style.vibrato_depth=1 style.vibrato_min_note=0.05 style.vibrato_start=0 style.vibrato_fade=0.03
++track: Alien Chant 2 voice=atlas style=robotic lang=en seed=15855 gain=-7 pan=-0.35 reverb=0.4 voice.robotic=1 voice.formant_scale=0.85 voice.vibrato_rate=8.5 voice.vibrato_depth=0.7 style.vibrato_depth=1 style.vibrato_min_note=0.05 style.vibrato_start=0 style.vibrato_fade=0.03
+ @ 16     # bar 5 - bar 8
+ E4 q ワ  E4 e レ  E4 e ワ  E4 e レ  E4 q. ワ  |  E4 e ウ  E4 e チュ  E4 q ウ  E4 e ジ  E4 e ン  A3 q ダ  |
+ C4 e ワ  C4 e ワ  F4 e ワ  F4 e レ  A4 e ワ  A4 e レ  C5 q ワ  |  B4 e ウ  B4 e チュ  G#4 e ウ  G#4 e ジ  E4 e ン  E4 e ダ  r q  |
+@@ -261,14 +304,41 @@
+ curve: loudness 521.9:0 522:-3 528:-20 (linear)
+ 
+ # =====================================================================================================
+-# CROWD (HUMANS): pitched gang shouts, written for atlas. vocals.py adds the unison doubles
++# CROWD (HUMANS): the gang's sung lines and answers, written for atlas. vocals.py adds the unison doubles
+ # Crowd 2 (ember, right) and Crowd 3 (aurora, an octave up). Pitches stay at or below G#4 for ember.
++# The shouts ("click!", "hey!", "help!") are on Crowd Shout.
+ # =====================================================================================================
+-track: Crowd voice=atlas style=rock lang=en gain=-5 pan=-0.6 reverb=0.35 voice.tension=0.45 style.timing_humanize=0.006 style.auto_breath=0
+-@ 47.5   # bar 12, beat 4.5 (E)
+-E4 q help
++track: Crowd voice=atlas style=rock lang=en seed=23774 gain=-5 pan=-0.6 reverb=0.35 voice.tension=0.45 style.timing_humanize=0.006 style.auto_breath=0
+ @ 110    # bar 28, beat 3 (G): echo of the 404
+ D4 e four  G3 e oh{overshoot=0,transition=0.03}  D4 q four  |
++# bridge
++@ 392    # bar 99 (Dm) - bar 100 (E)
++A3 e who  A3 e is  A3 e the  D4 e invader  D4 e +  A3 e +  r q  |  B3 e who  B3 e is  B3 e the  E4 e invader  E4 e +  B3 e +  r q  |
++# breakdown: whispered (see the voicing curve)
++@ 446.5  # bar 112, beat 3.5
++E4 e hurry  E4 e +
++# final chorus: the crowd sings the hook an octave under the AI (its calls are on Crowd Shout)
++@ 447.5
++B3 e select  |  D4 q. +  G4 q. all  F#4 e invaders  E4 q +  C#4 q +
++@ 463.5
++B3 e select  |  D4 q. +  G4 q. all  F#4 e invaders  E4 q +  C#4 q +
++@ 480    # bar 121
++D4 q prove  D4 e you're  G4 q. not  F#4 e a  E4 q robot  C#4 q +
++@ 495.5
++B3 e select  |  E4 q. +  G4 q. all  E4 e invaders  F#4 q +  C#4 q +
++# outro
++@ 518.5  # bar 130, beat 3.5 (G): in the gap after "apocalypse"
++D4 e five  G4 q stars{consonant_length=0.55}  |
++curve: voicing 446.4:1 446.5:0 447.4:0 447.5:1 (linear)
++curve: loudness 446.4:0 446.5:-4 447.4:-4 447.5:0 (linear)
++
++# =====================================================================================================
++# CROWD SHOUT: the gang's shouts and sound words, one hit each ("Click!" is the same shout every
++# time). vocals.py adds the doubles Crowd Shout 2 and Crowd Shout 3 like the crowd's.
++# =====================================================================================================
++track: Crowd Shout voice=atlas style=rock lang=en seed=23788 gain=-5 pan=-0.7 reverb=0.25 voice.tension=0.45 style.timing_humanize=0.006 style.auto_breath=0
++@ 47.5   # bar 12, beat 4.5 (E)
++E4 q help
+ # chorus 1 calls
+ @ 134    # bar 34 (G)
+ D4 e. click
+@@ -304,27 +374,17 @@
+ @ 358    # bar 90 (E)
+ E4 e. click
+ # bridge
+-@ 392    # bar 99 (Dm) - bar 100 (E)
+-A3 e who  A3 e is  A3 e the  D4 e invader  D4 e +  A3 e +  r q  |  B3 e who  B3 e is  B3 e the  E4 e invader  E4 e +  B3 e +  r q  |
+ @ 420    # bar 106 (Bb)
+ D4 q here  D4 q here  F4 e over  F4 e +  F4 q here  |
+-# breakdown: whispered (see the voicing curve)
+-@ 446.5  # bar 112, beat 3.5
+-E4 e hurry  E4 e +
+-# final chorus: the crowd sings the hook an octave under the AI, plus the calls
+-@ 447.5
+-B3 e select  |  D4 q. +  G4 q. all  F#4 e invaders  E4 q +  C#4 q +  r e  E4 e. click
++# final chorus calls
++@ 454    # bar 114, beat 3
++E4 e. click
+ @ 462    # bar 116 (Bm)
+ F#4 e. click
+-@ 463.5
+-B3 e select  |  D4 q. +  G4 q. all  F#4 e invaders  E4 q +  C#4 q +  r e  E4 e. click
+-@ 480    # bar 121
+-D4 q prove  D4 e you're  G4 q. not  F#4 e a  E4 q robot  C#4 q +  r e  E4 e. hey
+-@ 495.5
+-B3 e select  |  E4 q. +  G4 q. all  E4 e invaders  F#4 q +  C#4 q +  r e  F#4 e. click
+-# outro
+-@ 518.5  # bar 130, beat 3.5 (G): in the gap after "apocalypse"
+-D4 e five  G4 q stars{consonant_length=0.55}  |
++@ 470    # bar 118, beat 3
++E4 e. click
++@ 486    # bar 122, beat 3
++E4 e. hey
++@ 502    # bar 126, beat 3
++F#4 e. click
+ curve: pitchDelta 318.05:0 318.2:0 318.7:350 318.8:0 (linear)
+-curve: voicing 446.4:1 446.5:0 447.4:0 447.5:1 (linear)
+-curve: loudness 446.4:0 446.5:-4 447.4:-4 447.5:0 (linear)
