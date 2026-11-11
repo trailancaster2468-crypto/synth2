@@ -16,7 +16,7 @@ from . import dsp, gm, soundbank
 from .arrangement import Compiled, Instrument, compile_arrangement
 from .drums import GROUP_OF, drum_params, one_shot, synth_voice, velocity_gain
 from .fx import apply_mute, process, render_fx
-from .sampler import loudness, midi_velocity, note_groups, render_note
+from .sampler import midi_velocity, note_groups, render_note
 from .synth import Hit, hit_length, preset_params, render_hit
 
 PRE_ROLL = 4.0  # s rendered before t0 so reverb/delay tails and long notes are right at the window start
@@ -512,6 +512,9 @@ def _render_sampled(comp, name, inst, sr, S0, N, pre, n, b2s, beat_s, dirs=()) -
                     y = render_note(sinst, key, vq, round(h.gate * 200) / 200.0, sr, pitch=key + cents / 100.0,
                                     seq=seq, rand=u1 * 0.999, regions=regs, bend=bend,
                                     cut=None if h.cut is None else round(h.cut * 200) / 200.0)
+                    if inst.eq and len(y):  # per note, as the synth does: the same in any render window
+                        curve = inst.eq
+                        y = dsp.fft_filter(y, sr, lambda f: dsp.eq_curve(f, curve))
                     y.setflags(write=False)
                     cache[ck] = y
                 at = s + int(round(i * abs(h.strum) * sr))
@@ -526,7 +529,7 @@ def _render_sampled(comp, name, inst, sr, S0, N, pre, n, b2s, beat_s, dirs=()) -
                 break
     if buf is None:
         return None
-    buf = _post(inst, buf, comp, sr, S0, b2s, beat_s, eq=True)
+    buf = _post(inst, buf, comp, sr, S0, b2s, beat_s)
     audio = _finish(buf, pre, n)
     if not _audible(audio):
         return None

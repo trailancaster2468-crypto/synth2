@@ -15,7 +15,11 @@ Public API::
     problems = validate_arrangement(arrangement)     # ["error: ...", "warning: ..."]
 
 Everything is pure numpy: band-limited wavetable oscillators, STFT-domain time-varying
-resonant filters, synthesised drums and FX.
+resonant filters, synthesised drums and FX.  Any instrument can play samples instead
+(``"sound"``: an installed sound set, a SoundFont 2 or SFZ file, a folder of WAV files);
+see :mod:`.sampler`, :mod:`.soundbank` and "Sampled sounds" in ``FORMAT.md``.
+``sound_report(project)`` says which sounds play on this machine and ``list_sounds()``
+what is installed.
 """
 from __future__ import annotations
 

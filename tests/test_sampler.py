@@ -1155,3 +1155,52 @@ def test_sfz_set_presets_with_defines_controllers_and_keyswitch(tmp_path, monkey
     arr = band({"g": {"preset": "gtr_clean", "sound": {"set": "blend", "preset": "Bright", "cc": {"100": 127},
                                                         "keyswitch": "C1"}}}, LINE, {"g": "line"})
     assert validate_arrangement(arr) == [] and stems_of(arr)["g"].sound == "blend: Bright"
+
+
+# --------------------------------------------------------------------------------------- tools
+
+def test_list_sounds_tool(font, tmp_path, monkeypatch):
+    from synth2.ai.tools import Session, ToolError, call_tool
+
+    monkeypatch.setenv("SYNTH2_SOUNDS", str(tmp_path))
+    s = Session(Project.new("t", bpm=BPM))
+    empty = call_tool(s, "list_sounds", {})
+    assert empty["sets"] == [] and "synth2 sounds install" in empty["hint"]
+    install_set(tmp_path, "tiny-gm", "soundfont", ["tiny.sf2"], src=font.path, credits=["Tiny GM (CC0)"], tags=["gm"],
+                license="CC0-1.0")
+    sets = call_tool(s, "list_sounds", {})["sets"]
+    assert sets == [{"id": "tiny-gm", "kind": "soundfont", "name": "tiny-gm", "tags": ["gm"], "license": "CC0-1.0",
+                     "credits": ["Tiny GM (CC0)"], "presets": 2, "kits": ["Test Kit"]}]
+    one = call_tool(s, "list_sounds", {"set": "tiny-gm", "search": "bass"})["set"]
+    assert one["presets"] == [{"preset": "0:33", "name": "Sine Bass"}] and one["presets_matching"] == 1
+    assert one["kits"] == []
+    with pytest.raises(ToolError, match="no installed sound set"):
+        call_tool(s, "list_sounds", {"set": "nope"})
+    arr = band({"bass": {"preset": "bass_pick", "sound": "tiny-gm"}, "keys": {"preset": "piano", "sound": "absent"}},
+               LINE, {"bass": "line", "keys": "line"})
+    r = call_tool(s, "set_backing", {"arrangement": arr})
+    assert r["ok"] and any("'absent' is not installed" in w for w in r["warnings"])
+    assert r["summary"]["instruments"]["bass"]["sound"] == ["tiny-gm"]
+    used = call_tool(s, "list_sounds", {})["backing"]
+    assert used["instruments"]["bass"]["label"] == "tiny-gm: 0:33 Sine Bass" and used["credits"] == ["Tiny GM (CC0)"]
+    assert len(used["warnings"]) == 1 and "keys: sound set 'absent' is not installed" in used["warnings"][0]
+    summary = call_tool(s, "get_backing", {})["backing"]
+    assert any("absent" in m and "plays instead" in m for m in summary["problems"])
+    assert "sampled_sounds" in call_tool(s, "get_backing", {"detail": "reference"})
+
+
+def test_any_window_of_a_sampled_part_is_the_same_audio(font):
+    arr = band({"keys": {"preset": "piano", "sound": {"path": font.path, "preset": "Sine Piano", "release": 0.6},
+                         "eq": {"bands": [{"hz": 800, "db": -4, "q": 1}], "low_cut": 80}, "humanize": {"timing_ms": 3}},
+                "drums": {"type": "drums", "sound": {"path": font.path, "gate": 0.5}, "eq": {"high_cut": 6000}}},
+               dict(LINE, **BEAT), {"keys": "line", "drums": "beat"}, bars=4)
+    p = project(arr)
+    full = {st.name: st.audio for st in render_backing(p, SR, 0.0, 8.0)}
+    part = {st.name: st.audio for st in render_backing(p, SR, 2.7, 5.3)}
+    a = int(round(2.7 * SR))
+    assert set(part) == set(full) and "keys" in full
+    n = len(part["keys"])
+    assert np.allclose(part["keys"], full["keys"][a:a + n], atol=1e-6)  # the EQ of a pitched part is per note
+    for name in full:  # a kit's EQ runs over the rendered buffer: the same but for its last milliseconds
+        m = n - int(0.05 * SR)
+        assert np.allclose(part[name][:m], full[name][a:a + m], atol=2e-5), name

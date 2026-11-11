@@ -281,3 +281,30 @@ def test_backing_tools():
     assert s.project.backing is None
     call_tool(s, "undo", {})
     assert s.project.backing == ex
+
+
+# ------------------------------------------------------------------------------ synthesised band stays as it is
+
+# stem -> (RMS, peak) of the example arrangement at 22.05 kHz over its four bars and half a second, as rendered
+# before sampled instruments existed (an arrangement that names no sampled sound must not change)
+SYNTH_REFERENCE = {
+    "drums kick": (0.114649, 0.42678), "drums snare": (0.095925, 0.84815), "drums hats": (0.043789, 0.85192),
+    "drums cymbals": (0.017699, 0.33524), "bass": (0.138944, 0.54375), "gtr": (0.083929, 0.33618),
+    "lead": (0.094139, 0.42177), "arp": (0.038747, 0.30073), "fx": (0.010672, 0.30145),
+}
+
+
+def test_synthesised_band_is_unchanged(example_render):
+    p, _t1, stems = example_render
+    assert [st.name for st in stems] == list(SYNTH_REFERENCE)
+    for st in stems:
+        rms = float(np.sqrt(np.mean(st.audio.astype(np.float64) ** 2)))
+        peak = float(np.abs(st.audio).max())
+        assert rms == pytest.approx(SYNTH_REFERENCE[st.name][0], rel=2e-4), st.name
+        assert peak == pytest.approx(SYNTH_REFERENCE[st.name][1], rel=2e-4), st.name
+        assert st.sound == "" and st.warnings == () and st.credits == ()
+    kicks = kick_times(p)
+    assert len(kicks) == 12 and float(kicks.sum()) == pytest.approx(31.251025, abs=1e-5)
+    assert arranger.sound_report(p) == {
+        "instruments": {name: {"type": spec.get("type", "synth"), "sound": None, "plays": "synth"}
+                        for name, spec in p.backing["instruments"].items()}, "warnings": [], "credits": []}

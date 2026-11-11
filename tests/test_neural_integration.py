@@ -132,9 +132,10 @@ def test_full_render_length_report_and_credits(full):
     assert rep["engine"] == "neural" and rep["bank"] and rep["notes"] == len(tr.notes)
     assert rep["credits"] and rep["credits"] == neural.credits(rep["bank"])
     assert rep["neural"]["phrases"] == 2 and rep["neural"]["steps"] == 5 and rep["neural"]["failed"] == 0
-    # the rest between the phrases is silent and the notes are not
-    assert np.abs(audio[int(3.66 * SR):int(3.72 * SR)]).max() < 1e-4
-    assert np.sqrt(np.mean(audio[int(0.2 * SR):int(3.0 * SR)] ** 2)) > 0.005
+    # the rest between the phrases holds a breath, far under the notes
+    rms = lambda a, b: float(np.sqrt(np.mean(audio[int(a * SR):int(b * SR)].astype(np.float64) ** 2)))
+    assert rms(0.2, 3.0) > 0.005 and 1e-5 < rms(3.62, 3.72) < 0.25 * rms(0.2, 3.0)
+    assert sum(ph["phones"].count("AP") for ph in rep["neural"]["alignment"]) == 2 and rep["neural"]["dial"] == "crisp"
 
 
 def test_partial_render_equals_the_full_render(full):
@@ -254,9 +255,11 @@ def test_the_cache_serves_nothing_stale_after_an_edit(cached, monkeypatch, befor
 
 
 def test_level_and_loudness_changes_reuse_the_cached_phrases(warm, cached):
-    base, t1 = warm[1], 3.7  # the first phrase
+    base, t1 = warm[1], 3.3  # the first phrase
     quiet, rep = sing(t1=t1, edit=lambda p, tr: tr.voice_params.update({"neural.level_db": -6.0}))
-    assert rep["neural"]["cached"] == 1 and np.allclose(quiet, base[:len(quiet)] * 10 ** (-6 / 20), atol=1e-6)
+    level = backend().track_preset(twinkle()[1]).level_db  # the voice's own level, which the parameter replaces
+    assert rep["neural"]["cached"] == 1
+    assert np.allclose(quiet, base[:len(quiet)] * 10 ** ((-6.0 - level) / 20), atol=1e-6)
 
     def ride(p, tr):
         tr.curve("loudness").add(0.0, 0.0)
@@ -289,7 +292,7 @@ def test_breaths_and_the_dial_change_what_is_sung(monkeypatch):
     assert len(breaths) == 3  # before each line and in the rest inside the first
     f = info["frame_s"]
     rms = lambda x, a, b: float(np.sqrt(np.mean(np.asarray(x[int(a * SR):int(b * SR)], np.float64) ** 2)))
-    start, n = breaths[1]
+    start, n = breaths[2]  # the breath before the second line: nothing sounds there without it
     a, b = start * f + 0.03, (start + n) * f - 0.03
     assert 1e-4 < rms(crisp, a, b) < 0.5 * rms(crisp, 0.3, 1.5)  # a breath: audible, well under the notes
     dry, rep = sing(text=LINES, edit=lambda p, tr: tr.voice_params.update({"neural.breaths": 0}))
@@ -325,7 +328,8 @@ def test_a_lead_goes_through_its_chain_in_the_mix():
     assert strip["role"] == "lead" and strip["dial"] == "crisp" and strip["chain"]["rider"]["max_up_db"] >= 0
     assert "role" not in plain.report["mix"]["vocal_strips"]["Lead"]
     assert lead.report["tracks"][0]["role"] == "lead" and plain.report["tracks"][0]["role"] == ""
-    assert len(lead.audio) == len(plain.audio) and not np.array_equal(lead.audio, plain.audio)
+    n = min(len(lead.audio), len(plain.audio))
+    assert n > 3 * SR and not np.array_equal(lead.audio[:n], plain.audio[:n])
     assert np.isfinite(lead.audio).all() and np.abs(lead.mono()).max() > 0.01
 
 

@@ -509,26 +509,6 @@ def match_voice_level(inst: SampleInstrument, key: int, voice: str, params: dict
     return _geomean([ref / got]) if ref > 0 and got > 0 else 1.0
 
 
-def match_kit_level(inst: SampleInstrument, kit_params: dict, gate: float = DRUM_GATE) -> float:
-    """The gain that makes a sampled kit as loud as the synthesised kit: kick, snare and
-    closed hat are compared, the kit's own balance between its drums is kept."""
-    from .drums import drum_params, one_shot, velocity_gain
-
-    keys = set(inst.keys())
-    ratios = []
-    for voice in ("kick", "snare", "hat"):
-        key = next((k for k in gm.drum_keys(voice) if k in keys), None)
-        if key is None:
-            continue
-        params = drum_params(voice, (kit_params or {}).get(voice))
-        shot = one_shot(voice, params, _REF_VELOCITY, 0, _REF_SR)
-        ref = loudness(shot, _REF_SR) * velocity_gain(_REF_VELOCITY) * float(params.get("level", 1.0))
-        got = loudness(render_note(inst, key, midi_velocity(_REF_VELOCITY), gate, _REF_SR), _REF_SR)
-        if ref > 0 and got > 0:
-            ratios.append(ref / got)
-    return _geomean(ratios)
-
-
 # ------------------------------------------------------------------------------------ resolve
 
 def resolve(layer: dict, *, drums: bool = False, synth_preset: str | None = None, kit: str | None = None,

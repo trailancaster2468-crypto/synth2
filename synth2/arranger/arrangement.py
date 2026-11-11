@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from ..timing import note_to_midi, parse_duration
 from . import gm, soundbank, theory
-from .drums import ALL_VOICES, DRUM_DEFAULTS, DRUM_VOICES, canonical_voice
+from .drums import ALL_VOICES, DRUM_DEFAULTS, canonical_voice
 from .fx import FX_SOUNDS, PROCESS_EFFECTS
 from .synth import PRESETS, SYNTH_DEFAULTS
 
