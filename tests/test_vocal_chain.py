@@ -241,6 +241,11 @@ def test_a_noted_role_is_used_only_for_the_audio_it_was_noted_for():
     assert vc.noted_role("t1", x) is None
     vc.note_role("t3", np.zeros(1000, np.float32), "lead")
     assert vc.noted_role("t3", np.zeros(1000)) is None  # silence proves nothing
+    late = np.concatenate([np.zeros(3 * len(x), np.float32), x])  # a track that only sings at the end
+    vc.note_role("t4", late, "crowd")
+    assert vc.noted_role("t4", np.concatenate([late, np.zeros(100)]))["role"] == "crowd"
+    assert vc.noted_role("t4", np.concatenate([np.zeros(3 * len(x)), other])) is None
+    assert set(vc.noted_role("t4", late)) == {"role", "dial", "copy_of"}
 
 
 def _mix(sources, **master):

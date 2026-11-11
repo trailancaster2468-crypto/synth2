@@ -587,9 +587,13 @@ _NOTED_MAX = 512
 _lock = threading.Lock()
 
 
-def _probe(audio) -> tuple[int, float]:
-    m = len(audio) // 2
-    return m, float(np.abs(np.asarray(audio[:m], np.float64)).sum())
+def _probes(audio, ends=None) -> list[tuple[int, float]]:
+    """``(end, sum of |audio[:end]|)`` at ends that close in on the length of ``audio`` (a
+    half, three quarters, ..., all of it), or at the ``ends`` given."""
+    n = len(audio)
+    if ends is None:
+        ends = sorted({n - (n >> k) for k in range(1, 9)} | {n})
+    return [(m, float(np.abs(np.asarray(audio[:m], np.float64)).sum())) for m in ends if 0 < m <= n]
 
 
 def note_role(key: str, audio, role: str, dial: str = DEFAULT_DIAL, copy_of: str | None = None) -> None:
@@ -598,20 +602,23 @@ def note_role(key: str, audio, role: str, dial: str = DEFAULT_DIAL, copy_of: str
     with _lock:
         _NOTED.pop(key, None)
         if parse_role(role)[0]:
-            m, total = _probe(audio)
-            _NOTED[key] = {"role": parse_role(role)[0], "dial": dial, "copy_of": copy_of, "m": m, "sum": total}
+            _NOTED[key] = {"role": parse_role(role)[0], "dial": dial, "copy_of": copy_of, "probes": _probes(audio)}
             while len(_NOTED) > _NOTED_MAX:
                 _NOTED.popitem(last=False)
 
 
 def noted_role(key: str, audio) -> dict | None:
-    """The note left for track ``key`` when ``audio`` starts with the samples it was left for."""
+    """The note left for track ``key`` when ``audio`` starts with the samples it was left for:
+    some stretch from the start that is not silent has the same sum. (The mixer's copy may be
+    longer, and faded over its last moments in a region render.)"""
     with _lock:
         hit = _NOTED.get(key)
-    if hit is None or len(audio) < hit["m"] or hit["m"] == 0:
+    if hit is None:
         return None
-    total = float(np.abs(np.asarray(audio[:hit["m"]], np.float64)).sum())
-    return dict(hit) if total == hit["sum"] and total > 0 else None
+    mine = dict(_probes(audio, [m for m, _ in hit["probes"]]))
+    if not any(total > 0 and mine.get(m) == total for m, total in hit["probes"]):
+        return None
+    return {k: v for k, v in hit.items() if k != "probes"}
 
 
 def mix_roles(sources, sr: int) -> dict[str, dict]:

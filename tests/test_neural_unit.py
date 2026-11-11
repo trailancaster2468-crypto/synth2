@@ -1337,18 +1337,19 @@ def test_a_double_is_the_leads_take_over_its_own_notes(fake):
     lead.role, double.role = "double:Double", "double:Lead"  # two tracks doubling each other: one of them sings
     _, rep = sing(p, double, t1=t1)
     assert rep["neural"]["pitch"] == "copy"
-    assert vocal_chain.noted_role(lead.id, take) is None or True
 
 
 def test_render_project_gives_the_tracks_with_a_role_their_chain(fake):
     from synth2.engine.renderer import render_project
 
-    p = parse_score(DUET)
+    # a lead, its double, and a crowd that only sings in the last bar
+    p = parse_score(DUET + "track: Crowd voice=atlas style=flat lang=en role=crowd\nr w | r h  C3 h more\n")
     res = render_project(p, engine="neural")
     strips = res.report["mix"]["vocal_strips"]
     assert strips["Lead"]["role"] == "lead" and strips["Lead"]["dial"] == "crisp" and "lift" in strips["Lead"]["chain"]
     assert strips["Double"]["role"] == "double" and strips["Double"]["adt"]["delay"] == 0.018
-    assert [t["role"] for t in res.report["tracks"]] == ["lead", "double"]
+    assert strips["Crowd"]["role"] == "crowd" and strips["Crowd"]["duck_db"] == 3.0
+    assert [t["role"] for t in res.report["tracks"]] == ["lead", "double", "crowd"]
     # the same project sung by the formant engine, or without roles, is mixed as before
     formant = render_project(p, engine="formant")
     assert all("role" not in s for s in formant.report["mix"].get("vocal_strips", {}).values())
