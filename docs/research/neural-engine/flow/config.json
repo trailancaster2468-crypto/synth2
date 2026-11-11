@@ -1,0 +1,38 @@
+{
+ "about": "Lead settings of the flow study (F1). `before` = the second demo's lead (demo3/runs/q5_final); `flow` = the options added on top. Keyword arguments of flow/dsinfer.py render_track_ds; song 5 semitones lower (transpose).",
+ "transpose": -5,
+ "before": {
+  "slow_note": 0.25,
+  "voicing_floor": 6.0,
+  "pitch_source": "bank",
+  "vowel_breath_off": -3.0,
+  "detune": 7.0
+ },
+ "flow": {
+  "cons_cap": {
+   "stop": 0.035,
+   "vstop": 0.035,
+   "aff": 0.06,
+   "fric": 0.05,
+   "vfric": 0.05,
+   "nasal": 0.06,
+   "glide": 0.05
+  },
+  "cons_cap_keep": 0.5,
+  "onset_keep": true,
+  "cons_voicing_floor": {
+   "vfric": 8.0,
+   "nasal": 8.0,
+   "glide": 8.0,
+   "vstop": 11.0
+  },
+  "breath": {
+   "min_gap": 0.12,
+   "fill": 0.45,
+   "length": 0.3,
+   "min_len": 0.1,
+   "breathiness": -44.0,
+   "first": true
+  }
+ }
+}

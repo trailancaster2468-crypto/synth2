@@ -1,0 +1,38 @@
+# SELECT ALL INVADERS - verse 1, relaxed version (AI track, bars 9-24, starts at beat 32; written key A minor,
+# chords (Am Am/G F E) x4). Nothing shorter than an eighth; a quarter-note breath before every line except
+# line 6, which runs on from line 5; the long notes sit on open vowels (lawn, on, sky, bye, wall, all, face, race).
+# Notes only (synth2.score.parse_notes): build4.py puts them in place of the written verse.
+#
+#   Three in the morning, saucer on the lawn
+#   Eight billion users: "what is going on?"     (HUMANS: Help!)
+#   Mothership: a message from the sky
+#   Filed under spam, unread. Goodbye.
+#   They knocked. I made a cookie wall:
+#   "Reject all" is still accept all             (ALIENS: Cookies? Delicious.)
+#   Ninety thousand pop-ups in their face
+#   Meant for emails, not to save your race
+#
+# bar 9 (Am) - bar 10 (Am/G)
+A4 q br  A4 q three  A4 e in  A4 e the  C5 q morning  |
+A4 e +  E5 q saucer  D5 e +  C5 e on  B4 e the  A4 q lawn  |
+# bar 11 (F) - bar 12 (E): the crowd's "Help!" falls on the last eighth of bar 12
+C5 q br  C5 e eight  C5 e billion  A4 e +  C5 q users  A4 e +  |
+B4 e what  B4 e is  D5 q going  D5 e +  E5 q on  r e  |
+# bar 13 (Am) - bar 14 (Am/G)
+C5 q br  C5 q mothership  A4 e +  C5 q +  D5 e a  |
+E5 q message  D5 e +  C5 e from  B4 e the  E5 q. sky  |
+# bar 15 (F) - bar 16 (E)
+C5 q br  C5 q filed  C5 e under  C5 e +  F5 q spam  |
+B4 e unread  D5 q +  E5 e goodbye  B4 q. +  r e  |
+# bar 17 (Am) - bar 18 (Am/G): lines 5 and 6 in one breath
+C5 q br  C5 e they  C5 q knocked  B4 e I  C5 e made  C5 e a  |
+E5 q cookie  D5 e +  C5 h wall  C5 e reject  |
+# bar 19 (F) - bar 20 (E): the fine print, deadpan on one note; the aliens answer in the second half of bar 20
+C5 q +  C5 q all  C5 e is  C5 e still  C5 e accept  C5 e +  |
+B4 h all  r h  |
+# bar 21 (Am) - bar 22 (Am/G)
+E5 q br  E5 q ninety  E5 e +  E5 q thousand  D5 e +  |
+C5 q pop  C5 e ups  C5 e in  D5 e their  E5 q. face  |
+# bar 23 (F) - bar 24 (E)
+C5 q br  C5 q meant  A4 e for  F5 q emails  C5 e +  |
+B4 e not  B4 e to  E5 q save  D5 e your  E5 q. race  |
