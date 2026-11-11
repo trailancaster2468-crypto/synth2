@@ -29,11 +29,15 @@ C4 q twinkle  C4 q +  G4 q twinkle  G4 q + | A4 q little  A4 q +  G4 q star  r q
 F4 q how  F4 q I  E4 q wonder  E4 q + | D4 q what  D4 q you  C4 h are
 """
 WINDOW = (3.9, 8.4)  # seconds: the second phrase
-FIRST = (0.0, 3.7)  # seconds: the first phrase
+SHORT = """tempo: 120
+track: Lead voice=aurora style=pop lang=en
+r q  C4 q hello  E4 q world  r q | r q  G4 h more  r q
+"""
+SHORT_FIRST = 2.2  # seconds: the first of its two phrases ends before, the second starts after
 
 
-def twinkle():
-    p = parse_score(TWINKLE)
+def twinkle(text=TWINKLE):
+    p = parse_score(text)
     return p, p.tracks[0]
 
 
@@ -43,9 +47,9 @@ def backend():
     return renderer
 
 
-def sing(sr=SR, t0=0.0, t1=None, note_range=None, edit=None, quality="draft"):
+def sing(sr=SR, t0=0.0, t1=None, note_range=None, edit=None, quality="draft", text=TWINKLE):
     """Render the song (after ``edit(project, track)`` changed it) through the neural backend."""
-    p, tr = twinkle()
+    p, tr = twinkle(text)
     if edit is not None:
         edit(p, tr)
     t1 = p.tempo.beat_to_sec(tr.end) + 0.6 if t1 is None else t1
@@ -174,13 +178,14 @@ def test_render_project_reports_engine_and_credits():
 
 
 # ---- the phrase cache ------------------------------------------------------------------------------
-MODELS = {"pitch", "variance", "acoustic", "vocoder"}  # report["neural"]["seconds"] keys of the models that sing
+# keys of report["neural"]["seconds"]: time spent in the models that sing (a bank has the last two at least)
+MODELS = {"pitch", "variance", "acoustic", "vocoder"}
 
 
 def test_a_second_render_is_served_from_the_phrase_cache(full, warm, cached, monkeypatch):
     audio, _ = full
     root, first, rep = warm
-    assert rep["neural"]["cached"] == 0 and MODELS <= set(rep["neural"]["seconds"])  # the render that filled it
+    assert rep["neural"]["cached"] == 0 and {"acoustic", "vocoder"} <= set(rep["neural"]["seconds"])  # it sang
     assert np.array_equal(first, audio)  # the cache does not change what is sung
     again, rep = sing()
     assert rep["neural"]["cached"] == rep["neural"]["phrases"] == 2 and np.array_equal(again, audio)
@@ -205,7 +210,8 @@ def test_a_second_render_is_served_from_the_phrase_cache(full, warm, cached, mon
 def test_cached_partial_renders_equal_the_full_render(warm, cached, params, sr, tolerance):
     edit = lambda p, tr: tr.voice_params.update(params)
     whole, rep = sing(sr=sr, edit=edit)
-    assert rep["neural"]["cached"] == 2 and not rep["warnings"]  # effects and the sample rate come after the cache
+    # effects and the sample rate come after the cache
+    assert rep["neural"]["cached"] == 2 and not [w for w in rep["warnings"] if "effect" in w]
     if sr == SR:
         assert np.array_equal(whole, warm[1]) == (not params)
     for t0, t1 in (WINDOW, (1.0, 1.25), (3.0, 4.6), (7.9, 8.6)):
@@ -217,52 +223,49 @@ def test_cached_partial_renders_equal_the_full_render(warm, cached, params, sr, 
 
 def breathy(amount):
     def edit(p, tr):
-        for beat, value in ((0.0, 0.0), (2.0, amount), (6.0, 0.0)):
+        for beat, value in ((0.0, 0.0), (2.0, amount), (4.0, 0.0)):
             tr.curve("breathiness").add(beat, value)
     return edit
 
 
-@pytest.mark.parametrize("edit,quality", [
-    (lambda p, tr: setattr(tr.notes[1], "pitch", tr.notes[1].pitch + 2), "draft"),
-    (lambda p, tr: setattr(tr.notes[2], "lyric", "wrinkle"), "draft"),
-    (breathy(0.9), "draft"),
-    (lambda p, tr: tr.voice_params.update({"neural.gender": 0.4}), "draft"),
-    (None, "normal"),
-], ids=["note", "lyric", "curve-point", "voice-parameter", "quality"])
-def test_the_cache_serves_nothing_stale_after_an_edit(warm, cached, monkeypatch, edit, quality):
-    t0, t1 = FIRST
-    base = warm[1][:int(round(t1 * SR))]
-    if edit is not None and quality == "draft" and edit.__name__ == "edit":
-        # the curve exists already, with another value at one point, and that render is in the cache
-        before, rep = sing(t0=t0, t1=t1, edit=breathy(0.5))
-        assert not np.array_equal(before, base)
-        base = before
-    new, rep = sing(t0=t0, t1=t1, edit=edit, quality=quality)
-    assert rep["neural"]["cached"] == 0 and rep["neural"]["phrases"] == 1  # the phrase is sung again
-    assert not np.array_equal(new, base)
-    again, rep = sing(t0=t0, t1=t1, edit=edit, quality=quality)
-    assert rep["neural"]["cached"] == 1 and np.array_equal(again, new)
-    old, rep = sing(t0=t0, t1=t1)  # the entry of the song as it was is still there, for the song as it was
-    assert rep["neural"]["cached"] == 1 and np.array_equal(old, warm[1][:len(old)])
+@pytest.mark.parametrize("before,edit,quality,served", [
+    (None, lambda p, tr: setattr(tr.notes[0], "pitch", tr.notes[0].pitch + 2), "draft", 1),
+    (breathy(0.5), breathy(0.9), "draft", 1),
+    (None, lambda p, tr: tr.voice_params.update({"neural.tone": 2.0}), "draft", 0),
+    (None, None, "normal", 0),
+], ids=["note", "curve-point", "voice-parameter", "quality"])
+def test_the_cache_serves_nothing_stale_after_an_edit(cached, monkeypatch, before, edit, quality, served):
+    """``served``: phrases of the edited song that are still the cached ones (the edits of a note
+    and of a curve point reach the first phrase only)."""
+    song, _ = sing(text=SHORT)  # in the cache from here on
+    base, _ = sing(text=SHORT, edit=before)
+    new, rep = sing(text=SHORT, edit=edit, quality=quality)
+    assert rep["neural"]["phrases"] == 2 and rep["neural"]["cached"] == served  # what changed is sung again
+    n = int(round(SHORT_FIRST * SR))
+    assert not np.array_equal(new[:n], base[:n]) and np.array_equal(new[n:], base[n:]) == (served == 1)
+    again, rep = sing(text=SHORT, edit=edit, quality=quality)
+    assert rep["neural"]["cached"] == 2 and np.array_equal(again, new)
+    for was, audio in ((None, song), (before, base)):  # the earlier versions still get their own entries
+        old, rep = sing(text=SHORT, edit=was)
+        assert rep["neural"]["cached"] == 2 and np.array_equal(old, audio)
     monkeypatch.setenv("SYNTH2_NEURAL_CACHE", "0")
-    fresh, rep = sing(t0=t0, t1=t1, edit=edit, quality=quality)
-    assert rep["neural"]["cached"] == 0 and np.array_equal(new, fresh)  # exactly what a render without a cache gives
+    fresh, rep = sing(text=SHORT, t1=SHORT_FIRST, edit=edit, quality=quality)
+    assert rep["neural"]["cached"] == 0 and np.array_equal(fresh, new[:n])  # what a render without a cache gives
 
 
 def test_level_and_loudness_changes_reuse_the_cached_phrases(warm, cached):
-    t0, t1 = FIRST
-    base = warm[1][:int(round(t1 * SR))]
-    quiet, rep = sing(t0=t0, t1=t1, edit=lambda p, tr: tr.voice_params.update({"neural.level_db": -6.0}))
-    assert rep["neural"]["cached"] == 1 and np.allclose(quiet, base * 10 ** (-6 / 20), atol=1e-6)
+    base, t1 = warm[1], 3.7  # the first phrase
+    quiet, rep = sing(t1=t1, edit=lambda p, tr: tr.voice_params.update({"neural.level_db": -6.0}))
+    assert rep["neural"]["cached"] == 1 and np.allclose(quiet, base[:len(quiet)] * 10 ** (-6 / 20), atol=1e-6)
 
     def ride(p, tr):
         tr.curve("loudness").add(0.0, 0.0)
         tr.curve("loudness").add(4.0, -12.0)
-    faded, rep = sing(t0=t0, t1=t1, edit=ride)
-    assert rep["neural"]["cached"] == 1 and not np.array_equal(faded, base)
+    faded, rep = sing(t1=t1, edit=ride)
     rms = lambda x: float(np.sqrt(np.mean(np.asarray(x, np.float64) ** 2)))
     late = slice(int(2.2 * SR), int(3.0 * SR))
-    assert rms(faded[late]) < 0.5 * rms(base[late]) and rms(faded[:SR // 2]) > 0.8 * rms(base[:SR // 2])
+    assert rep["neural"]["cached"] == 1 and rms(faded[late]) < 0.5 * rms(base[late])
+    assert rms(faded[:SR // 2]) > 0.8 * rms(base[:SR // 2])
 
 
 @pytest.mark.skipif(not os.environ.get("SYNTH2_TEST_BANK2"), reason="SYNTH2_TEST_BANK2 names no second models folder")

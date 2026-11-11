@@ -924,9 +924,18 @@ def test_phrase_cache_key_changes_with_every_setting(fake, monkeypatch):
         first_key(env={"SYNTH2_NEURAL_STEPS": "9"}),
         first_key(quality="draft"),
     ]
+    point = lambda name, value: lambda p, tr: tr.curve(name).add(0.5, value)
+    variants += [first_key(point(name, value)) for name, value in (
+        ("pitchDelta", 30.0), ("breathiness", 0.4), ("breathiness", 0.5), ("voicing", 0.6), ("gender", 0.3),
+        ("toneShift", 50.0), ("vibratoEnv", 0.2))]
     assert base not in variants and len(set(variants)) == len(variants)
-    # level and effects are applied after the cache: they do not change the key
-    assert base == first_key(lambda p, tr: tr.voice_params.update({"neural.level_db": -3.0}))
+    # level, loudness, effects and (for a bank without a tension input) tension are applied after the cache:
+    # they do not change the key
+    for same in (lambda p, tr: tr.voice_params.update({"neural.level_db": -3.0, "neural.fx.alien": 1.0}),
+                 point("loudness", -3.0), point("tension", 0.5)):
+        assert base == first_key(same)
+    # two ways to the same model input are one entry: a constant toneShift curve and the tone parameter
+    assert first_key(point("toneShift", 100.0)) == variants[1]
 
 
 def test_phrase_cache_serves_repeats_without_running_the_models(fake, monkeypatch):
