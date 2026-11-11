@@ -17,18 +17,16 @@ the full render.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import os
-import sys
 import threading
-import types
 from collections import OrderedDict
 
 import numpy as np
 
 from . import align as al
-from . import models
+from . import cache as phrase_cache
+from . import fx, models, resample
+from .cache import stable_hash
 from .engine import ENGINE_VERSION, Options, PhraseInput, Runner, Timer, reproducible, steps_for, synth_phrase
 from .phonemes import PhonemeMap
 from .pitch import PITCH_STEPS, BankPitch, default_expr, default_vibrato
@@ -95,52 +93,6 @@ def _comfort_range(model) -> tuple[float, float]:
         return COMFORT_RANGE
 
 
-def _cache_module():
-    try:
-        from . import cache
-    except ImportError:
-        return None
-    return cache
-
-
-def _fx_module():
-    try:
-        from . import fx
-    except ImportError:
-        return None
-    return fx
-
-
-def _canon(v, h) -> None:
-    if isinstance(v, np.ndarray):
-        h.update(f"a{v.dtype.str}{v.shape}".encode())
-        h.update(np.ascontiguousarray(v).tobytes())
-    elif isinstance(v, (list, tuple)):
-        h.update(f"l{len(v)}".encode())
-        for x in v:
-            _canon(x, h)
-    elif isinstance(v, dict):
-        h.update(f"d{len(v)}".encode())
-        for k in sorted(v):
-            _canon(str(k), h)
-            _canon(v[k], h)
-    elif isinstance(v, (np.generic,)):
-        _canon(v.item(), h)
-    else:
-        h.update(json.dumps([type(v).__name__, repr(v) if isinstance(v, float) else v], default=str).encode())
-
-
-def stable_hash(*parts) -> str:
-    """sha256 over a canonical encoding of nested values and numpy arrays (``cache.stable_hash``
-    when the cache module is there, the same idea without it)."""
-    cache = _cache_module()
-    if cache is not None:
-        return cache.stable_hash(*parts)
-    h = hashlib.sha256()
-    _canon(list(parts), h)
-    return h.hexdigest()
-
-
 def window_span(t0: float, t1: float, sr: int, bank_sr: int, pre_roll: float = 0.0) -> tuple[int, int, int, int]:
     """``(out_start, n_out, buf_start, buf_end)``: the project samples of ``[t0, t1)`` and the
     span of bank-rate samples (absolute indices) they are made from, with the resampler's
@@ -150,8 +102,6 @@ def window_span(t0: float, t1: float, sr: int, bank_sr: int, pre_roll: float = 0
     if sr == bank_sr:
         lo, hi = out_start, out_start + n_out
     else:
-        from . import resample
-
         m = int(resample.margin(bank_sr, sr)) + 2
         lo = (out_start * bank_sr) // sr - m
         hi = -((-(out_start + n_out) * bank_sr) // sr) + m
@@ -253,18 +203,15 @@ class NeuralBackend:
         from ..project import CURVE_SPECS
 
         frame, bsr, hop = bank.frame, bank.sample_rate, bank.hop
-        fxm = _fx_module()
-        fx_spec = preset.fx_spec()
-        if fx_spec and fxm is None:
-            warnings.append("character effects are not available in this build; the voice is rendered without them")
-            fx_spec = []
-        for item in list(fx_spec):
+        fx_spec = []
+        for item in preset.fx_spec():
             try:
-                fxm.parse_fx(item)
+                fx.parse_fx(item)
             except ValueError as exc:
                 warnings.append(f"effect {item.split(':')[0]!r} ignored: {exc}")
-                fx_spec.remove(item)
-        pre_roll = float(fxm.fx_tail(fx_spec)) if fx_spec else 0.0
+            else:
+                fx_spec.append(item)
+        pre_roll = float(fx.fx_tail(fx_spec)) if fx_spec else 0.0
         out_start, n_out, buf0, buf1 = window_span(t0, t1, sr, bsr, pre_roll)
 
         # the track's frame grid and everything that is a function of time on it
@@ -325,8 +272,7 @@ class NeuralBackend:
         blend = bank.blend({m: w for m, w in weights.items() if m in bank.modes})
         ident = [ENGINE_VERSION, bank.identity(), [list(b) for b in blend] if blend else None, opts.key(),
                  "seeded" if seeded else "shared"]
-        cachem = _cache_module()
-        cache = cachem.default_cache() if cachem is not None and cachem.enabled() else None
+        cache = phrase_cache.default_cache() if phrase_cache.enabled() else None
         pm = PhonemeMap(bank.has)
         timer = Timer()
         shared = Runner(bank, None, blend, timer)
@@ -371,12 +317,10 @@ class NeuralBackend:
             ts = (buf0 + np.arange(len(buf))) / bsr
             buf = (buf * 10.0 ** (np.interp(ts, t, gain_db) / 20.0)).astype(np.float32)
         if fx_spec and len(buf):
-            buf = np.asarray(fxm.apply_fx(buf, bsr, fx_spec, t0=buf0 / bsr, seed=int(track.seed or 0)), np.float32)
+            buf = np.asarray(fx.apply_fx(buf, bsr, fx_spec, t0=buf0 / bsr, seed=int(track.seed or 0)), np.float32)
         if sr == bsr:
             out = buf[out_start - buf0:out_start - buf0 + n_out]
         else:
-            from . import resample
-
             out = resample.resample(buf, bsr, sr, in_start=buf0, out_start=out_start, n_out=n_out)
         if len(out) < n_out:
             out = np.pad(out, (0, n_out - len(out)))
@@ -448,14 +392,3 @@ class NeuralBackend:
         if low:
             warnings.append(f"{low} note(s) lie below the voicebank's comfortable range (from "
                             f"{midi_to_note(int(round(lo)))}); consider transposing the part up")
-
-
-class _Module(types.ModuleType):
-    """Importing this module makes it the ``backend`` attribute of ``synth2.neural`` in place
-    of the package's ``backend()`` function, so the module answers the same call."""
-
-    def __call__(self, bank: str | None = None) -> NeuralBackend:
-        return get_backend(bank)
-
-
-sys.modules[__name__].__class__ = _Module

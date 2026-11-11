@@ -1,8 +1,7 @@
 """The neural engine without models: alignment, phoneme mapping, presets, the voicebank loader,
 and the backend's window arithmetic, noise handling and reports against a fake onnxruntime."""
-import hashlib
-import importlib
 import importlib.machinery
+import importlib.util
 import json
 import os
 import sys
@@ -17,12 +16,11 @@ from synth2.engine.expression import get_style
 from synth2.engine.planner import plan_track
 from synth2.neural import align as al
 from synth2.neural import pitch as pt
+from synth2.neural import renderer as nb
 from synth2.neural.phonemes import PhonemeMap
 from synth2.neural.presets import PRESETS, VoicePreset, preset_for
 from synth2.score import parse_score
 from synth2.voices import VOICES, get_voice
-
-nb = importlib.import_module("synth2.neural.backend")  # the package also has a backend() function
 
 SR, HOP, BINS = 44100, 512, 8
 FRAME = HOP / SR
@@ -410,6 +408,23 @@ def install(models_dir: Path, bank_id="fake", **kw) -> Path:
     return folder / "files"
 
 
+def install_vocoder(models_dir: Path, vid: str, name: str, **manifest) -> None:
+    d = models_dir / vid / "files"
+    d.mkdir(parents=True)
+    (d / "vocoder.yaml").write_text(f"name: {name}\nmodel: v.onnx\nsample_rate: {SR}\nhop_size: {HOP}\n"
+                                    f"num_mel_bins: {BINS}\n")
+    _model(d / "v.onnx", ["mel", "f0"], ["waveform"])
+    (models_dir / vid / "synth2-model.json").write_text(json.dumps({
+        "format": "synth2-model", "id": vid, "kind": "vocoder", "root": "files", "credits": [f"Vocoder {vid}"],
+        **manifest}))
+
+
+def remove_bundled_vocoder(root: Path) -> None:
+    for f in (root / "dsvocoder").iterdir():
+        f.unlink()
+    (root / "dsvocoder").rmdir()
+
+
 @pytest.fixture
 def fake(tmp_path, monkeypatch):
     """A models folder with one fake voicebank and a fake onnxruntime; returns the fake module."""
@@ -420,6 +435,7 @@ def fake(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "onnxruntime", ort)
     monkeypatch.setenv("SYNTH2_MODELS", str(tmp_path / "models"))
     monkeypatch.setenv("SYNTH2_NEURAL_CACHE", "0")
+    monkeypatch.setenv("SYNTH2_CACHE", str(tmp_path / "cache"))  # a test that turns the cache on writes here
     monkeypatch.setenv("SYNTH2_NEURAL_THREADS", "3")
     for var in ("SYNTH2_NEURAL_STEPS", "SYNTH2_NEURAL_REPRODUCIBLE", "SYNTH2_NEURAL_PITCH", "SYNTH2_NEURAL_BANK",
                 "SYNTH2_QUALITY"):
@@ -534,31 +550,39 @@ def test_vocoder_resolution_order(fake):
     from synth2.neural import models
     from synth2.neural.voicebank import VoicebankError, load_installed, resolve_vocoder
 
-    def add_vocoder(vid, name, default=False):
-        d = fake.models / vid / "files"
-        d.mkdir(parents=True)
-        (d / "vocoder.yaml").write_text(f"name: {name}\nmodel: v.onnx\nsample_rate: {SR}\nhop_size: {HOP}\n"
-                                        f"num_mel_bins: {BINS}\n")
-        _model(d / "v.onnx", ["mel", "f0"], ["waveform"])
-        (fake.models / vid / "synth2-model.json").write_text(json.dumps({
-            "format": "synth2-model", "id": vid, "kind": "vocoder", "root": "files", "default": default,
-            "credits": [f"Vocoder {vid}"]}))
-
     bank = models.find("voicebank", "fake")
     assert resolve_vocoder(bank)[0] is None  # the bank's own dsvocoder/ comes first
     assert load_installed(bank).vocoder_id == "fake_voc"
-    for f in (fake.root / "dsvocoder").iterdir():
-        f.unlink()
-    (fake.root / "dsvocoder").rmdir()
+    remove_bundled_vocoder(fake.root)
     with pytest.raises(VoicebankError, match="no vocoder is installed"):
         resolve_vocoder(bank)
-    add_vocoder("voc-default", "other", default=True)
-    add_vocoder("voc-named", "fake_voc")
+    install_vocoder(fake.models, "voc-default", "other", default=True)
+    install_vocoder(fake.models, "voc-named", "fake_voc")
     assert resolve_vocoder(bank)[1] == "voc-named"  # the dsconfig's vocoder name beats the default
     manifest = json.loads((fake.models / "fake" / "synth2-model.json").read_text())
     (fake.models / "fake" / "synth2-model.json").write_text(json.dumps({**manifest, "vocoder": "voc-default"}))
     vb = load_installed(models.find("voicebank", "fake"))
     assert vb.vocoder_id == "voc-default" and vb.credits == ["Fake singer (test)", "Vocoder voc-default"]
+
+
+def test_credits_and_licence_are_those_of_the_vocoder_in_use(fake):
+    from synth2 import neural
+
+    install_vocoder(fake.models, "voc", "fake_voc", default=True, commercial_use=False)
+    path = fake.models / "fake" / "synth2-model.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "commercial_use": True}))
+    neural.refresh()
+    p, tr = song()
+    # the bank sings through its own dsvocoder/: the installed vocoder is neither credited nor a licence limit
+    assert neural.credits() == neural.credits("fake") == ["Fake singer (test)"] == sing(p, tr)[1]["credits"]
+    st = neural.status()
+    assert st["credits"] == ["Fake singer (test)"] and st["commercial_use"] is True and st["available"]
+    remove_bundled_vocoder(fake.root)
+    neural.refresh()
+    assert neural.credits() == ["Fake singer (test)", "Vocoder voc"] == sing(p, tr)[1]["credits"]
+    st = neural.status()
+    assert st["credits"] == ["Fake singer (test)", "Vocoder voc"] and st["commercial_use"] is False
+    assert neural.credits("missing") == []
 
 
 # ---- the backend ----------------------------------------------------------------------------------
@@ -802,6 +826,9 @@ def test_backend_registry_and_engine_selection(fake):
     b = backend_for_track(p, tr, "neural")
     assert b.name == "neural" and b is backend_for_track(p, tr, "neural") and set(b.voices()) == set(VOICES)
     assert neural.backend("fake") is nb.get_backend("fake") and neural.backend() is nb.get_backend()
+    # the package's backend() is a function and no module of the package takes its name
+    assert isinstance(neural.backend, types.FunctionType) and neural.backend() is b is not neural.backend("fake")
+    assert importlib.util.find_spec("synth2.neural.backend") is None
     install(fake.models, "b2")
     install(fake.models, "b3")
     for bank in ("fake", "b2", "b3"):
@@ -904,11 +931,10 @@ def test_phrase_cache_key_changes_with_every_setting(fake, monkeypatch):
 
 def test_phrase_cache_serves_repeats_without_running_the_models(fake, monkeypatch):
     store = {}
-    mod = types.ModuleType("synth2.neural.cache")
-    mod.stable_hash = lambda *parts: hashlib.sha256(repr([_plain(x) for x in parts]).encode()).hexdigest()
-    mod.enabled = lambda: os.environ.get("SYNTH2_NEURAL_CACHE", "1") != "0"
-    mod.default_cache = lambda: types.SimpleNamespace(get=store.get, put=store.__setitem__)
-    monkeypatch.setitem(sys.modules, "synth2.neural.cache", mod)
+    stand_in = types.SimpleNamespace(
+        enabled=lambda: os.environ.get("SYNTH2_NEURAL_CACHE", "1") != "0",
+        default_cache=lambda: types.SimpleNamespace(get=store.get, put=store.__setitem__))
+    monkeypatch.setattr(nb, "phrase_cache", stand_in)  # a dict in place of the cache folder
     monkeypatch.setenv("SYNTH2_NEURAL_CACHE", "1")
     p, tr = song()
     first, rep = sing(p, tr)
@@ -930,7 +956,6 @@ def test_phrase_cache_serves_repeats_without_running_the_models(fake, monkeypatc
 
 def test_effects_run_on_the_bank_rate_buffer_with_absolute_time(fake, monkeypatch):
     seen = []
-    mod = types.ModuleType("synth2.neural.fx")
 
     def parse_fx(spec):
         items = [spec] if isinstance(spec, str) else list(spec)
@@ -943,8 +968,8 @@ def test_effects_run_on_the_bank_rate_buffer_with_absolute_time(fake, monkeypatc
         seen.append((len(x), sr, list(spec), t0, seed))
         return (np.asarray(x) * 0.5).astype(np.float32)
 
-    mod.parse_fx, mod.apply_fx, mod.fx_tail = parse_fx, apply_fx, lambda spec: 0.25
-    monkeypatch.setitem(sys.modules, "synth2.neural.fx", mod)
+    stand_in = types.SimpleNamespace(parse_fx=parse_fx, apply_fx=apply_fx, fx_tail=lambda spec: 0.25)
+    monkeypatch.setattr(nb, "fx", stand_in)  # records what the renderer hands the effects
     p, tr = song()
     ref, _ = sing(p, tr)
     assert not seen  # no effect unless a neural.fx parameter asks for one
@@ -955,16 +980,7 @@ def test_effects_run_on_the_bank_rate_buffer_with_absolute_time(fake, monkeypatc
     assert sr == SR and spec == ["alien:0.6"] and seed == tr.seed
     assert t0 == pytest.approx(0.75) and n == SR + int(0.25 * SR)  # the effect's pre-roll comes before the window
     assert any("'zap' ignored" in w for w in rep["warnings"])
-    monkeypatch.setitem(sys.modules, "synth2.neural.fx", None)  # a build without the effects module
+    tr.voice_params = {"neural.fx.zap": 1.0}  # nothing valid is left: no effect call and no pre-roll
+    seen.clear()
     dry, rep = sing(p, tr, t0=1.0, t1=2.0)
-    assert np.array_equal(dry, ref[SR:2 * SR]) and any("effects are not available" in w for w in rep["warnings"])
-
-
-def _plain(v):
-    if isinstance(v, np.ndarray):
-        return ("array", v.dtype.str, v.shape, hashlib.sha256(np.ascontiguousarray(v).tobytes()).hexdigest())
-    if isinstance(v, dict):
-        return sorted((k, _plain(x)) for k, x in v.items())
-    if isinstance(v, (list, tuple)):
-        return [_plain(x) for x in v]
-    return (type(v).__name__, repr(v))
+    assert np.array_equal(dry, ref[SR:2 * SR]) and not seen and any("'zap' ignored" in w for w in rep["warnings"])

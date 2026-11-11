@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.metadata
 import importlib.util
 import os
+import sys
 
 from . import models
 
@@ -56,7 +57,7 @@ def _check(bank: str | None) -> tuple[bool, str]:
             return False, "onnxruntime is not installed"
         if not _has_module("yaml"):
             return False, "PyYAML is not installed"
-        if not _has_module(__name__ + ".backend"):
+        if not _has_module(__name__ + ".renderer"):
             return False, "this build of synth2 has no neural engine"
         vb = models.find("voicebank", bank)
         if vb is None:
@@ -73,30 +74,39 @@ def _check(bank: str | None) -> tuple[bool, str]:
 def refresh() -> None:
     """Forget cached availability (call after installing or removing a model)."""
     _cache.clear()
-    try:
-        from . import backend as _backend
-    except Exception:
-        return
-    reset = getattr(_backend, "reset", None)
-    if callable(reset):
-        reset()
+    renderer = sys.modules.get(__name__ + ".renderer")  # loaded by the first neural render
+    if renderer is not None:
+        renderer.reset()
 
 
 def backend(bank: str | None = None):
     """The :class:`~synth2.engine.backend.VoiceBackend` of the neural engine. ``bank`` pins a
     voicebank id; with None each track uses its voice preset's bank or the default bank."""
-    from .backend import get_backend
+    from .renderer import get_backend
 
     return get_backend(bank)
 
 
+def _vocoder(vb: models.InstalledModel) -> models.InstalledModel | None:
+    """The installed vocoder model voicebank ``vb`` sings through. None when the bank brings its
+    own vocoder (a ``dsvocoder`` folder) or no vocoder is installed. Never raises."""
+    try:
+        from .voicebank import resolve_vocoder
+
+        voc_id = resolve_vocoder(vb)[1]
+    except Exception:  # no vocoder, or the bank's files cannot be read here: go by the manifests
+        return models.vocoder_for(vb)
+    return models.find("vocoder", voc_id) if voc_id else None
+
+
 def credits(bank: str | None = None) -> list[str]:
-    """The attribution lines of a voicebank and its vocoder (empty when nothing is installed)."""
+    """The attribution lines of a voicebank and of the vocoder it sings through (empty when
+    nothing is installed). A bank that brings its own vocoder is credited alone."""
     vb = models.find("voicebank", bank)
     if vb is None:
         return []
     out = list(vb.credits)
-    voc = models.vocoder_for(vb)
+    voc = _vocoder(vb)
     if voc is not None:
         out += [c for c in voc.credits if c not in out]
     return out
@@ -114,7 +124,7 @@ def status() -> dict:
     vocoders = models.installed("vocoder")
     commercial = None
     if default is not None:
-        voc = models.vocoder_for(default)
+        voc = _vocoder(default)
         flags = [default.commercial_use] + ([voc.commercial_use] if voc is not None else [])
         commercial = False if False in flags else (True if all(f is True for f in flags) else None)
     return {
