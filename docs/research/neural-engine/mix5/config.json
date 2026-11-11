@@ -1,0 +1,75 @@
+{
+ "about": "Engine settings of the separation study (G1). `before` and `flow` are the flow study's lead settings, unchanged. `adlib` = the `adlib` option of sep/dsinfer.py render_track_ds per ad-lib track (defaults: dsinfer.ADLIB).",
+ "transpose": -5,
+ "before": {
+  "slow_note": 0.25,
+  "voicing_floor": 6.0,
+  "pitch_source": "bank",
+  "vowel_breath_off": -3.0,
+  "detune": 7.0
+ },
+ "flow": {
+  "cons_cap": {
+   "stop": 0.035,
+   "vstop": 0.035,
+   "aff": 0.06,
+   "fric": 0.05,
+   "vfric": 0.05,
+   "nasal": 0.06,
+   "glide": 0.05
+  },
+  "cons_cap_keep": 0.5,
+  "onset_keep": true,
+  "cons_voicing_floor": {
+   "vfric": 8.0,
+   "nasal": 8.0,
+   "glide": 8.0,
+   "vstop": 11.0
+  },
+  "breath": {
+   "min_gap": 0.12,
+   "fill": 0.45,
+   "length": 0.3,
+   "min_len": 0.1,
+   "breathiness": -44.0,
+   "first": true
+  }
+ },
+ "adlib": {
+  "AI Adlib": {
+   "split": "word",
+   "pitch": "flat",
+   "stamp": true
+  },
+  "Alien Adlib": {
+   "split": "word",
+   "pitch": {
+    "default": "flat",
+    "ha": "fall",
+    "ouch": "fall"
+   },
+   "stamp": true,
+   "vibrato": true
+  },
+  "Alien Chant": {
+   "split": "syllable",
+   "pitch": "flat",
+   "stamp": true,
+   "vibrato": true,
+   "chop": {
+    "hz": 11,
+    "depth_db": -9
+   },
+   "glottal": true
+  },
+  "Crowd Shout": {
+   "split": "word",
+   "pitch": {
+    "default": "flat",
+    "what": "rise",
+    "huh": "rise"
+   },
+   "stamp": true
+  }
+ }
+}
