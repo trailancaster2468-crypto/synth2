@@ -162,6 +162,9 @@ class Track:
     id: str = field(default_factory=_new_id)
     # engine spec for this track ("" = inherit the project's): auto, formant, neural or neural:<voicebank>
     engine: str = ""
+    # the track's role in the mix ("" = none): lead, double, harmony, answer, adlib or crowd; a double may name
+    # the track it doubles ("double:Harmony"). The neural engine and its vocal chain read it (engine/vocal_chain.py)
+    role: str = ""
 
     # ---- note editing -------------------------------------------------
     def sort(self):
@@ -222,6 +225,7 @@ class Track:
             "notes": [n.to_dict() for n in sorted(self.notes, key=lambda n: n.onset)],
             "curves": {k: c.to_dict() for k, c in self.curves.items() if c.points},
             **({"engine": self.engine} if self.engine else {}),
+            **({"role": self.role} if self.role else {}),
         }
 
     @classmethod
@@ -240,6 +244,7 @@ class Track:
             voice_params={k: float(v) for k, v in (d.get("voice_params") or {}).items()},
             id=str(d.get("id") or _new_id()),
             engine=str(d.get("engine") or ""),
+            role=str(d.get("role") or ""),
         )
         t.notes = [Note.from_dict(n) for n in d.get("notes", [])]
         t.curves = {k: Curve.from_dict(v) for k, v in (d.get("curves") or {}).items() if k in CURVE_SPECS}

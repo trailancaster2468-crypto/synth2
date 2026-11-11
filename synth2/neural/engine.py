@@ -3,14 +3,18 @@
 :class:`Runner` holds the sessions one phrase uses and builds every feed from the model's
 own input list, so banks with speaker embeddings, a tension variance, no variance model or
 no ``depth`` input all go through the same code. :func:`synth_phrase` is the phrase
-pipeline, a port of OpenUtau's DiffSinger renderer plus three measures from this engine's
+pipeline, a port of OpenUtau's DiffSinger renderer plus measures from this engine's
 research notes (``docs/research/neural-engine``):
 
 * slow motion: notes shorter than ``slow_note`` seconds are sung up to ``slow_max`` times
   slower by the variance and acoustic models and the mel is squeezed back onto the real
   frame grid; the vocoder gets the real f0, so timing and pitch are as written;
 * a floor under the predicted voicing of vowels (a collapsed prediction is a whispered
-  syllable);
+  syllable) and one under the voicing of voiced consonants (the voice stays on through them);
+* breaths (``AP``) with a designed breathiness curve, and an offset on the breathiness of
+  vowel frames only;
+* stops sung long enough in slow motion for a closure and a release, then cut out around the
+  release instead of being squeezed (the squeeze averages a burst with its closure);
 * reproducible noise: the diffusion models draw their noise inside the graph, so in
   reproducible mode every phrase runs them in sessions made right after
   ``onnxruntime.set_seed`` with a seed from the track seed and the phrase's place.
@@ -26,7 +30,7 @@ import numpy as np
 from . import align as al
 from .voicebank import Voicebank, VoicebankError, feed, speedup_for
 
-ENGINE_VERSION = "1"  # part of every cache key: raise it when the same inputs give other audio
+ENGINE_VERSION = "2"  # part of every cache key: raise it when the same inputs give other audio
 QUALITY_STEPS = {"draft": 5, "normal": 10, "high": 20}
 VARIANCE_STEPS = 10
 DEPTH = 0.6  # shallow-diffusion depth asked for; clipped to the bank's max_depth
@@ -59,7 +63,8 @@ def steps_for(quality: str | None = None) -> int:
 
 @dataclass(frozen=True)
 class Options:
-    """Per-render settings of the phrase pipeline (scalars only: they go into cache keys)."""
+    """Per-render settings of the phrase pipeline (scalars and tuples of pairs: they go into
+    cache keys). The defaults leave every consonant and breath measure off."""
 
     steps: int = QUALITY_STEPS["normal"]
     var_steps: int = VARIANCE_STEPS
@@ -69,10 +74,29 @@ class Options:
     slow_max: float = al.SLOW_MAX
     voicing_floor: float | None = al.VOICING_FLOOR  # dB; None or 0: no floor
     min_vowel: float | None = None
+    cons_cap: tuple = ()  # ((class, s), ...): consonant caps of ``align.align``
+    cons_cap_keep: float = 0.0
+    cons_cap_share: float | None = None
+    onset_keep: bool = False
+    cons_floor: tuple = ()  # ((class, dB), ...): voicing floors of voiced consonants
+    burst: tuple = ()  # ((class, s), ...): sung at least this long in slow motion, cut out around the release
+    vowel_breath_db: float = 0.0  # dB on the breathiness of vowel frames
+    breath_db: float | None = None  # dB the breathiness of a breath peaks at; None: as predicted
+    min_breath: float = 0.0  # s: a breath left shorter than this is a rest
+    cons_gain: tuple = ()  # ((class, dB), ...) after the vocoder
+    cons_gain_hf: float | None = None  # Hz: the gain applies above this only
 
     def key(self) -> list:
         return [self.steps, self.var_steps, float(self.depth), float(self.velocity), self.slow_note or 0.0,
-                float(self.slow_max), self.voicing_floor or 0.0, self.min_vowel or 0.0]
+                float(self.slow_max), self.voicing_floor or 0.0, self.min_vowel or 0.0,
+                [list(x) for x in self.cons_cap], float(self.cons_cap_keep), self.cons_cap_share, bool(self.onset_keep),
+                [list(x) for x in self.cons_floor], [list(x) for x in self.burst], float(self.vowel_breath_db),
+                self.breath_db, float(self.min_breath), [list(x) for x in self.cons_gain], self.cons_gain_hf]
+
+    def caps(self) -> dict:
+        """The consonant options of ``align.align`` / ``align.phrase_frames``."""
+        return {"cons_cap": dict(self.cons_cap) or None, "cons_cap_keep": self.cons_cap_keep,
+                "cons_cap_share": self.cons_cap_share, "onset_keep": self.onset_keep}
 
 
 @dataclass
@@ -269,8 +293,20 @@ def synth_phrase(run: Runner, ph: PhraseInput, opts: Options) -> np.ndarray:
     if opts.voicing_floor and "voicing" in var:
         var["voicing"] = al.floor_voicing(np.clip(var["voicing"], -96, 0), ph.seq, durs_ac, ph.is_vowel, frame,
                                           opts.voicing_floor)
+    if opts.cons_floor or opts.breath_db is not None:
+        al.shape_consonants(var, ph.seq, durs_ac, ph.is_vowel, frame, dict(opts.cons_floor) or None, opts.breath_db)
+    if opts.vowel_breath_db:
+        offsets = dict(offsets)
+        offsets["breathiness"] = offsets.get("breathiness", 0.0) + opts.vowel_breath_db * al.vowel_weight(
+            durs_ac, ph.is_vowel)
     mel = run.mel(ph.seq, durs_ac, hz(p_ac), var, gender=gender, velocity=opts.velocity, steps=opts.steps,
                   depth=opts.depth, offsets=offsets)
     if to_slow is not None:
-        mel = al.warp_rows(mel, to_slow)
-    return run.vocode(mel, f0)
+        mel_slow, mel = mel, al.warp_rows(mel, to_slow)
+        if opts.burst:
+            mel = al.squeeze_bursts(mel, mel_slow, ph.seq, ph.durs, durs_ac, [c for c, _ in opts.burst])
+    wav = run.vocode(mel, f0)
+    if opts.cons_gain:
+        wav = al.consonant_gain(wav, ph.seq, ph.durs, dict(opts.cons_gain), run.bank.hop, run.bank.sample_rate,
+                                hf=opts.cons_gain_hf)
+    return wav

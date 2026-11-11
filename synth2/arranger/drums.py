@@ -13,6 +13,7 @@ from functools import lru_cache
 
 import numpy as np
 
+from . import gm
 from .dsp import bandpass_noise, fft_filter, noise, osc, saturate, sine
 
 # kit voice -> default parameters (all optional in an arrangement)
@@ -61,11 +62,35 @@ GROUP_OF = {v: g for g, vs in DRUM_GROUPS.items() for v in vs}
 N_VARIANTS = 4
 
 
+# every voice a pattern can name: the synthesised voices and the further General MIDI percussion of sampled kits
+ALL_VOICES = DRUM_VOICES + tuple(gm.EXTRA_VOICES)
+
+
 def canonical_voice(name: str) -> str | None:
+    """The voice a lane or hit names: a kit voice, an alias, one of the further percussion
+    voices, or ``n<key>`` / a bare key number for any key of a sampled kit."""
     n = str(name).strip().lower()
     if n in DRUM_DEFAULTS:
         return n
-    return DRUM_ALIASES.get(n)
+    if n in DRUM_ALIASES:
+        return DRUM_ALIASES[n]
+    if n in gm.EXTRA_VOICES:
+        return n
+    if n in gm.EXTRA_ALIASES:
+        return gm.EXTRA_ALIASES[n]
+    if n.isdigit() and int(n) <= 127:
+        return f"n{int(n)}"
+    return n if gm.key_voice(n) is not None else None
+
+
+def synth_voice(voice: str, overrides: dict | None) -> tuple[str, dict]:
+    """(synthesised voice, its parameters) for any voice name: the further percussion voices
+    are played by the nearest synthesised voice with their own tuning."""
+    base, changes = gm.synth_voice(voice)
+    if changes or base != voice:
+        changes.update(overrides or {})
+        return base, drum_params(base, changes)
+    return voice, drum_params(voice, overrides)
 
 
 def _t(n, sr):

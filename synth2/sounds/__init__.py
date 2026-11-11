@@ -74,8 +74,10 @@ class InstalledSound:
     @property
     def presets(self) -> list[dict]:
         """Presets the manifest points out: dicts with ``name`` and ``file`` (relative to
-        ``root``), and where known ``bank``, ``program``, ``category`` and ``note``. A
-        soundfont's full preset list is in the file itself; this is only a guide."""
+        ``root``) and where known ``category``, ``bank`` and ``program``. An SFZ preset may
+        carry ``defines`` (values for ``$variables`` the ``.sfz`` file uses without defining
+        them) and ``cc`` (controller number -> starting value, to pick a variant of the
+        program). A soundfont's full preset list is in the file itself; this is only a guide."""
         return [dict(p) for p in self.manifest.get("presets") or [] if isinstance(p, dict)]
 
     def file(self, rel: str) -> Path:

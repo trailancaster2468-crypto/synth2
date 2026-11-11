@@ -1827,6 +1827,14 @@ and 1-based (bar 1 starts at beat 0), 'beat' inside a bar is 1-based (2.5 = the 
   voicing, transpose/octave, strum (s), humanize, mute. Synth sound tweaks go in params (osc layers, cutoff,
   resonance, env, attack, decay, sustain, release, drive, vibrato, glide, chip_arp ... see get_backing
   detail='reference').
+  Sampled instruments: add "sound" to play real samples instead of the synth (list_sounds shows what is
+  installed): "sound": "<set id>" | "<path to .sf2/.sfz/WAV/folder>" | {"set": id, "preset": "0:33" | "Finger
+  Bass" | "strings", tune, transpose, gain_db, attack, release, cutoff, vibrato, mono, key_range ...} | [layers].
+  "preset" stays the synth preset: it plays (with a warning, never an error) when the sound is not installed;
+  with no sound preset the General MIDI program that fits it is chosen. Kits: {"type": "drums", "sound": id,
+  "voices": {"snare": {"tune": -1, "gain_db": 2, "sample": "my.wav"}}}; "split": "each" gives every kind of
+  drum its own stem (default with a sound). More percussion voices exist for kits (conga_hi, claves, triangle,
+  ridebell, splash ... and n<key> for any key of a sampled kit).
 - patterns: {name: {kind, ...}}; grid = steps per bar (16 default), bars, swing, gate, velocity, transpose.
   * drums: lanes {kick: 'x...x...x...x...', snare: '....X.......X...', hat: 'x.x.x.x.'} - '.' rest, x hit,
     X accent, o ghost, 1-9 velocity, r roll, f flam; voices kick snare clap rim hat ohat crash ride tom1 tom2
@@ -1942,6 +1950,52 @@ def _get_backing(s: Session, a: dict) -> dict:
     if detail == "full":
         return {"arrangement": copy.deepcopy(arr)}
     return {"backing": arranger.summarize(arr, s.project)}
+
+
+@_tool("list_sounds", """
+List the sampled sound sets installed on this machine and what each can play, to choose instruments for the
+backing band's "sound" (see set_backing). Without arguments: every set with its kind (soundfont, sfz, drumkit,
+samples), tags (gm = a complete General MIDI set), licence and credits, the number of presets and the names of its
+drum kits. set='<id>': that set's presets as {preset: 'bank:program' or file name, name}, filtered by `search`
+(part of a name, e.g. 'bass', 'string'). program=<0..127> or a General MIDI name ('slap bass', 'flute') with a
+set: the preset that would play for it. Also returns which sounds the current backing uses and any that fall back
+to the synth because they are not installed.
+""", {"set": {"type": "string", "description": "Id of an installed sound set to list in full."},
+      "search": {"type": "string", "description": "Only presets whose name contains this text."},
+      "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Most presets to return (default 80)."}})
+def _list_sounds(s: Session, a: dict) -> dict:
+    from .. import arranger
+
+    out: dict = {}
+    sid, search = a.get("set"), str(a.get("search") or "").lower()
+    limit = int(a.get("limit") or 80)
+    if sid:
+        entry = next((e for e in arranger.list_sounds(detail=True) if e["id"] == sid), None)
+        if entry is None:
+            known = [e["id"] for e in arranger.list_sounds()]
+            raise ToolError(f"no installed sound set {sid!r}; installed: {', '.join(known) or 'none'} "
+                            "(install sets with the command: synth2 sounds install <id>)")
+        for kind in ("presets", "kits"):
+            items = [p for p in entry[kind] if search in p["name"].lower() or search in p["preset"].lower()]
+            entry[f"{kind}_matching"] = len(items)
+            entry[kind] = [{"preset": p["preset"], "name": p["name"]} | ({"file": p["file"]} if len(
+                {q["file"] for q in items}) > 1 else {}) for p in items[:limit]]
+        out["set"] = entry
+    else:
+        out["sets"] = arranger.list_sounds()
+        if not out["sets"]:
+            out["hint"] = ("no sound sets are installed: instruments play the built-in synth. Install sets with "
+                           "the command 'synth2 sounds install <id>' ('synth2 sounds list' shows what is offered), "
+                           "or point 'sound' at a .sf2 / .sfz file or a folder of WAV files.")
+    if s.project.backing:
+        try:
+            rep = arranger.sound_report(s.project)
+            used = {k: v for k, v in rep["instruments"].items() if v.get("sound")}
+            if used:
+                out["backing"] = {"instruments": used, "warnings": rep["warnings"], "credits": rep["credits"]}
+        except arranger.ArrangementError:
+            pass
+    return out
 
 
 @_tool("clear_backing", """

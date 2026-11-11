@@ -4,25 +4,33 @@ One track is rendered like this:
 
 1. ``plan_track`` plans the whole track, exactly as for the formant engine.
 2. ``align`` cuts the plan into phrases; the phrases that can reach the render window are
-   laid out on the track's frame grid (the duration model runs for those only).
+   laid out on the track's frame grid (the duration model runs for those only), with a
+   breath in the gaps between lines and the consonant options of the track's dial setting.
 3. Every phrase's waveform comes from the phrase cache or from ``engine.synth_phrase``. The
-   cache holds what the vocoder returned, before level, gain rides and effects, under a key
-   made of everything the waveform depends on.
+   cache holds what the phrase pipeline returned, before level, gain rides and effects, under
+   a key made of everything the waveform depends on.
 4. The phrases are overlap-added onto the absolute sample grid of the bank's rate, gain is
    applied as a function of absolute time, then effects, then the resampler puts the
    window on the project's sample grid.
 
 A phrase's audio does not depend on the window, so a partial render equals the same span of
 the full render.
+
+A track in ad-lib mode is sung hit by hit instead of phrase by phrase (``adlib.py``). A
+track with the role ``double`` is not sung when the project has a track for it to double:
+its audio is that track's take over the double's own notes. Every track with a role is
+noted for the mixer (``engine/vocal_chain.py``), which gives it the role's chain.
 """
 from __future__ import annotations
 
 import os
 import threading
 from collections import OrderedDict
+from dataclasses import replace
 
 import numpy as np
 
+from . import adlib
 from . import align as al
 from . import cache as phrase_cache
 from . import fx, models, resample
@@ -30,7 +38,7 @@ from .cache import stable_hash
 from .engine import ENGINE_VERSION, Options, PhraseInput, Runner, Timer, reproducible, steps_for, synth_phrase
 from .phonemes import PhonemeMap
 from .pitch import PITCH_STEPS, BankPitch, default_expr, default_vibrato
-from .presets import BREATH_DB, GENDER_LIMIT, VoicePreset, preset_for
+from .presets import BREATH_DB, DETUNE, GENDER_LIMIT, VoicePreset, track_preset
 from .voicebank import Voicebank, VoicebankError, load_installed
 
 MAX_BANKS = 2  # voicebanks kept loaded
@@ -41,6 +49,7 @@ TENSION_SCALE = 4.0  # the bank's tension units per unit of the tension curve
 TENSION_GAIN_DB = 1.5  # dB per unit of the tension curve for a bank without a tension input
 COMFORT_RANGE = (50, 72)  # MIDI notes a bank sings well when its manifest gives no "range"
 VELOCITY_SMOOTH = 5  # frames of smoothing on the steps of note velocities
+COPY_LEAD, COPY_TAIL, COPY_FADE = 0.06, 0.12, 0.02  # s around a double's notes that the doubled take is copied
 
 _lock = threading.Lock()
 _banks: "OrderedDict[tuple, Voicebank]" = OrderedDict()
@@ -164,23 +173,41 @@ class NeuralBackend:
     def render_track(self, project, track, sample_rate: int, t0: float, t1: float,
                      note_range: tuple[float, float] | None = None) -> tuple[np.ndarray, dict]:
         """Render ``track`` dry over ``[t0, t1)`` seconds: ``int(round((t1 - t0) * sample_rate))``
-        samples, the first one at absolute project sample ``int(round(t0 * sample_rate))``."""
+        samples, the first one at absolute project sample ``int(round(t0 * sample_rate))``.
+
+        A track with a role (``Track.role``) is noted for the mixer, which then gives it the
+        role's chain (``engine/vocal_chain.py``). A ``double`` whose project has a track to
+        double is not sung: its audio is that track's take over the double's notes."""
+        from ..engine import vocal_chain
+
+        audio, report = self._render(project, track, int(sample_rate), t0, t1, note_range)
+        vocal_chain.note_role(track.id, audio, report["role"], report["neural"].get("dial") or vocal_chain.DEFAULT_DIAL,
+                              report["neural"].get("copy_of"))
+        return audio, report
+
+    def _render(self, project, track, sr: int, t0: float, t1: float, note_range=None, doubling=()):
+        from ..engine import vocal_chain
         from ..engine.expression import get_style
         from ..engine.planner import plan_track
         from ..engine.renderer import track_report
         from ..voices import get_voice
 
-        sr = int(sample_rate)
         voice = get_voice(track.voice).with_params(track.voice_params)
         overrides = {k[6:]: v for k, v in track.voice_params.items() if k.startswith("style.")}
         style = get_style(track.style or voice.default_style, overrides)
         rng = np.random.default_rng(track.seed)
         plan = plan_track(track.notes, project.tempo, track.language, style, rng)
-        preset = preset_for(track.voice, track.voice_params)
+        preset = track_preset(track)
         bank, warnings = self.bank_for(preset)
+        role, source = vocal_chain.parse_role(getattr(track, "role", ""))
+        if getattr(track, "role", "") and not role:
+            warnings.append(f"unknown role {track.role!r} ignored (roles: {', '.join(vocal_chain.ROLES)})")
         n_out = max(0, int(round((t1 - t0) * sr)))
         info: dict = {}
-        if plan.units and n_out:
+        sources = self._doubled(project, track, source, doubling) if role == "double" else []
+        if sources and n_out:
+            audio = self._copy(project, track, sources, sr, t0, t1, doubling, info)
+        elif plan.units and n_out:
             audio = self._sing(project, track, plan, voice, style, rng, preset, bank, sr, t0, t1, warnings, info)
             self._range_warning(track.notes if note_range is None else track.notes_in_range(*note_range), bank,
                                 preset, warnings)
@@ -193,8 +220,56 @@ class NeuralBackend:
         report["warnings"] = report["warnings"] + [w for w in warnings if w not in report["warnings"]]
         report["credits"] = list(bank.credits)
         report["bank"] = bank.id
+        report["role"] = role
+        info.setdefault("dial", preset.dial)
         report["neural"] = info
         return audio, report
+
+    @staticmethod
+    def _doubled(project, track, source: str | None, doubling=()) -> list:
+        """The tracks a double copies: the one it names, else the leads of its voice."""
+        from ..engine import vocal_chain
+
+        if source:
+            try:
+                named = project.track(source)
+            except LookupError:
+                named = None
+            found = [named] if named is not None else []
+        else:
+            found = [t for t in project.tracks
+                     if vocal_chain.parse_role(getattr(t, "role", ""))[0] == "lead" and t.voice == track.voice]
+        return [t for t in found if t is not track and t.notes and t.id not in doubling]
+
+    def _copy(self, project, track, sources, sr: int, t0: float, t1: float, doubling, info: dict) -> np.ndarray:
+        """The takes of ``sources`` over the notes of ``track`` (from ``COPY_LEAD`` s before to
+        ``COPY_TAIL`` s after each, ``COPY_FADE`` s fades), with the track's loudness curve."""
+        from ..engine import vocal_chain
+        from ..engine.expression import evaluate_curve
+
+        n = max(0, int(round((t1 - t0) * sr)))
+        out = np.zeros(n, np.float32)
+        for src in sources:
+            a, _ = self._render(project, src, sr, t0, t1, None, (*doubling, track.id))
+            out[: len(a)] += a[:n]
+        b2s = project.tempo.beat_to_sec
+        k = int(COPY_FADE * sr)
+        first = int(round(t0 * sr)) - 2 * k  # the gate is built with a margin, so a window's edge does not shape it
+        gate = np.zeros(n + 4 * k)
+        for nt in track.notes:
+            a = int((b2s(nt.onset) - COPY_LEAD) * sr) - first
+            b = int((b2s(nt.onset + nt.duration) + COPY_TAIL) * sr) - first
+            gate[max(0, a):max(0, min(len(gate), b))] = 1.0
+        win = np.hanning(2 * k + 1)
+        gate = np.convolve(gate, win / win.sum(), mode="same")[2 * k:2 * k + n]
+        hop = max(1, int(round(0.01 * sr)))
+        s0 = int(round(t0 * sr))
+        grid = np.arange((s0 // hop) * hop, s0 + n + hop, hop)  # absolute samples: the same in every window
+        ld = np.clip(evaluate_curve(track.curves.get("loudness"), grid / sr, b2s, 0.0), -48.0, 12.0)
+        gain = np.interp(s0 + np.arange(n), grid, 10 ** (ld / 20.0))
+        info.update(pitch="copy", copy=[s.name for s in sources], phrases=0, cached=0, sung_s=0.0, alignment=[],
+                    copy_of=vocal_chain.parse_role(getattr(sources[0], "role", ""))[0] or "lead")
+        return (out * gate * gain).astype(np.float32)
 
     # ---- one track
     def _sing(self, project, track, plan, voice, style, rng, preset: VoicePreset, bank: Voicebank, sr: int,
@@ -223,18 +298,22 @@ class NeuralBackend:
                   for name, spec in CURVE_SPECS.items()}
         rng_state = rng.bit_generator.state
         s2 = build_pitch(t, plan.timings, style, voice, rng, vibrato_env=curves["vibratoEnv"])
-        delta = curves["pitchDelta"] / 100.0
-        pitch = s2 + delta
 
+        hits_mode = preset.adlib is not None  # detached hits with a designed pitch instead of lines
         source = (os.environ.get(PITCH_ENV) or "").strip().lower()
         if source not in ("bank", "expression"):
             source = "bank"
         if preset.expr is not None and preset.expr <= 0:
             source = "expression"
-        if source == "bank" and bank.pitch is None:
+        if hits_mode:
+            source = "adlib"
+        elif source == "bank" and bank.pitch is None:
             source = "expression"
             if bank.pitch_note:
                 warnings.append(f"the voicebank's pitch predictor is not used ({bank.pitch_note})")
+        detune = float(preset.detune) if preset.detune is not None else (DETUNE if source == "bank" else 0.0)
+        delta = curves["pitchDelta"] / 100.0 + detune / 100.0
+        pitch = s2 + delta
         bp = None
         if source == "bank":
             # the same stream and the same seed sequence as rng (build_pitch keys per-note draws on
@@ -260,10 +339,22 @@ class NeuralBackend:
             gain_db = gain_db + TENSION_GAIN_DB * curves["tension"]
 
         seeded = reproducible()
+        breath = None if hits_mode else preset.breath()
+        if breath:
+            busy = adlib.busy_spans(project, track)
+            if busy:  # no breath where an ad-lib of the same voice sounds on another track
+                breath["avoid"] = busy
         opts = Options(steps=steps_for(), velocity=preset.velocity,
                        slow_note=al.SLOW_NOTE if preset.slow is None else (preset.slow if preset.slow > 0 else None),
                        voicing_floor=al.VOICING_FLOOR if preset.voicing_floor is None else
-                       (preset.voicing_floor if preset.voicing_floor > 0 else None))
+                       (preset.voicing_floor if preset.voicing_floor > 0 else None),
+                       cons_floor=preset.cons_floor, vowel_breath_db=preset.vowel_breath_db,
+                       cons_gain=preset.cons_gain, cons_gain_hf=preset.cons_gain_hf)
+        if not hits_mode:  # a hit has its own consonant options (adlib.py) and no breath
+            opts = replace(opts, cons_cap=preset.cons_cap, cons_cap_keep=preset.cons_cap_keep,
+                           cons_cap_share=preset.cons_cap_share, onset_keep=preset.onset_keep, burst=preset.burst,
+                           breath_db=breath["breathiness"] if breath else None,
+                           min_breath=breath["min_len"] if breath else 0.0)
         weights = preset.mode_weights()
         unknown = sorted(m for m in weights if m not in bank.modes)
         if unknown:
@@ -277,21 +368,44 @@ class NeuralBackend:
         timer = Timer()
         shared = Runner(bank, None, blend, timer)
 
-        phrases, cuts = al.split_long(al.build_phrases(plan))
-        if cuts:
-            warnings.append(f"{cuts} phrase(s) longer than {al.MAX_PHRASE:g} s were split at their longest gap; "
-                            "add a rest or a breath to choose where")
         buf = np.zeros(max(0, buf1 - buf0), np.float32)
         lo_s, hi_s = buf0 / bsr, buf1 / bsr
         alignment: list[dict] = []  # per phrase: first frame, phonemes, their lengths in frames, note starters
         stats = {"phrases": 0, "cached": 0, "sung_s": 0.0, "pitch_fallbacks": 0, "pitch_repaired": 0, "failed": 0}
+        if hits_mode:
+            def timbre(at: float):
+                """Timbre shift, formant shift and variance offsets at ``at`` seconds."""
+                c = {name: float(np.clip(evaluate_curve(track.curves.get(name), np.array([at]), b2s, spec[0]),
+                                         spec[1], spec[2])[0]) for name, spec in CURVE_SPECS.items()}
+                o = {"breathiness": preset.breath_db + BREATH_DB * c["breathiness"],
+                     "voicing": preset.voicing_db + VOICING_DB * (c["voicing"] - 1.0)}
+                if acoustic_takes_tension:
+                    o["tension"] = preset.tension + TENSION_SCALE * c["tension"]
+                return (preset.tone + c["toneShift"] / 100.0,
+                        float(np.clip(preset.gender - c["gender"], -GENDER_LIMIT, GENDER_LIMIT)), o)
+
+            hits = adlib.Hits(project, track, plan, voice, style, adlib.settings(preset.adlib), bank, pm.convert,
+                              shared, blend, opts, ident, cache, seeded, detune, timbre, timer)
+            hits.sing(buf, buf0, warnings)
+            stats.update(hits.stats)
+            info["hits"] = hits.rows
+            phrases = []
+        else:
+            phrases, cuts = al.split_long(al.build_phrases(plan))
+            if cuts:
+                warnings.append(f"{cuts} phrase(s) longer than {al.MAX_PHRASE:g} s were split at their longest gap; "
+                                "add a rest or a breath to choose where")
+        before = breath["length"] if breath else 0.0
+        prev_end = None  # where the phrase before ended: a phrase may start with a breath in the silence
         for units in phrases:
-            a, b = al.phrase_bounds(units, frame)
+            this_prev, prev_end = prev_end, units[-1].end
+            a, b = al.phrase_bounds(units, frame, before)
             if b < lo_s or a > hi_s:
                 continue
             try:
                 got = self._phrase(bank, plan, units, pm, shared, bp, pitch, delta, tone, gender, off, opts, blend,
-                                   ident, cache, track, seeded, k_off, n_frames, timer, (buf0, buf1))
+                                   ident, cache, track, seeded, k_off, n_frames, timer, (buf0, buf1), breath,
+                                   this_prev)
                 if got is None:
                     continue
                 wav, f_start, meta = got
@@ -324,20 +438,22 @@ class NeuralBackend:
             out = resample.resample(buf, bsr, sr, in_start=buf0, out_start=out_start, n_out=n_out)
         if len(out) < n_out:
             out = np.pad(out, (0, n_out - len(out)))
-        info.update(stats, steps=opts.steps, seeded=seeded, preset=preset.summary(), frame_s=frame,
-                    alignment=alignment,
+        info.update(stats, steps=opts.steps, seeded=seeded, preset=preset.summary(), dial=preset.dial,
+                    detune=detune, frame_s=frame, alignment=alignment,
                     seconds={k: round(v, 3) for k, v in timer.t.items()})
         return np.ascontiguousarray(out, np.float32)
 
     def _phrase(self, bank, plan, units, pm, shared: Runner, bp, pitch, delta, tone, gender, off, opts: Options,
-                blend, ident, cache, track, seeded: bool, k_off: int, n_frames: int, timer: Timer, span):
+                blend, ident, cache, track, seeded: bool, k_off: int, n_frames: int, timer: Timer, span,
+                breath=None, prev_end=None):
         """``(waveform, first frame, meta)`` of one phrase, from the cache or the models; None
         when the phrase has no sample inside ``span`` (absolute bank-rate samples)."""
         frame = bank.frame
-        groups, end = al.phrase_groups(units, plan, pm.convert)
+        groups, end = al.phrase_groups(units, plan, pm.convert, frame, breath, prev_end)
         phones, word_div, word_dur, ph_midi = al.dur_inputs(groups, end, frame)
         pred = shared.predict_dur(phones, word_div, word_dur, ph_midi)
-        seq, durs, f_start, is_vowel = al.phrase_frames(groups, end, pred, frame, opts.min_vowel)
+        seq, durs, f_start, is_vowel = al.phrase_frames(groups, end, pred, frame, opts.min_vowel, opts.min_breath,
+                                                        **opts.caps())
         n = int(sum(durs))
         if (f_start + n) * bank.hop <= span[0] or f_start * bank.hop >= span[1]:
             return None
@@ -348,6 +464,8 @@ class NeuralBackend:
         sl = slice(a, a + n) if a >= 0 and a + n <= n_frames else np.clip(np.arange(a, a + n), 0, n_frames - 1)
         slow = np.append(al.slow_factors(groups, end, opts.slow_note, opts.slow_max), 1.0) if opts.slow_note \
             else np.ones(len(seq))
+        if opts.burst:
+            slow = al.slow_consonants(slow, seq, durs, frame, dict(opts.burst))
         seed = al.phrase_seed(int(track.seed or 0), f_start, n) if seeded else None
         ni = bp.notes(units, seq, durs, f_start) if bp is not None else None
         pitch_key = bp.key(ni, sl) if bp is not None else ["expression", pitch[sl]]

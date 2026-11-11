@@ -288,6 +288,12 @@ def build_parser() -> argparse.ArgumentParser:
     dm = sub.add_parser("demo", help="render the built-in demo songs")
     dm.add_argument("-o", "--output", default="out/demo")
     dm.set_defaults(func=cmd_demo)
+
+    from .neural import cli as models_cli
+    from .sounds import cli as sounds_cli
+
+    models_cli.add_parser(sub)
+    sounds_cli.add_parser(sub)
     return ap
 
 

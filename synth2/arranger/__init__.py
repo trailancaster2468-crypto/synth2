@@ -21,17 +21,18 @@ from __future__ import annotations
 
 from .arrangement import (ARP_MODES, DELAY_TIMES, FORMAT_NAME, KIT_PRESETS, PATTERN_KINDS, ROLES, ArrangementError,
                           compile_arrangement, parse_riff, validate_arrangement)
-from .drums import DRUM_ALIASES, DRUM_DEFAULTS, DRUM_GROUPS, DRUM_VOICES
+from . import gm, soundbank
+from .drums import ALL_VOICES, DRUM_ALIASES, DRUM_DEFAULTS, DRUM_GROUPS, DRUM_VOICES
 from .dsp import WAVES
 from .fx import FX_SOUNDS, PROCESS_EFFECTS
-from .render import BackingStem, kick_times, render_backing, song_length_seconds
+from .render import BackingStem, kick_times, render_backing, song_length_seconds, sound_report
 from .synth import PRESETS
 from .theory import VOICINGS, parse_chord
 
 __all__ = [
     "render_backing", "kick_times", "validate_arrangement", "BackingStem", "ArrangementError", "compile_arrangement",
     "summarize", "reference", "example_arrangement", "PRESETS", "DRUM_VOICES", "FX_SOUNDS", "PROCESS_EFFECTS",
-    "parse_chord", "parse_riff", "song_length_seconds", "FORMAT_NAME",
+    "parse_chord", "parse_riff", "song_length_seconds", "FORMAT_NAME", "sound_report", "list_sounds",
 ]
 
 SYNTH_PARAM_DOCS: dict[str, str] = {
@@ -82,6 +83,25 @@ def reference() -> dict:
         "drum_voices": {v: dict(p) for v, p in DRUM_DEFAULTS.items()},
         "drum_aliases": dict(DRUM_ALIASES),
         "drum_stem_groups": {g: list(v) for g, v in DRUM_GROUPS.items()},
+        "drum_stems_each": {v: gm.stem_of(v) for v in ALL_VOICES},
+        "drum_split": "kit 'split': true or 'groups' = kick / snare / hats / cymbals stems (default for a "
+                      "synthesised kit), 'each' = one stem per kind of drum (default for a kit with a 'sound'), "
+                      "false or 'kit' = one stem",
+        "percussion_voices": {v: {"keys": list(spec[0]), "stem": spec[1], "synth_stand_in": spec[2]}
+                              for v, spec in gm.EXTRA_VOICES.items()},
+        "sampled_sounds": {
+            "how": "any instrument may name a sampled sound: \"sound\": \"<installed set id>\" | \"<path to "
+                   ".sf2 / .sfz / WAV / folder>\" | {set | path, preset, options...} | [layer, layer] (layers "
+                   "play together). 'preset' keeps naming the synth preset, which plays when the sound is not "
+                   "installed (reported as a warning, never an error); without a sound preset the General MIDI "
+                   "program that fits the synth preset is used. Kits: {\"type\": \"drums\", \"sound\": ...} "
+                   "with per-drum 'voices': {kick: {tune (semitones), gain_db, pan, note (kit key), sample (a "
+                   "file), length (s)}}. See list_sounds for what is installed.",
+            "options": dict(soundbank.SOUND_OPTION_DOCS),
+            "general_midi_programs": {str(i): n for i, n in enumerate(gm.GM_PROGRAMS)},
+            "preset_programs": {k: list(v) for k, v in gm.PRESET_PROGRAMS.items()},
+            "drum_keys": {v: list(k) for v, k in gm.DRUM_KEYS.items()},
+        },
         "kits": list(KIT_PRESETS),
         "fx_sounds": {k: {"default_beats": v[0], "default_pitch": v[1], "description": v[2]}
                       for k, v in FX_SOUNDS.items()},
@@ -130,13 +150,36 @@ def summarize(arrangement: dict, project=None) -> dict:
     for name, inst in comp.instruments.items():
         insts[name] = {"type": inst.kind, "preset": inst.preset, "role": inst.role, "gain_db": inst.gain_db,
                        "pan": inst.pan, "sidechain": inst.sidechain, "mute": inst.mute,
+                       **({"sound": [soundbank.describe(layer) for layer in inst.sound]} if inst.sound else {}),
                        "events": len(comp.drum_events.get(name, [])) + len(comp.note_events.get(name, []))
                        + len(comp.fx_events.get(name, []))}
     kicks = sum(1 for evs in comp.drum_events.values() for e in evs if e.voice == "kick")
+    problems = list(comp.warnings)
+    if any(inst.sound for inst in comp.instruments.values()):
+        dirs = soundbank.project_dirs(project, arrangement)
+        for name, inst in comp.instruments.items():
+            for layer in inst.sound or []:
+                res = soundbank.resolve(layer, drums=inst.kind == "drums", synth_preset=inst.preset, kit=inst.kit,
+                                        kit_params=inst.params if inst.kind == "drums" else None, low=inst.low,
+                                        dirs=dirs, chords=inst.role not in ("bass", "lead"))
+                if res.instrument is None:
+                    problems.append(f"warning: instruments.{name}.sound: {res.error}; the synthesised "
+                                    f"{'kit' if inst.kind == 'drums' else 'preset'} plays instead")
     return {"sections": secs, "instruments": insts, "patterns": sorted((arrangement.get("patterns") or {})),
             "length_bars": round(comp.end_beat / bpb, 3), "length_s": round(b2s(comp.end_beat), 3),
             "kick_hits": kicks, "processing_events": len(comp.processes), "stops": len(comp.stops),
-            "problems": comp.warnings}
+            "problems": problems}
+
+
+def list_sounds(detail: bool = False) -> list[dict]:
+    """Installed sound sets and what each can play (presets and kits; counts only unless
+    ``detail``)."""
+    out = []
+    for entry in soundbank.catalogue():
+        if not detail:
+            entry = dict(entry, presets=len(entry["presets"]), kits=[k["name"] for k in entry["kits"]][:40])
+        out.append(entry)
+    return out
 
 
 def example_arrangement() -> dict:

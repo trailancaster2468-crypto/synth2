@@ -55,7 +55,9 @@ interchange formats (SVP, MIDI, MusicXML, UST) carry the vocals only.
       "delay": {"time": "8d", "feedback": 0.3, "mix": 0.15},   // times: 1 2 2d 4 4d 4t 8 8d 8t 16 16d 16t 32 or beats
       "reverb": 0.0, "reverb_decay": 1.2,   // built-in room (the mixer also adds role-based reverb)
       "humanize": {"timing_ms": 2, "velocity": 0.05},
-      "split": true,           // drum kits: separate kick / snare / hats / cymbals stems
+      "split": true,           // drum kits: true or "groups" = kick / snare / hats / cymbals stems,
+                               // "each" = one stem per kind of drum, false or "kit" = one stem
+      "sound": "generaluser-gs",   // a sampled sound instead of the synth (see Sampled sounds)
       "mute": false
     }
   },
@@ -101,6 +103,75 @@ interchange formats (SVP, MIDI, MusicXML, UST) carry the vocals only.
 }
 ```
 
+## Sampled sounds
+
+Any pitched instrument and any drum kit can play samples instead of the synth: a SoundFont 2
+file, an SFZ instrument, or a folder of WAV files. `sound` names it:
+
+```jsonc
+"bass":  {"preset": "bass_pick", "sound": "generaluser-gs"},              // an installed sound set (synth2 sounds list)
+"keys":  {"preset": "piano", "sound": "samples/MyPiano.sfz"},             // a file or folder, relative to the project
+"gtr":   {"preset": "gtr_clean", "sound": {"set": "generaluser-gs", "preset": "0:27", "release": 0.4}},
+"pad":   {"preset": "pad", "sound": [{"set": "generaluser-gs", "preset": "strings"},      // two layers
+                                     {"set": "generaluser-gs", "preset": "choir", "gain_db": -6, "transpose": 12}]},
+"str":   {"sound": "generaluser-gs", "preset": "Tremolo Strings"},        // no synth preset: 'preset' names the sample preset
+"drums": {"type": "drums", "kit": "rock", "sound": "avl-drumkits",
+          "voices": {"snare": {"tune": -1, "gain_db": 2}, "kick": {"sample": "samples/my_kick.wav"}}}
+```
+
+- `preset` stays the synth preset. It decides the instrument's role, register and voicing, and it
+  **plays when the sound cannot be loaded** (not installed on this machine, file missing or
+  unreadable): the render goes on, the stem carries a warning, and `get_backing` lists it under
+  `problems`. Nothing is ever an error because a sound is missing.
+- Which preset of the sound plays: `sound.preset` by name (`"Finger Bass"`), `"bank:program"`
+  (`"0:33"`), program number, or a General MIDI name or short alias (`"strings"`, `"slap bass"`,
+  `"flute"` ...). Without it, the General MIDI program that fits the synth preset is used (bass_pick ->
+  Electric Bass (pick), piano -> Acoustic Grand Piano, gtr_clean -> Electric Guitar (clean) ...); a
+  drum kit takes the kit of bank 128 that fits its `kit` (rock -> Power, electro -> Electronic).
+  For a set of several files, `sound.file` picks the file.
+- When `preset` is not a synth preset and the instrument has a `sound`, `preset` names the sample
+  preset, and the stand-in synth preset is `fallback`, or the one that fits the General MIDI
+  program.
+- Paths are absolute, or relative to the arrangement's top-level `"sample_dir"`, the project
+  file's folder, or the working directory.
+- The level is matched to the synthesised instrument the sound replaces (`"normalize": false`
+  keeps the samples' own level), so swapping sounds does not upset the mix.
+
+Options of a sound layer (all optional):
+
+| option | meaning |
+|---|---|
+| `set` / `path` | installed set id / file or folder |
+| `file` | which file of a set with several |
+| `preset` | preset name, `"bank:program"`, program number, General MIDI name |
+| `tune`, `transpose` | cents added to every note; semitones (which key of the sound a note plays) |
+| `gain_db`, `pan`, `normalize` | level trim, pan offset, level matching on/off |
+| `attack`, `hold`, `decay`, `sustain`, `release` | amplitude envelope overrides (s; sustain 0..1) |
+| `cutoff`, `resonance`, `keytrack`, `vel_to_cutoff` | low-pass filter: Hz at full velocity, dB of peak, 0..1 key tracking, octaves it closes at velocity 0 |
+| `velocity_curve`, `vel_sens` | loudness = velocity ** curve (2 = the formats' default); 0..1 how much velocity matters |
+| `vibrato`, `vibrato_rate`, `vibrato_delay` | semitones, Hz, s |
+| `mono`, `glide` | each note cuts the previous one (default: as the synth preset); portamento s |
+| `key_range`, `vel_range` | `["C2", "C5"]`, `[1, 90]`: where the layer plays (splits, velocity switches) |
+| `round_robin` | `false` = always the first take |
+| `drift` | cents of random detuning per note (seeded: a render repeats bit for bit) |
+| `gate` | kits: s a SoundFont drum key is held (default 0.3; one-shot samples ignore it) |
+
+`humanize` (timing, velocity) works as for the synth. Round robins and random layers are chosen
+from the note's position in the song, so any part of the song renders the same takes.
+
+Kits: every voice plays the kit's sample on its General MIDI key (kick 36, snare 38, hat 42,
+ohat 46, crash 49 ...); a drum the kit does not have is synthesised (reported). Per-voice options
+in `voices`: `tune` (semitones), `gain_db`, `pan`, `note` (another key of the kit), `sample`
+(a sample file of your own for this drum), `length` (s, cut the tail). The synth voice's own
+parameters stay valid next to them (they shape the stand-in). Open hats are choked by the next
+hat; a kit's own choke groups are honoured.
+
+Folders of WAV files: a kit folder names its drums in the file or folder names (`kick.wav`,
+`Snare/hard_v2_rr1.wav`, `HiHat Open.wav`, `tom-l.wav`; `_v1 _v2` or `soft / accent` = velocity
+layers, `_rr1 _rr2` = round robins); a multisample names its notes (`Piano_C#4.wav`,
+`bass_A1_mf.wav`). WAV: 8/16/24/32-bit PCM and 32/64-bit float. FLAC and Ogg need the optional
+`soundfile` package. Compressed SoundFonts (`.sf3`) are not supported.
+
 ## Patterns
 
 ### drums
@@ -112,6 +183,17 @@ one-bar pattern. Open hats are choked by the next closed hat.
 Voices: `kick snare clap rim hat ohat crash ride tom1 tom2 tom3 shaker tamb cowbell snap`
 (aliases: bd sd cp hh oh cr rd ht mt lt ...). Stems: `<kit> kick`, `<kit> snare` (snare, clap, rim,
 snap, toms), `<kit> hats` (hats, shaker, tamb, cowbell), `<kit> cymbals` (crash, ride).
+
+With `"split": "each"` every kind of drum has a stem of its own: `<kit> kick`, `snare`, `clap`,
+`rim`, `snap`, `toms`, `hat` (closed and pedal), `ohat`, `shaker`, `tamb`, `cowbell`, `crash`
+(crash, splash, china), `ride` (ride and its bell), and one per family of the further percussion.
+This is the default for a kit that names a `sound`.
+
+Further percussion voices (General MIDI keys; a synthesised kit plays the nearest synthesised
+voice): `kick2 snare2 phat (pedal hat) crash2 splash china ride2 ridebell tom1b tom2b tom3b
+bongo_hi bongo_lo conga_mute conga_hi conga_lo timbale_hi timbale_lo agogo_hi agogo_lo cabasa
+maracas whistle guiro claves woodblock_hi woodblock_lo cuica triangle_mute triangle vibraslap`.
+A lane named `n<key>` (or just the number, e.g. `"n27"`, `"85"`) plays that key of a sampled kit.
 
 ### line (bass lines and other chord-relative monophonic parts)
 `steps` holds one degree token per step, relative to the chord playing at that step:

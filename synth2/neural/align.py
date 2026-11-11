@@ -271,14 +271,16 @@ def phrase_frames(groups, end: float, pred, frame: float, min_vowel: float | Non
     return seq, durs, b[0] - HEAD, is_vowel
 
 
-def phrase_bounds(units, frame: float) -> tuple[float, float]:
+def phrase_bounds(units, frame: float, before: float = 0.0) -> tuple[float, float]:
     """Seconds outside which a phrase has no frames, whatever the duration model predicts.
 
-    The head starts at most ``PAD`` and ``HEAD`` frames before the first unit; the end moves
-    past the last unit by at most one frame per phoneme (each phoneme gets at least a frame).
+    The head starts at most ``PAD`` and ``HEAD`` frames before the first unit's consonants
+    (and ``before`` s more: the breath a phrase may start with); the end moves past the last
+    unit by at most one frame per phoneme (each phoneme gets at least a frame).
     """
     phones = sum(len(u.phones) + 2 for u in units)
-    return units[0].start - PAD - (HEAD + 1) * frame, units[-1].end + (TAIL + 1 + phones) * frame
+    start = units[0].start - (units[0].lead or 0.0) - before
+    return start - PAD - (HEAD + 1) * frame, units[-1].end + (TAIL + 1 + phones) * frame
 
 
 # ---- slow-motion rendering ------------------------------------------------------------------------

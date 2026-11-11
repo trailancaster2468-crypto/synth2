@@ -20,8 +20,8 @@ import re
 from dataclasses import dataclass, field
 
 from ..timing import note_to_midi, parse_duration
-from . import theory
-from .drums import DRUM_DEFAULTS, DRUM_VOICES, canonical_voice
+from . import gm, soundbank, theory
+from .drums import ALL_VOICES, DRUM_DEFAULTS, DRUM_VOICES, canonical_voice
 from .fx import FX_SOUNDS, PROCESS_EFFECTS
 from .synth import PRESETS, SYNTH_DEFAULTS
 
@@ -47,10 +47,18 @@ DELAY_TIMES = {"1": 4.0, "2": 2.0, "2d": 3.0, "4": 1.0, "4d": 1.5, "4t": 2 / 3, 
                "8t": 1 / 3, "16": 0.25, "16d": 0.375, "16t": 1 / 6, "32": 0.125}
 
 TOP_KEYS = {"format", "version", "title", "key", "swing", "humanize", "energy_response", "instruments", "patterns",
-            "sections", "fills", "events", "stops", "comment", "notes", "description", "length_bars"}
+            "sections", "fills", "events", "stops", "comment", "notes", "description", "length_bars", "sample_dir"}
 INSTRUMENT_KEYS = {"type", "preset", "kit", "params", "voices", "gain_db", "pan", "role", "sidechain", "width",
                    "reverb", "reverb_decay", "delay", "eq", "drive", "low", "center", "voicing", "transpose", "octave",
-                   "humanize", "strum", "mute", "split", "comment", "description"}
+                   "humanize", "strum", "mute", "split", "comment", "description", "sound", "fallback"}
+# per-drum options of a sampled kit (next to the synthesised voice's own parameters)
+SAMPLED_VOICE_KEYS = {"note", "sample", "tune", "gain_db", "pan", "length"}
+_SOUND_NUMBERS = {"tune": (-1200, 1200), "transpose": (-48, 48), "gain_db": (-40, 24), "pan": (-1, 1),
+                  "attack": (0, 20), "hold": (0, 20), "decay": (0, 60), "sustain": (0, 1), "release": (0, 30),
+                  "cutoff": (20, 20000), "resonance": (0, 24), "keytrack": (0, 1), "vel_to_cutoff": (0, 6),
+                  "velocity_curve": (0.1, 4), "vel_sens": (0, 1), "vibrato": (0, 2), "vibrato_rate": (0.1, 12),
+                  "vibrato_delay": (0, 5), "glide": (0, 1), "drift": (0, 50), "gate": (0.02, 10)}
+_SOUND_BOOLS = ("normalize", "mono", "round_robin")
 PATTERN_KEYS = {"kind", "type", "grid", "bars", "swing", "lanes", "steps", "velocity", "gate", "rhythm", "voicing",
                 "center", "low", "octave", "transpose", "strum", "mode", "order", "octaves", "notes", "score",
                 "relative", "comment", "description", "accent"}
@@ -99,6 +107,10 @@ class Instrument:
     strum: float = 0.0
     mute: bool = False
     split: bool = True
+    stems: str = "groups"  # drum kits: "groups" (kick / snare / hats / cymbals), "each" (one per kind of drum), "kit"
+    kit: str = "pop"
+    sound: list | None = None  # sampled sound layers (see FORMAT.md); None = synthesised
+    voice_sound: dict = field(default_factory=dict)  # sampled kits: per-voice options (tune, gain_db, sample ...)
 
 
 @dataclass
@@ -263,6 +275,24 @@ def _instrument(ctx: _Ctx, name: str, d) -> Instrument | None:
     if typ is not None and not isinstance(typ, str):
         ctx.err(f"{where}.type", "must be 'drums', 'synth' or 'fx'")
         return None
+    sound_given = d.get("sound") not in (None, False, "", [], {})
+    sound_preset = None
+    kit_like = preset in ("drums", "kit") or bool(d.get("kit")) or name.lower() in ("drums", "kit", "drumkit")
+    if sound_given and preset not in PRESETS and (typ == "synth" or (typ in (None, "") and not kit_like)):
+        # 'preset' names the sampled preset; the synth preset that stands in for it is 'fallback', or the one
+        # that fits its General MIDI program
+        sound_preset = preset
+        fb = d.get("fallback")
+        if fb is not None and fb not in PRESETS:
+            ctx.err(f"{where}.fallback", f"unknown preset {fb!r}{_suggest(fb, PRESETS)}; presets: {', '.join(PRESETS)}")
+            fb = None
+        if fb is None:
+            bp = gm.program_of(preset)
+            fb = gm.synth_preset_for(bp[1]) if bp is not None and bp[0] != 128 else "piano"
+        preset, typ = fb, "synth"
+    elif sound_given and typ in ("drums", "kit", "drum") or (sound_given and typ in (None, "") and kit_like):
+        if preset not in (None, "drums", "kit"):
+            sound_preset = preset
     if typ in (None, ""):
         if preset in PRESETS:
             typ = "synth"
@@ -335,29 +365,50 @@ def _instrument(ctx: _Ctx, name: str, d) -> Instrument | None:
         for v, ov in given.items():
             cv = canonical_voice(v)
             if cv is None:
-                ctx.err(f"{where}.voices", f"unknown drum voice {v!r}{_suggest(v, DRUM_VOICES)}; voices: "
-                                           f"{', '.join(DRUM_VOICES)}")
+                ctx.err(f"{where}.voices", f"unknown drum voice {v!r}{_suggest(v, ALL_VOICES)}; voices: "
+                                           f"{', '.join(ALL_VOICES)}, or n<key> for any key of a sampled kit")
                 continue
             if not isinstance(ov, dict):
                 ctx.err(f"{where}.voices.{v}", "must be an object of parameters")
                 continue
-            for k in ov:
-                if k not in DRUM_DEFAULTS[cv] and k != "bell":
+            synth_keys = DRUM_DEFAULTS[gm.synth_voice(cv)[0]]
+            good, sampled = {}, {}
+            for k, v_ in ov.items():
+                if k == "sample":
+                    if isinstance(v_, str) and v_:
+                        sampled[k] = v_
+                    else:
+                        ctx.err(f"{where}.voices.{v}.sample", "must be the path of a sample file")
+                    continue
+                if k not in synth_keys and k != "bell" and k not in SAMPLED_VOICE_KEYS:
                     ctx.warn(f"{where}.voices.{v}", f"unknown parameter {k!r} ignored; {cv} parameters: "
-                                                    f"{', '.join(DRUM_DEFAULTS[cv])}")
-            good = {}
-            for k in ov:
-                if k in DRUM_DEFAULTS[cv] or k == "bell":
-                    v_ = ov[k]
-                    if isinstance(v_, bool) or not isinstance(v_, (int, float)) or not math.isfinite(v_):
-                        ctx.err(f"{where}.voices.{v}.{k}", f"must be a number, got {v_!r}")
-                        continue
+                                                    f"{', '.join(synth_keys)}; sampled kits also take "
+                                                    f"{', '.join(sorted(SAMPLED_VOICE_KEYS))}")
+                    continue
+                if isinstance(v_, bool) or not isinstance(v_, (int, float)) or not math.isfinite(v_):
+                    ctx.err(f"{where}.voices.{v}.{k}", f"must be a number, got {v_!r}")
+                    continue
+                if k in synth_keys or k == "bell":
                     good[k] = float(v_)
+                if k in SAMPLED_VOICE_KEYS:
+                    sampled[k] = float(v_)
             voices.setdefault(cv, {}).update(good)
+            if sampled:
+                inst.voice_sound.setdefault(cv, {}).update(sampled)
         inst.params = voices
+        inst.kit = kit
         inst.role = "drums"
         inst.reverb_decay = 0.9
-        inst.split = bool(d.get("split", True))
+        split = d.get("split", "each" if sound_given else True)
+        if isinstance(split, str):
+            if split not in ("each", "groups", "kit"):
+                ctx.err(f"{where}.split", "must be true, false, 'groups' (kick / snare / hats / cymbals stems), "
+                                          "'each' (one stem per kind of drum) or 'kit' (one stem)")
+                split = "groups"
+            inst.stems = split
+        else:
+            inst.stems = "groups" if split else "kit"
+        inst.split = inst.stems != "kit"
     else:
         inst.role = "fx"
         inst.reverb_decay = 1.6
@@ -406,6 +457,11 @@ def _instrument(ctx: _Ctx, name: str, d) -> Instrument | None:
             inst.delay = {"beats": beats, "feedback": _num(ctx, f"{where}.delay.feedback", dl.get("feedback"), 0.35, 0, 0.9),
                           "mix": _num(ctx, f"{where}.delay.mix", dl.get("mix"), 0.2, 0, 1),
                           "pingpong": bool(dl.get("pingpong", True))}
+    if sound_given:
+        if typ == "fx":
+            ctx.warn(f"{where}.sound", "an FX rack has no sampled sounds; ignored")
+        else:
+            inst.sound = _sound_layers(ctx, f"{where}.sound", d["sound"], typ == "drums", sound_preset)
     hz = d.get("humanize")
     if hz is not None:
         if not isinstance(hz, dict):
@@ -415,6 +471,85 @@ def _instrument(ctx: _Ctx, name: str, d) -> Instrument | None:
                              "velocity": _num(ctx, f"{where}.humanize.velocity", hz.get("velocity"), None, 0, 0.5)}
             inst.humanize = {k: v for k, v in inst.humanize.items() if v is not None}
     return inst
+
+
+def _sound_layers(ctx: _Ctx, where: str, v, drums: bool, preset=None) -> list[dict] | None:
+    """The validated layers of an instrument's ``sound``: each a dict with ``set`` or ``path``
+    and options. Problems are reported; a layer that names no sound is dropped."""
+    items = v if isinstance(v, list) else [v]
+    out = []
+    for i, item in enumerate(items):
+        w = f"{where}[{i}]" if isinstance(v, list) else where
+        if isinstance(item, str) and item.strip():
+            item = item.strip()
+            layer = {"path": item} if soundbank.looks_like_path(item) else {"set": item}
+        elif isinstance(item, dict):
+            ctx.unknown_keys(w, item, soundbank.SOUND_KEYS)
+            layer = {}
+            for k in ("set", "path", "file"):
+                if item.get(k) is not None:
+                    if isinstance(item[k], str) and item[k].strip():
+                        layer[k] = item[k].strip()
+                    else:
+                        ctx.err(f"{w}.{k}", f"must be a string, got {item[k]!r}")
+            if "set" not in layer and "path" not in layer:
+                ctx.err(w, "needs 'set' (the id of an installed sound set) or 'path' (a .sf2 or .sfz file, a WAV "
+                           "file or a folder of samples)")
+                continue
+            pr = item.get("preset")
+            if pr is not None:
+                ok = (isinstance(pr, str) and pr.strip()) or (isinstance(pr, int) and not isinstance(pr, bool)) or (
+                    isinstance(pr, list) and len(pr) == 2 and all(isinstance(x, int) for x in pr))
+                if ok:
+                    layer["preset"] = pr.strip() if isinstance(pr, str) else pr
+                else:
+                    ctx.err(f"{w}.preset", "must be a preset name, 'bank:program', a program number or "
+                                           "[bank, program]")
+            for k, (lo, hi) in _SOUND_NUMBERS.items():
+                if item.get(k) is not None:
+                    x = _num(ctx, f"{w}.{k}", item[k], None, lo, hi)
+                    if x is not None:
+                        layer[k] = int(x) if k == "transpose" else x
+            for k in _SOUND_BOOLS:
+                if item.get(k) is not None:
+                    layer[k] = bool(item[k])
+            if item.get("cc") is not None:
+                c = item["cc"]
+                if isinstance(c, dict) and all(str(k).isdigit() and isinstance(x, (int, float)) and not isinstance(
+                        x, bool) for k, x in c.items()):
+                    layer["cc"] = {str(int(k)): float(min(127, max(0, x))) for k, x in c.items()}
+                else:
+                    ctx.err(f"{w}.cc", "must be an object of controller numbers and values 0..127, like {\"100\": 127}")
+            if item.get("keyswitch") is not None:
+                ks = _pitch(ctx, f"{w}.keyswitch", item["keyswitch"])
+                if ks is not None:
+                    layer["keyswitch"] = ks
+            kr = item.get("key_range")
+            if kr is not None:
+                if isinstance(kr, (list, tuple)) and len(kr) == 2:
+                    a, b = _pitch(ctx, f"{w}.key_range", kr[0]), _pitch(ctx, f"{w}.key_range", kr[1])
+                    if a is not None and b is not None:
+                        layer["key_range"] = [min(a, b), max(a, b)]
+                else:
+                    ctx.err(f"{w}.key_range", "must be [low, high] notes like [\"C2\", \"C5\"]")
+            vr = item.get("vel_range")
+            if vr is not None:
+                if isinstance(vr, (list, tuple)) and len(vr) == 2 and all(
+                        isinstance(x, (int, float)) and not isinstance(x, bool) for x in vr):
+                    layer["vel_range"] = [int(max(1, min(vr))), int(min(127, max(vr)))]
+                else:
+                    ctx.err(f"{w}.vel_range", "must be [low, high] MIDI velocities 1..127")
+        else:
+            ctx.err(w, "must be the id of an installed sound set, a path, or an object like "
+                       "{\"set\": \"<id>\", \"preset\": \"0:33\"}")
+            continue
+        if preset is not None and "preset" not in layer:
+            layer["preset"] = preset
+        out.append(layer)
+    if drums and len(out) > 1:
+        ctx.warn(where, "a drum kit plays one sound; the first layer is used")
+        out = out[:1]
+    return out or None
 
 
 _BOOL_PARAMS = {"mono"}
@@ -610,8 +745,8 @@ def _pattern(ctx: _Ctx, name: str, d, bpb: float):
         for lane, s in lanes.items():
             v = canonical_voice(lane)
             if v is None:
-                ctx.err(f"{where}.lanes", f"unknown drum voice {lane!r}{_suggest(lane, DRUM_VOICES)}; voices: "
-                                          f"{', '.join(DRUM_VOICES)}")
+                ctx.err(f"{where}.lanes", f"unknown drum voice {lane!r}{_suggest(lane, ALL_VOICES)}; voices: "
+                                          f"{', '.join(ALL_VOICES)}, or n<key> for any key of a sampled kit")
                 continue
             toks = split_steps(s)
             parsed = []
@@ -965,7 +1100,16 @@ def validate_arrangement(arr) -> list[str]:
     """All problems with an arrangement as messages starting with 'error:' or 'warning:' ([] = perfect)."""
     ctx = _Ctx()
     try:
-        _compile(ctx, arr, None, 4.0)
+        comp = _compile(ctx, arr, None, 4.0)
+        for name, inst in comp.instruments.items():
+            for layer in inst.sound or []:
+                sid = layer.get("set")
+                if sid and soundbank._installed(sid) is None and not soundbank.looks_like_path(sid) \
+                        and soundbank.find_path(sid, soundbank.project_dirs(None, arr)) is None:
+                    stand_in = "the synthesised kit" if inst.kind == "drums" else \
+                        f"the synthesised preset {inst.preset!r}"
+                    ctx.warn(f"instruments.{name}.sound", f"sound set {sid!r} is not installed on this machine: "
+                                                          f"{stand_in} plays instead (synth2 sounds install {sid})")
     except Exception as exc:  # pragma: no cover - defensive: never crash validation
         ctx.err("arrangement", f"could not be processed: {type(exc).__name__}: {exc}")
     return ctx.errors + ctx.warnings
@@ -1291,7 +1435,7 @@ def _compile(ctx: _Ctx, arr, project_key, bpb) -> Compiled:
                 continue
             voice = canonical_voice(e.get("voice", ""))
             if voice is None:
-                ctx.err(where, f"unknown drum voice {e.get('voice')!r}; voices: {', '.join(DRUM_VOICES)}")
+                ctx.err(where, f"unknown drum voice {e.get('voice')!r}; voices: {', '.join(ALL_VOICES)}")
                 continue
             drum_events[part].append(DrumEvent(beat, voice, vel))
         else:

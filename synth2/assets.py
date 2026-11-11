@@ -301,10 +301,6 @@ def ssl_context():
     return ctx
 
 
-def _is_url(text: str) -> bool:
-    return bool(re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", str(text)))
-
-
 def download(url: str, dest, *, size: int | None = None, progress: Progress | None = None,
              label: str = "", timeout: float = 60.0, retries: int = 3) -> int:
     """Stream ``url`` (http or https) into the file ``dest``. Stops as soon as more than
@@ -392,7 +388,7 @@ def _safe_parts(name: str) -> list[str]:
     for p in parts:
         if p == ".." or p.endswith((" ", ".")) and p.strip(". ") == "":
             raise UnsafeArchive(f"archive entry that leaves the target folder: {name!r}")
-        if ":" in p or any(ord(ch) < 32 for ch in p):
+        if any(ord(ch) < 32 for ch in p) or (os.name == "nt" and ":" in p):
             raise UnsafeArchive(f"archive entry with an invalid name: {name!r}")
     return parts
 
@@ -503,35 +499,35 @@ def _unzip(archive: Path, dest: Path, members, budget: _Budget) -> None:
                                     f"({exc})") from None
 
 
-def _untar(archive, dest: Path, members, budget: _Budget, *, archive_size: int,
-           fileobj=None, skip_links: bool = False) -> None:
+def _untar_members(tf, dest: Path, members, budget: _Budget, archive_size: int,
+                   skip_links: bool) -> None:
+    for member in tf:
+        budget.entry()
+        parts = _safe_parts(member.name)
+        if not parts or not _selected(parts, members):
+            continue
+        if member.isdir():
+            _target(dest, parts).mkdir(parents=True, exist_ok=True)
+            continue
+        if not member.isreg():
+            if skip_links and (member.issym() or member.islnk()):
+                continue
+            raise UnsafeArchive(f"archive entry {member.name!r} is a link or special file")
+        src = tf.extractfile(member)
+        if src is None:
+            raise UnsafeArchive(f"archive entry {member.name!r} cannot be read")
+        with src:
+            _copy_stream(src, _target(dest, parts), member.size, budget, archive_size)
+
+
+def _untar(archive: Path, dest: Path, members, budget: _Budget) -> None:
     import tarfile
 
     try:
-        tf = tarfile.open(name=None if fileobj else archive, fileobj=fileobj, mode="r:*")
-    except (tarfile.TarError, OSError, EOFError) as exc:
-        raise UnsafeArchive(f"not a readable tar archive ({exc})") from None
-    with tf:
-        try:
-            for member in tf:
-                budget.entry()
-                parts = _safe_parts(member.name)
-                if not parts or not _selected(parts, members):
-                    continue
-                if member.isdir():
-                    _target(dest, parts).mkdir(parents=True, exist_ok=True)
-                    continue
-                if not member.isreg():
-                    if skip_links and (member.issym() or member.islnk()):
-                        continue
-                    raise UnsafeArchive(f"archive entry {member.name!r} is a link or special file")
-                src = tf.extractfile(member)
-                if src is None:
-                    raise UnsafeArchive(f"archive entry {member.name!r} cannot be read")
-                with src:
-                    _copy_stream(src, _target(dest, parts), member.size, budget, archive_size)
-        except (tarfile.TarError, EOFError) as exc:
-            raise UnsafeArchive(f"damaged tar archive ({exc})") from None
+        with tarfile.open(archive, mode="r:*") as tf:
+            _untar_members(tf, dest, members, budget, os.path.getsize(archive), False)
+    except (tarfile.TarError, EOFError) as exc:
+        raise UnsafeArchive(f"{archive.name} is not a readable tar archive ({exc})") from None
 
 
 def _open_compressed(raw, name: str):
@@ -605,41 +601,18 @@ def _undeb(archive: Path, dest: Path, members, budget: _Budget) -> None:
             except ValueError:
                 raise UnsafeArchive(f"{archive.name} is damaged") from None
             if name.startswith("data.tar"):
-                reader = _open_compressed(_Window(fh, length), name)
-                import io
+                import lzma
+                import tarfile
+                import zlib
 
-                stream = reader if isinstance(reader, io.IOBase) else io.BufferedReader(reader)
                 try:
-                    import tarfile
-
-                    with tarfile.open(fileobj=stream, mode="r|") as tf:
-                        _untar_stream(tf, dest, members, budget, archive_size)
-                except (tarfile.TarError, EOFError, OSError) as exc:
-                    if isinstance(exc, OSError) and not isinstance(exc, (EOFError,)) \
-                            and exc.errno is not None:
-                        raise
+                    with tarfile.open(fileobj=_open_compressed(_Window(fh, length), name),
+                                      mode="r|") as tf:
+                        _untar_members(tf, dest, members, budget, archive_size, True)
+                except (tarfile.TarError, EOFError, lzma.LZMAError, zlib.error) as exc:
                     raise UnsafeArchive(f"{archive.name}: damaged data archive ({exc})") from None
                 return
             fh.seek(length + (length & 1), 1)
-
-
-def _untar_stream(tf, dest: Path, members, budget: _Budget, archive_size: int) -> None:
-    for member in tf:
-        budget.entry()
-        parts = _safe_parts(member.name)
-        if not parts or not _selected(parts, members):
-            continue
-        if member.isdir():
-            _target(dest, parts).mkdir(parents=True, exist_ok=True)
-            continue
-        if member.issym() or member.islnk():
-            continue
-        if not member.isreg():
-            raise UnsafeArchive(f"package entry {member.name!r} is a special file")
-        src = tf.extractfile(member)
-        if src is None:
-            raise UnsafeArchive(f"package entry {member.name!r} cannot be read")
-        _copy_stream(src, _target(dest, parts), member.size, budget, archive_size)
 
 
 def archive_kind(path) -> str | None:
@@ -684,7 +657,7 @@ def extract(archive, dest, *, kind: str = "auto", members: Iterable[str] = (),
     if kind == "zip":
         _unzip(archive, dest, members, budget)
     elif kind == "tar":
-        _untar(archive, dest, members, budget, archive_size=os.path.getsize(archive))
+        _untar(archive, dest, members, budget)
     else:
         _undeb(archive, dest, members, budget)
 
@@ -711,7 +684,9 @@ def staging_dir(base, item_id: str) -> Path:
 
     base = Path(base)
     base.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix=f".install-{item_id}-", dir=base))
+    stage = Path(tempfile.mkdtemp(prefix=f".install-{item_id}-", dir=base))
+    os.chmod(stage, 0o755)
+    return stage
 
 
 def clean_stale(base) -> None:
@@ -753,14 +728,17 @@ def put_in_place(stage, base, item_id: str) -> Path:
 
 def install_item(base, item_id: str, sources: Iterable[Source], manifest: dict,
                  manifest_name: str, *, local=None, progress: Progress | None = None,
-                 limits: Limits = DEFAULT_LIMITS, check: Callable[[Path], None] | None = None,
-                 workers: int = 1) -> Path:
+                 limits: Limits = DEFAULT_LIMITS,
+                 check: Callable[[Path], dict | None] | None = None,
+                 workers: int = 1, record_size: bool = False) -> Path:
     """Fetch, verify and unpack ``sources`` into ``<base>/<id>/files`` and write ``manifest``
-    (plus ``installed_size`` and ``installed_at``) as ``<base>/<id>/<manifest_name>``.
+    (plus ``installed_at``, and ``installed_size`` with ``record_size``) as
+    ``<base>/<id>/<manifest_name>``.
 
     ``local`` is an archive file (for an item with one source) or a folder holding the
     source files, used instead of downloading; local files are verified like downloads.
-    ``check(files_dir)`` may inspect the unpacked files and raise :class:`AssetError`.
+    ``check(files_dir)`` may inspect the unpacked files and raise :class:`AssetError`; a
+    dict it returns is merged into the manifest.
     The item is built in a staging folder inside ``base`` and renamed into place at the end:
     a failure leaves no trace and an existing install of the same id stays untouched.
     Licence acceptance is the caller's job (:func:`require_license`) and comes first.
@@ -787,11 +765,12 @@ def install_item(base, item_id: str, sources: Iterable[Source], manifest: dict,
             for n, src in enumerate(sources):
                 _fetch_one(src, n, len(sources), files, inbox, budget, local, progress)
         _rmtree(inbox)
-        if check is not None:
-            check(files)
         data = dict(manifest)
+        if check is not None:
+            data.update(check(files) or {})
         data.pop("installed_at", None)
-        data["installed_size"] = tree_size(files)
+        if record_size:
+            data["installed_size"] = tree_size(files)
         data["installed_at"] = now_stamp()
         write_manifest(stage, manifest_name, data)
         return put_in_place(stage, base, item_id)
@@ -871,14 +850,16 @@ def _fetch_parallel(sources, files: Path, inbox: Path, budget: _Budget,
 
 def add_item(base, item_id: str, path, manifest: dict, manifest_name: str, *,
              copy: bool = False, limits: Limits = DEFAULT_LIMITS,
-             check: Callable[[Path], None] | None = None) -> Path:
+             check: Callable[[Path, bool], dict | None] | None = None,
+             record_size: bool = False) -> Path:
     """Register something the user already has as ``<base>/<id>``.
 
     ``path`` is a folder or a file. With ``copy=False`` a folder or plain file is registered
-    in place: the manifest gets an absolute ``root`` and ``external: true`` and nothing is
-    copied. With ``copy=True`` (always for an archive) the contents are copied or unpacked
-    into ``<base>/<id>/files``. ``manifest`` must not contain ``root`` for the in-place
-    case; a relative ``root`` is kept for copies.
+    in place: the manifest gets ``external: true`` and nothing is copied. With ``copy=True``
+    (always for an archive) the contents are copied or unpacked into ``<base>/<id>/files``.
+    ``check(folder, external)`` receives the folder the files are in (``files``, or the
+    user's folder) and returns manifest fields to merge, ``root`` among them: relative to
+    the item folder for a copy, absolute for an item registered in place.
     """
     check_id(item_id)
     base, path = Path(base), Path(path).expanduser()
@@ -900,18 +881,20 @@ def add_item(base, item_id: str, path, manifest: dict, manifest_name: str, *,
                 import shutil
 
                 shutil.copyfile(path, files / path.name)
+            data["root"] = "files"
             if check is not None:
-                check(files)
-            data.setdefault("root", "files")
+                data.update(check(files, False) or {})
             data["external"] = False
-            data["installed_size"] = tree_size(files)
+            measured = files
         else:
-            root = path if path.is_dir() else path.parent
+            root = (path if path.is_dir() else path.parent).resolve()
+            data["root"] = str(root)
             if check is not None:
-                check(root)
-            data["root"] = str(root.resolve())
+                data.update(check(root, True) or {})
             data["external"] = True
-            data["installed_size"] = tree_size(path)
+            measured = path
+        if record_size:
+            data["installed_size"] = tree_size(measured)
         data["installed_at"] = now_stamp()
         write_manifest(stage, manifest_name, data)
         return put_in_place(stage, base, item_id)

@@ -28,7 +28,9 @@ Grammar summary
 * ``track: NAME key=value ...`` starts a track.  Options: ``voice``, ``style``
   (defaults to the voice's own style), ``lang``, ``gain`` (dB), ``pan`` (-1..1),
   ``reverb`` (send 0..1), ``mute``, ``solo``, ``seed``, ``engine`` (this track's
-  engine, same values as the header), ``voice.<field>=v`` (voice tweaks such as
+  engine, same values as the header), ``role`` (the track's role in the mix for
+  the neural engine: ``lead``, ``double``, ``harmony``, ``answer``, ``adlib``,
+  ``crowd``; ``"double:NAME"`` doubles track NAME), ``voice.<field>=v`` (voice tweaks such as
   ``voice.breathiness=0.3``; ``voice.neural.<name>=v`` tunes the neural engine,
   e.g. ``voice.neural.gender=0.2`` or ``voice.neural.fx.alien=0.6``) and
   ``style.<field>=v`` (expression-style overrides such as
@@ -69,7 +71,7 @@ __all__ = [
 
 HEADER_KEYS = ("title", "tempo", "bpm", "time", "meter", "key", "sample_rate", "engine", "master")
 TRACK_OPTIONS = ("voice", "style", "lang", "language", "gain", "gain_db", "pan", "reverb", "reverb_send",
-                 "mute", "solo", "seed", "engine", "voice.<field>", "voice.neural.<name>", "style.<field>")
+                 "mute", "solo", "seed", "engine", "role", "voice.<field>", "voice.neural.<name>", "style.<field>")
 INTERPOLATIONS = ("linear", "cubic", "step")
 DEFAULT_LYRIC = "la"
 
@@ -562,6 +564,13 @@ class _Parser:
                 t.seed = int(_parse_number(v, k, lineno, raw))
             elif k == "engine":
                 t.engine = _parse_engine(v, lineno, tok, raw)
+            elif k == "role":
+                from .engine.vocal_chain import ROLES, parse_role
+
+                t.role = _unquote(v, lineno, raw).strip()
+                if t.role and not parse_role(t.role)[0]:
+                    self.warn(lineno, f"unknown role {t.role!r}; roles: {', '.join(ROLES)} "
+                                      "(a double may name its track: \"double:Lead\")")
             else:
                 raise ScoreError(f"unknown track option {k!r}; valid options: {', '.join(TRACK_OPTIONS)}",
                                  lineno, tok, raw)
@@ -1015,6 +1024,8 @@ def _track_line(t: Track, index: int) -> str:
         parts.append(f"seed={t.seed}")
     if t.engine:
         parts.append(f"engine={_engine_token(t.engine)}")
+    if t.role:
+        parts.append(f"role={_value_token(t.role)}")
     for k, v in t.voice_params.items():
         parts.append(f"{k}={_num(v)}" if k.startswith("style.") else f"voice.{k}={_num(v)}")
     return " ".join(parts)

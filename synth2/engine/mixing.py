@@ -1282,8 +1282,19 @@ def vocal_to_band_ratio(vocal: np.ndarray, band: np.ndarray, sr: int, act: np.nd
     return _vbr(_bp_power(mono(vocal), sr, lo, hi), _bp_power(mono(band), sr, lo, hi), act)
 
 
-def _vocal_job(s: Source, sr: int, n: int, S: "_Settings", band_mode: bool, master_eq: list) -> dict:
-    y, si = _processed_vocal(s, sr, band_mode, S.vocal_chain and s.overrides.get("chain", True), master_eq)
+def _vocal_job(s: Source, sr: int, n: int, S: "_Settings", band_mode: bool, master_eq: list,
+               role: dict | None = None) -> dict:
+    scale = 1.0
+    if role is not None:  # a track with a role in the mix (vocal_chain.py) gets that role's chain, not the strip
+        from . import vocal_chain
+
+        y, si = vocal_chain.apply_role(np.asarray(s.audio), sr, role["role"], role.get("dial"), role.get("lead_env"),
+                                       role.get("copy_of"), float(s.overrides.get("pan", s.pan)))
+        scale = float(si.get("reverb_scale", 1.0))
+        if master_eq:
+            y = eq(y, master_eq, sr).astype(np.float32)
+    else:
+        y, si = _processed_vocal(s, sr, band_mode, S.vocal_chain and s.overrides.get("chain", True), master_eq)
     if len(y) < n:
         y = np.pad(y, (0, n - len(y)))
     y = y[:n]
@@ -1292,7 +1303,7 @@ def _vocal_job(s: Source, sr: int, n: int, S: "_Settings", band_mode: bool, mast
     st = np.empty((n, 2), dtype=np.float32)
     np.multiply(y, np.float32(g * gl), out=st[:, 0])
     np.multiply(y, np.float32(g * gr), out=st[:, 1])
-    return {"stem": st, "mono": y, "g": g, "info": si}
+    return {"stem": st, "mono": y, "g": g, "info": si, "reverb_scale": scale}
 
 
 def _low_end_trim(sources: list[Source], sr: int, master_eq: list, S: "_Settings") -> tuple[float, float | None]:
@@ -1420,8 +1431,10 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
                 progress=None, threads: int | None = None, fixed: dict | None = None) -> MixResult:
     """Mix vocal and backing sources into stems, a dry sum and the effect returns.
 
-    Vocal path: channel strip (``settings.vocal_chain``) -> fader / pan -> stem; sends to the
-    reverb (track ``reverb_send``) and the ping-pong delay (``settings.vocal_delay``).
+    Vocal path: channel strip (``settings.vocal_chain``; for a track with a role that a voice
+    engine noted in :mod:`.vocal_chain`, the role's chain and effects instead) -> fader / pan ->
+    stem; sends to the reverb (track ``reverb_send``) and the ping-pong delay
+    (``settings.vocal_delay``).
     Backing path (``band_mode``): balance -> mid/side -> role EQ (mid) and EQ x width with mono
     bass (side), one FFT pass -> role compressor -> kick sidechain duck (stems flagged
     ``sidechain``) -> vocal-keyed ducking and a 1.5-4 kHz carve of the mid -> gain -> instrument
@@ -1450,13 +1463,20 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
     vocals = [s for s in sources if s.kind == "vocal"]
     backing = [s for s in sources if s.kind != "vocal"]
     done = 0
-    for s, r in zip(vocals, _run_jobs(lambda s: _vocal_job(s, sr, n, S, band_mode, master_eq), vocals, threads)):
+    roles: dict = {}
+    if vocals and S.vocal_chain:
+        from . import vocal_chain
+
+        roles = vocal_chain.mix_roles(vocals, sr)
+    role_of = lambda s: roles.get(s.key) if s.overrides.get("chain", True) else None  # noqa: E731
+    for s, r in zip(vocals, _run_jobs(lambda s: _vocal_job(s, sr, n, S, band_mode, master_eq, role_of(s)), vocals,
+                                      threads)):
         done += 1
         if progress:
             progress(done / max(1, len(sources)), f"mixed {s.name}")
         st, y, g = r["stem"], r["mono"], r["g"]
         vocal_bus += st
-        rs = float(s.overrides.get("reverb", s.reverb_send))
+        rs = float(s.overrides.get("reverb", s.reverb_send * r.get("reverb_scale", 1.0)))
         if rs > 0:
             rev_send += y * np.float32(g * rs)
         ds = float(s.overrides.get("delay", s.delay_send))

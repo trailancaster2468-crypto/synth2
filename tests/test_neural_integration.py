@@ -268,6 +268,67 @@ def test_level_and_loudness_changes_reuse_the_cached_phrases(warm, cached):
     assert rms(faded[:SR // 2]) > 0.8 * rms(base[:SR // 2])
 
 
+# ---- the dial, breaths, ad-lib mode, roles ---------------------------------------------------------
+LINES = """tempo: 100
+track: Lead voice=aurora style=pop lang=en
+C4 q test  D4 e stick  E4 e catch  r q  E4 q sits | r h  C4 q take  D4 q two
+"""
+SHOUTS = """tempo: 120
+track: Shouts voice=aurora style=pop lang=en voice.neural.adlib=1
+C4 e hey  r e  C4 e hey  r e  E4 e click  E4 e click  r q
+"""
+
+
+def test_breaths_and_the_dial_change_what_is_sung(monkeypatch):
+    monkeypatch.delenv("SYNTH2_NEURAL_DIAL", raising=False)
+    crisp, rep = sing(text=LINES)
+    info = rep["neural"]
+    assert info["dial"] == "crisp" and info["failed"] == 0 and info["pitch_fallbacks"] == 0
+    breaths = [(ph["frame"] + sum(ph["frames"][:i]), n) for ph in info["alignment"]
+               for i, (q, n) in enumerate(zip(ph["phones"], ph["frames"])) if q == "AP"]
+    assert len(breaths) == 3  # before each line and in the rest inside the first
+    f = info["frame_s"]
+    rms = lambda x, a, b: float(np.sqrt(np.mean(np.asarray(x[int(a * SR):int(b * SR)], np.float64) ** 2)))
+    start, n = breaths[1]
+    a, b = start * f + 0.03, (start + n) * f - 0.03
+    assert 1e-4 < rms(crisp, a, b) < 0.5 * rms(crisp, 0.3, 1.5)  # a breath: audible, well under the notes
+    dry, rep = sing(text=LINES, edit=lambda p, tr: tr.voice_params.update({"neural.breaths": 0}))
+    assert not any("AP" in ph["phones"] for ph in rep["neural"]["alignment"]) and rms(dry, a, b) < 0.3 * rms(crisp, a, b)
+    smooth, rep = sing(text=LINES, edit=lambda p, tr: tr.voice_params.update({"neural.dial": 0}))
+    assert rep["neural"]["dial"] == "smooth" and len(smooth) == len(crisp) and not np.array_equal(smooth, crisp)
+    assert rms(smooth, 0.3, 1.5) == pytest.approx(rms(crisp, 0.3, 1.5), rel=0.5)
+    again, _ = sing(text=LINES)
+    assert np.array_equal(again, crisp)
+
+
+def test_adlib_hits_are_stamped_copies_of_one_take():
+    audio, rep = sing(text=SHOUTS)
+    hits = rep["neural"]["hits"]
+    assert [h["lyric"] for h in hits] == ["hey", "hey", "click", "click"] and rep["neural"]["phrases"] == 2
+    assert rep["neural"]["pitch"] == "adlib" and rep["neural"]["failed"] == 0
+    first, second = (int(round(h["t"] * SR)) for h in hits[:2])
+    assert np.abs(audio[first:first + 6000]).max() > 0.02
+    assert np.array_equal(audio[first:first + 9000], audio[second:second + 9000])
+    part, _ = sing(text=SHOUTS, t0=0.4, t1=1.6)
+    a = int(round(0.4 * SR))
+    assert np.array_equal(part, audio[a:a + len(part)])
+
+
+def test_a_lead_goes_through_its_chain_in_the_mix():
+    def render(role):
+        p, tr = twinkle()
+        tr.role = role
+        return render_project(p, engine="neural", quality="draft", end_beat=8.0)
+
+    lead, plain = render("lead"), render("")
+    strip = lead.report["mix"]["vocal_strips"]["Lead"]
+    assert strip["role"] == "lead" and strip["dial"] == "crisp" and strip["chain"]["rider"]["max_up_db"] >= 0
+    assert "role" not in plain.report["mix"]["vocal_strips"]["Lead"]
+    assert lead.report["tracks"][0]["role"] == "lead" and plain.report["tracks"][0]["role"] == ""
+    assert len(lead.audio) == len(plain.audio) and not np.array_equal(lead.audio, plain.audio)
+    assert np.isfinite(lead.audio).all() and np.abs(lead.mono()).max() > 0.01
+
+
 @pytest.mark.skipif(not os.environ.get("SYNTH2_TEST_BANK2"), reason="SYNTH2_TEST_BANK2 names no second models folder")
 def test_a_second_voicebank_loads_and_sings(monkeypatch):
     nb = backend()
