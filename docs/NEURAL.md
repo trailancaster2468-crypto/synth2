@@ -99,8 +99,8 @@ model asks for attribution, `credits`.
 | Module | Role |
 |---|---|
 | `__init__.py` | `available(bank=None) -> (ok, reason)`, `backend(bank=None)`, `status()`, `credits(bank=None)`, `refresh()`. Cheap to import, never raises. |
-| `models.py` | Where models live and which are installed (`models_dir`, `InstalledModel`, `read_manifest`, `installed`, `find`, `vocoder_for`), plus the installer. |
-| `cli.py` | The `synth2 models` commands. |
+| `models.py` | Where models live and which are installed (`models_dir`, `InstalledModel`, `read_manifest`, `installed`, `find`, `vocoder_for`), plus the installer (`REGISTRY`, `install`, `add_local`, `remove`); downloading, verifying and extracting are in `synth2/assets.py`. |
+| `cli.py` | `synth2 models list`, `install`, `add`, `remove` and `path`. Exposes `add_parser(subparsers)` and `run(args)`. |
 | `voicebank.py` | Loads a DiffSinger voicebank folder: `dsconfig.yaml` files, phoneme and language tables, speakers and voice modes, ONNX sessions (lazy and shared, or fresh and seeded; thread count from `SYNTH2_NEURAL_THREADS`). |
 | `phonemes.py` | Maps Synth2 phonemes to a voicebank's phoneme set per language, with fallbacks for phonemes the bank lacks. |
 | `align.py` | Pure functions from the planner's timed units to what the models are fed: phrases, word groups (vowel on the note onset), breaths, consonant classes and caps, frame durations, slow-motion grids, the burst squeeze, the voicing floors, the breath curve, the phrase seed. |

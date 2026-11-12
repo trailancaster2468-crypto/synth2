@@ -1121,15 +1121,64 @@ DRUM_GROUP_PRESETS: dict[str, dict[str, Any]] = {
     "cymbals": {"eq": [("hp", 250, 0, 0.7071)], "comp": None,
                 "duck": 0.5, "carve": 0.6, "reverb": 0.03, "width": 1.0, "mono_below": None, "crest_db": 10.0},
 }
+DRUM_GROUPS = tuple(DRUM_GROUP_PRESETS)  # the four group stems; the entries added below are single drums
+
+
+def _drum(base: str, hp: float, **over) -> dict[str, Any]:
+    """The preset of group ``base`` with the high-pass at ``hp`` Hz (the bands after it kept) and ``over``."""
+    pre = dict(DRUM_GROUP_PRESETS[base])
+    pre["eq"] = [("hp", hp, 0, 0.7071), *pre["eq"][1:]]
+    pre.update(over)
+    return pre
+
+
+# Stems of a kit split per kind of drum ("<name> clap", "... toms", "... congas", ...). Each keeps the
+# treatment of the group it used to be mixed in (snare: clap, rim, snap, toms; hats: hat, ohat, shaker, tamb,
+# cowbell; cymbals: crash, ride) with a high-pass under its own lowest partial; a click gets the transient
+# limiter instead of the compressor. Hand drums and the small percussion start from one preset ("perc", the
+# perc role's own values); what sounds in the vocal's band (cuica, whistle) is carved and ducked more.
+_HAND = {"eq": [("hp", 160, 0, 0.7071)], "comp": None, "duck": 0.5, "carve": 0.5, "reverb": 0.08, "width": 1.0,
+         "mono_below": 150.0, "crest_db": 12.0}
+DRUM_GROUP_PRESETS.update({
+    "clap": _drum("snare", 160),
+    "rim": _drum("snare", 200, comp=None),
+    "snap": _drum("snare", 300, comp=None),
+    "toms": {"eq": [("hp", 55, 0, 0.7071), ("peak", 420, -2.0, 1.0)],
+             "comp": {"ratio": 3.0, "offset_db": -5.0, "attack": 0.015, "release": 0.12, "detector": "rms"},
+             "duck": 0.2, "carve": 0.3, "reverb": 0.05, "width": 1.0, "mono_below": 120.0, "crest_db": 13.0},
+    "hat": _drum("hats", 300),
+    "ohat": _drum("hats", 300),
+    "shaker": _drum("hats", 400),
+    "tamb": _drum("hats", 350),
+    "cowbell": _drum("hats", 250, crest_db=12.0),
+    "crash": _drum("cymbals", 250),
+    "ride": _drum("cymbals", 250, duck=0.4),
+    "perc": dict(_HAND),
+    "bongos": dict(_HAND, eq=[("hp", 140, 0, 0.7071)]),
+    "congas": dict(_HAND, eq=[("hp", 100, 0, 0.7071)], mono_below=120.0),
+    "timbales": dict(_HAND, eq=[("hp", 120, 0, 0.7071)]),
+    "agogo": dict(_HAND, eq=[("hp", 300, 0, 0.7071)], mono_below=None),
+    "claves": dict(_HAND, eq=[("hp", 500, 0, 0.7071)], mono_below=None),
+    "woodblock": dict(_HAND, eq=[("hp", 300, 0, 0.7071)], mono_below=None),
+    "triangle": dict(_HAND, eq=[("hp", 800, 0, 0.7071)], duck=0.3, carve=0.3, reverb=0.04, mono_below=None),
+    "guiro": dict(_HAND, eq=[("hp", 300, 0, 0.7071)], mono_below=None),
+    "cuica": dict(_HAND, eq=[("hp", 180, 0, 0.7071)], carve=0.8),
+    "whistle": dict(_HAND, eq=[("hp", 700, 0, 0.7071)], duck=0.6, carve=1.0, mono_below=None),
+    "vibraslap": dict(_HAND, eq=[("hp", 300, 0, 0.7071)], mono_below=None),
+})
 
 
 def role_preset(role: str, name: str = "") -> dict[str, Any]:
     """The default processing of a backing stem: its role's preset, refined for drum sub-stems
-    (by the last word of the stem name). Unknown roles are treated as keys."""
+    (by the last word of the stem name). A group stem (kick, snare, hats, cymbals) is known by
+    that word alone; a single drum's stem by the word after the kit's name ("kit clap"), so an
+    instrument that is simply called "shaker" keeps its role's preset. Unknown roles are
+    treated as keys."""
     pre = dict(ROLE_PRESETS.get(role, ROLE_PRESETS["keys"]))
     if role in ("drums", "perc"):
-        last = str(name).strip().split()[-1].lower() if str(name).strip() else ""
-        if last in DRUM_GROUP_PRESETS:
+        words = str(name).strip().lower().split()
+        last = words[-1] if words else ""
+        if last in DRUM_GROUPS or (len(words) > 1 and last in DRUM_GROUP_PRESETS):
             pre.update(DRUM_GROUP_PRESETS[last])
     return pre
 

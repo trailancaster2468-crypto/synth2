@@ -308,3 +308,60 @@ def test_projects_and_scores_carry_the_role():
     assert "role=" not in project_to_score(parse_score("tempo: 120\ntrack: A\nC4 q la\n"))
     odd = parse_score("tempo: 120\ntrack: A role=juggler\nC4 q la\n")
     assert odd.tracks[0].role == "juggler"  # kept, with a warning; the engines ignore it
+
+
+# ---- drum stems in the mixer ----------------------------------------------------------------------
+def test_stems_of_single_drums_have_presets_and_the_group_stems_keep_theirs():
+    groups = {
+        "kick": {"eq": [("hp", 32, 0, 0.7071, 4), ("peak", 380, -2.0, 1.2), ("peak", 3500, 1.0, 1.0)],
+                 "comp": {"ratio": 3.0, "offset_db": -4.0, "attack": 0.012, "release": 0.08, "detector": "rms"},
+                 "duck": 0.0, "carve": 0.0, "reverb": 0.0, "width": 1.0, "mono_below": 200.0, "crest_db": None},
+        "snare": {"eq": [("hp", 90, 0, 0.7071), ("peak", 450, -1.5, 1.0)],
+                  "comp": {"ratio": 3.0, "offset_db": -5.0, "attack": 0.01, "release": 0.1, "detector": "rms"},
+                  "duck": 0.2, "carve": 0.4, "reverb": 0.05, "width": 1.0, "mono_below": 150.0, "crest_db": 12.0},
+        "hats": {"eq": [("hp", 300, 0, 0.7071)], "comp": None, "duck": 0.3, "carve": 0.5, "reverb": 0.02, "width": 1.0,
+                 "mono_below": None, "crest_db": 10.0},
+        "cymbals": {"eq": [("hp", 250, 0, 0.7071)], "comp": None, "duck": 0.5, "carve": 0.6, "reverb": 0.03,
+                    "width": 1.0, "mono_below": None, "crest_db": 10.0},
+    }
+    for name, want in groups.items():  # as they were
+        assert mixing.DRUM_GROUP_PRESETS[name] == want and mixing.DRUM_GROUPS == tuple(groups)
+        assert mixing.role_preset("drums", f"Kit {name}") == {**mixing.ROLE_PRESETS["drums"], **want}
+        assert mixing.role_preset("drums", name) == {**mixing.ROLE_PRESETS["drums"], **want}
+    singles = ("clap rim snap toms hat ohat shaker tamb cowbell crash ride bongos congas timbales agogo claves "
+               "woodblock triangle guiro cuica whistle vibraslap perc").split()
+    keys = set(groups["snare"])
+    for name in singles:
+        pre = mixing.DRUM_GROUP_PRESETS[name]
+        assert set(pre) == keys and pre["eq"][0][0] == "hp" and 40 <= pre["eq"][0][1] <= 1000
+        assert mixing.role_preset("drums", f"Kit {name}") == {**mixing.ROLE_PRESETS["drums"], **pre}
+        assert mixing.role_preset("perc", f"Latin Kit {name.upper()}") == {**mixing.ROLE_PRESETS["perc"], **pre}
+        # an instrument that is simply called by a drum's name is not a kit's stem: its role's preset, as before
+        assert mixing.role_preset("perc", name) == mixing.ROLE_PRESETS["perc"]
+        assert mixing.role_preset("drums", name) == mixing.ROLE_PRESETS["drums"]
+        assert mixing.role_preset("keys", f"Kit {name}") == mixing.ROLE_PRESETS["keys"]
+        assert mixing.biquads(mixing.as_band(pre["eq"][0]), 44100)  # the bands are ones the mixer can build
+    # each drum keeps the dynamics of the group it used to be mixed in, above its own lowest partial
+    P = mixing.DRUM_GROUP_PRESETS
+    assert P["clap"]["comp"] == P["snare"]["comp"] and P["clap"]["eq"][0][1] > P["snare"]["eq"][0][1]
+    assert P["rim"]["comp"] is None and P["rim"]["crest_db"] == 12.0 and P["toms"]["eq"][0][1] < P["snare"]["eq"][0][1]
+    assert P["hat"] == P["hats"] and P["ohat"] == P["hats"] and P["crash"] == P["cymbals"]
+    assert mixing.role_preset("perc", "Kit perc") == mixing.ROLE_PRESETS["perc"]  # the rest: the perc role's values
+    assert P["whistle"]["carve"] > P["bongos"]["carve"]  # what sounds in the vocal's band makes more room
+    assert mixing.role_preset("drums", "") == mixing.ROLE_PRESETS["drums"]
+
+
+def test_a_single_drums_stem_goes_through_the_mix():
+    from synth2.project import MasterSettings
+
+    rng = np.random.default_rng(1)
+    n = SR
+    hits = np.zeros((n, 2))
+    for k in range(0, n, SR // 4):
+        hits[k:k + 800] += (rng.standard_normal((800, 1)) * np.exp(-np.arange(800) / 150.0)[:, None]) * 0.3
+    src = lambda name: mixing.Source(key=name, name=name, kind="backing", audio=hits.copy(), role="drums")
+    mix = mixing.mix_sources([src("Kit clap"), src("Kit congas"), src("Kit snare")], SR, band_mode=True,
+                             settings=MasterSettings())
+    assert set(mix.stems) == {"Kit clap", "Kit congas", "Kit snare"}
+    assert all(np.isfinite(v).all() and np.abs(v).max() > 0.01 for v in mix.stems.values())
+    assert not np.array_equal(mix.stems["Kit clap"], mix.stems["Kit congas"])  # other high-pass, other dynamics
