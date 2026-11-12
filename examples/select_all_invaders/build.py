@@ -238,11 +238,20 @@ SYNTH_MIX: dict[str, dict] = {
 # vocals in that band, so the band came out 5 dB lower under the voice. These entries put each sampled stem
 # back at the level and the 1-5 kHz level its synthesised stem has in the mix.
 SAMPLED_MIX: dict[str, dict] = {
-    "drums kick": {"eq_add": [["lowshelf", 60, -1.5, 0.7], ["peak", 2500, -4.0, 0.8], ["highshelf", 6000, -3.0, 0.7]]},
-    "drums snare": {"gain_db": -4.5, "eq_add": [["peak", 3500, 3.0, 0.8]]},
-    "bass": {"eq_add": [["highshelf", 1200, -6.0, 0.7]]},
-    "gtrL": {"gain_db": -2.0, "eq_add": [["peak", 1000, -1.5, 1.0], ["peak", 2600, -5.0, 0.7]]},
-    "gtrR": {"gain_db": -2.0, "eq_add": [["peak", 1000, -1.5, 1.0], ["peak", 2600, -4.0, 0.7]]},
+    "drums kick": {"gain_db": 0.0,
+                   "eq_add": [["lowshelf", 60, -1.5, 0.7], ["peak", 2500, -4.0, 0.8], ["highshelf", 6000, -3.0, 0.7]]},
+    # the sampled snare, clap and toms hit 5 to 8 dB harder at their peaks than the synthesised ones
+    "drums snare": {"gain_db": -6.5, "crest_db": 10.0, "eq_add": [["peak", 3500, 2.0, 0.8]]},
+    "drums clap": {"gain_db": -3.0},
+    "drums toms": {"gain_db": -4.5},
+    # sampled hats and cymbals have a body between 1 and 5 kHz that the synthesised ones (all above 6 kHz) lack
+    "drums hat": {"gain_db": -5.5, "eq_add": [["peak", 2500, -6.0, 0.6]]},
+    "drums ohat": {"gain_db": -5.5, "eq_add": [["peak", 2500, -6.0, 0.6]]},
+    "drums crash": {"gain_db": -2.0, "eq_add": [["peak", 2500, -5.0, 0.6]]},
+    "drums ride": {"gain_db": -2.0, "eq_add": [["peak", 2500, -5.0, 0.6]]},
+    "bass": {"eq_add": [["highshelf", 1200, -9.5, 0.7]]},
+    "gtrL": {"gain_db": -1.0, "eq_add": [["peak", 1000, -1.5, 1.0], ["peak", 2600, -5.0, 0.7]]},
+    "gtrR": {"gain_db": -1.5, "eq_add": [["peak", 1000, -1.5, 1.0], ["peak", 2600, -4.0, 0.7]]},
     "mute": {"gain_db": -3.0, "eq_add": [["highshelf", 1500, -8.0, 0.7]]},
     "bell": {"gain_db": -3.0},
 }

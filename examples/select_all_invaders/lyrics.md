@@ -3,6 +3,9 @@
 This is the final lyric sheet. It uses draft 3 as the base and adds the best lines from drafts 1 and 2.
 
 - **Roles:** `[AI]` is the deadpan idol lead (nova, robotic). `[ALIENS]` is the uncanny alien voice. `[HUMANS]` is the gang crowd. `[ALL]` is every voice. `[AI+ALIENS]` is a unison duet.
+- **Key:** E minor, F# minor from the final chorus (bar 113).
+- **Tracks:** every kind of sound has a track of its own (the lead's lines, its calls, each ad-lib, the aliens' lines, answers, chants, the crowd's lines, shouts and clicks): the table in `SPEC.md`, "Voices, tracks and roles". A line tagged `[AI]` below is on one of the lead's section channels; a short call of the lead inside another voice's section is on `AI Answer`.
+- **Credits:** sung by the neural engine, the vocals are AI-synthesised with the voicebank 绮萱 (Qixuan) and DiffSinger; see `SPEC.md`, "Credits a render carries".
 - **Calls:** a `(ROLE: ...)` in parentheses is a short backing call, sung by that role in the gaps of the main line.
 - **Line length:** each text line is a 2-bar phrase unless the section heading says otherwise.
 
