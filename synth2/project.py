@@ -458,6 +458,7 @@ class Project:
                 "gain_db": t.gain_db,
                 "pan": t.pan,
                 **({"engine": t.engine} if t.engine else {}),
+                **({"role": t.role} if t.role else {}),
             })
         if self.engine:
             out["engine"] = self.engine

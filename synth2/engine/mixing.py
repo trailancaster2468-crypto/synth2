@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from collections import deque
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -214,17 +215,20 @@ def eq_response(bands: Iterable, sr: int, freqs_hz: np.ndarray) -> np.ndarray:
 
 
 _GRID_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+_GRID_LOCK = threading.Lock()
 
 
 def _dense_z(sr: int) -> tuple[np.ndarray, np.ndarray]:
     """``(z^-1, z^-2)`` on the dense design grid (cached per sample rate)."""
-    if sr not in _GRID_CACHE:
-        k = dense_size(sr)
-        z1 = np.exp(-2j * np.pi * np.arange(k // 2 + 1) / k)
-        _GRID_CACHE[sr] = (z1, z1 * z1)
-        while len(_GRID_CACHE) > 4:
-            _GRID_CACHE.pop(next(iter(_GRID_CACHE)))
-    return _GRID_CACHE[sr]
+    with _GRID_LOCK:  # the mixer's jobs and whole renders run on several threads
+        hit = _GRID_CACHE.get(sr)
+        if hit is None:
+            k = dense_size(sr)
+            z1 = np.exp(-2j * np.pi * np.arange(k // 2 + 1) / k)
+            hit = _GRID_CACHE[sr] = (z1, z1 * z1)
+            while len(_GRID_CACHE) > 4:
+                _GRID_CACHE.pop(next(iter(_GRID_CACHE)))
+        return hit
 
 
 def dense_size(sr: int) -> int:

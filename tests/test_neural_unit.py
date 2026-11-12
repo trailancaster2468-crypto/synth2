@@ -1531,3 +1531,35 @@ def test_effects_run_on_the_bank_rate_buffer_with_absolute_time(fake, monkeypatc
     seen.clear()
     dry, rep = sing(p, tr, t0=1.0, t1=2.0)
     assert np.array_equal(dry, ref[SR:2 * SR]) and not seen and any("'zap' ignored" in w for w in rep["warnings"])
+
+
+def test_two_renders_at_the_same_time_give_what_they_give_alone(fake, monkeypatch):
+    """Roles travel on the mixer's sources, so nothing a render leaves behind is keyed by a track: two
+    projects rendered on two threads come out as they do one after the other."""
+    import threading
+
+    from synth2.engine import render_project
+
+    monkeypatch.setenv("SYNTH2_NEURAL_CACHE", "0")  # every phrase is sung, in both runs
+    a, b = parse_score(DUET), parse_score(DUET.replace("C4 q sing", "E4 q sing").replace("role=double", "role=harmony"))
+    b.tracks[0].id, b.tracks[1].id = a.tracks[0].id, a.tracks[1].id  # the same track ids in both projects
+    b.tracks[0].seed += 5
+    alone = [render_project(p, engine="neural") for p in (a, b)]
+    assert not np.array_equal(alone[0].audio[: len(alone[1].audio)], alone[1].audio[: len(alone[0].audio)])
+    for _ in range(3):
+        got = [None, None]
+        gate = threading.Barrier(2)
+
+        def run(i, p):
+            gate.wait()
+            got[i] = render_project(p, engine="neural")
+
+        threads = [threading.Thread(target=run, args=(i, p)) for i, p in enumerate((a, b))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for want, res in zip(alone, got):
+            assert np.array_equal(res.audio, want.audio)
+            assert {k: v["role"] for k, v in res.report["mix"]["vocal_strips"].items()} == \
+                {k: v["role"] for k, v in want.report["mix"]["vocal_strips"].items()}

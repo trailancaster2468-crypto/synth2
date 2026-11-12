@@ -867,3 +867,27 @@ def test_vocoder_memory_stays_small_per_sample(monkeypatch):
         p.tracks[0].add_note(1 + i, 1, 60 + (i * 5) % 12, "la")
     render_track(p, 0)
     assert st["peak"] / st["n"] < 45, st["peak"] / st["n"]
+
+
+def test_a_sound_that_is_not_installed_is_reported_once_in_the_arrangers_own_words(tmp_path, monkeypatch):
+    from synth2 import arranger
+
+    monkeypatch.setenv("SYNTH2_SOUNDS", str(tmp_path / "no-sounds"))
+    p = Project.new("song", bpm=120, voice="aurora")
+    p.sample_rate = 16000
+    p.tracks[0].add_note(0, 2, 60, "la")
+    p.backing = {"instruments": {"keys": {"preset": "piano", "sound": "no-such-set"},
+                                 "drums": {"type": "drums", "kit": "rock", "sound": "no-such-kit"},
+                                 "bass": {"preset": "bass_pick"}},
+                 "patterns": {"hold": {"kind": "chords", "rhythm": "x---------------"},
+                              "beat": {"kind": "drums", "lanes": {"kick": "x...x...x...x...", "snare": "....x.......x..."}},
+                              "root": {"kind": "line", "steps": "R...R...R...R..."}},
+                 "sections": [{"name": "A", "bars": 1, "chords": ["C"],
+                               "parts": {"keys": "hold", "drums": "beat", "bass": "root"}}]}
+    rep = render_project(p).report
+    want = arranger.sound_report(p)["warnings"]
+    assert len(want) == 2 and all("plays instead" in w for w in want)
+    # the same sentences as arranger.sound_report, each once (a kit's stems all carry the kit's warning)
+    assert sorted(w for w in rep["warnings"] if "plays instead" in w) == sorted(want)
+    assert "credits" not in rep and all("sound" not in b for b in rep["backing"])
+    assert {b["name"].split()[0] for b in rep["backing"]} == {"keys", "drums", "bass"}

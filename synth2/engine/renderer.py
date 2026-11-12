@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -319,6 +320,7 @@ def _backing_end_beat(project: Project, spec, kicks_beats: np.ndarray) -> float 
 # section preview of the same mix (same master settings, backing and track mixer settings) is
 # mastered like the full song instead of on its own
 _LEVEL_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_LEVEL_LOCK = threading.Lock()  # renders may run on several threads at once
 _LEVEL_KEYS = ("band_gain_db", "bus_threshold_db", "low_end_trim_db", "glue_threshold_db", "master_gain_db")
 
 
@@ -524,7 +526,8 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
     bpm = project.tempo.bpm_at(start_beat or 0.0) if hasattr(project.tempo, "bpm_at") else project.bpm
     mastered = band_mode or ms.loudness_target is not None
     level_key = _level_key(project, sr, engine) if mastered else None
-    fixed = _LEVEL_CACHE.get(level_key) if (mastered and partial) else None
+    with _LEVEL_LOCK:
+        fixed = _LEVEL_CACHE.get(level_key) if (mastered and partial) else None
     mix = mixing.mix_sources(sources, sr, band_mode=band_mode, settings=ms, kicks=kicks_abs - render0, bpm=bpm,
                              reverb_room=room, reverb_wet=ms.reverb_wet if reverb_tail > 0 else 0.0, fixed=fixed,
                              consume=True)
@@ -550,10 +553,11 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
         mix_info.update(minfo)
         levels = {k: mix_info.get(k) for k in _LEVEL_KEYS}
         if not partial and level_key:  # remember the full song's levels for section previews
-            _LEVEL_CACHE[level_key] = levels
-            _LEVEL_CACHE.move_to_end(level_key)
-            while len(_LEVEL_CACHE) > 8:
-                _LEVEL_CACHE.popitem(last=False)
+            with _LEVEL_LOCK:
+                _LEVEL_CACHE[level_key] = levels
+                _LEVEL_CACHE.move_to_end(level_key)
+                while len(_LEVEL_CACHE) > 8:
+                    _LEVEL_CACHE.popitem(last=False)
         mix_info["levels_from_full_render"] = fixed is not None
         for k in _LEVEL_KEYS:
             mix_info[k] = mixing._r(mix_info.get(k))

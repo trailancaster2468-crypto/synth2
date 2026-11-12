@@ -259,3 +259,10 @@ def test_relative_sound_paths_resolve_next_to_the_project_file(tmp_path, monkeyp
     assert arranger.sound_report(Project.from_dict(loaded.to_dict()))["instruments"]["keys"]["plays"] == "synth"
     fresh = Project.from_dict(loaded.to_dict())  # no file: only the working directory is searched
     assert soundbank.find_path("samples/ping_C4.wav", soundbank.project_dirs(fresh, fresh.backing)) is None
+
+
+def test_the_summary_names_a_tracks_role_when_it_has_one():
+    p = Project.new("x", bpm=100)
+    p.add_track("Double", role="double:Lead")
+    tracks = p.summary()["tracks"]
+    assert "role" not in tracks[0] and tracks[1]["role"] == "double:Lead"
