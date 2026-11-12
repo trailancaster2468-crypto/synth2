@@ -30,19 +30,20 @@ they overlap it. The values are documented next to the tables below; every one o
 measurement (levels against the lead, 1-5 kHz balance, section loudness, limiter activity, recognisers on
 the stems), none from listening.
 
-It writes ``out/select_all_invaders/``: ``select_all_invaders.wav`` (24-bit), ``stems/`` (one 24-bit WAV per
-vocal track and band stem; post-fader, pre-reverb), ``select_all_invaders.s2p.json``,
+It writes ``out/select_all_invaders/``: ``select_all_invaders.wav`` (24-bit), ``select_all_invaders.s2p.json``,
 ``select_all_invaders.mp3`` (320 kbps, when ffmpeg is installed; trimmed so its decoded true peak stays
 under the ceiling) and ``select_all_invaders.report.json`` (the render report with engines, credits and
 warnings, plus the analysis printed at the end: loudness per section, true peak, the vocal-to-band balance
 per section, the low-end balance, the long-term spectrum slope and, with ``--pitch``, the pitch accuracy of
-every vocal track).
+every vocal track). With ``--stems`` it also writes ``stems/``: one 24-bit WAV per vocal track and band stem
+(post-fader, pre-reverb), about a hundred files of 50 MB each for the whole song.
 
 Usage (from the repository root)::
 
     python examples/select_all_invaders/build.py                          # the whole song
     python examples/select_all_invaders/build.py --start-bar 33 --end-bar 48   # a quick section render
     python examples/select_all_invaders/build.py --engine formant         # without the neural models
+    python examples/select_all_invaders/build.py --stems                  # with the stems (5 GB for the song)
 
 A section render goes to ``out/select_all_invaders/preview/``. After a full render the mix levels
 (band gain, compressor thresholds, master gain) are saved in ``mix_levels.json``, and a section render
@@ -119,6 +120,9 @@ ALIEN_UNDER = {"crest_db": 8.0, "eq_add": [["peak", 300, -2.5, 1.0], ["peak", 28
 CROWD = {"crest_db": 12.0}  # the shouts are peaky
 
 # Every vocal channel: (kind, fader dB, pan, reverb send, delay send, strip overrides, in-channel effects).
+# The faders are set for the neural engine, whose voices have one level per voice: its detached hits, hooks and
+# chants come out 2 to 4 dB under its lines, and their faders make that up (measured against the lead, stem by
+# stem).
 # The lead is the anchor at 0 dB, dead centre, and nothing else is in the centre. The reverb send of a lead
 # channel is scaled by its dial setting (crisp: x 0.6), the delay send is into the ducked dotted-eighth
 # ping-pong (1 = the lead's). Strip overrides shape the mixer's channel strip (the tracks without a role; with
@@ -138,38 +142,39 @@ VOCAL_MIX: dict[str, tuple] = {
     # the harmony: its take right, its copy left, outside the doubles, more room
     "Harmony":             ("harmony", -8.6, 0.70, 0.65, 0.5, None, None),
     "Harmony L":           ("harmony", -10.1, -0.70, 0.65, 0.5, None, FX["harmony copy"]),
-    "Harmony Final":       ("harmony", -10.1, 0.70, 0.65, 0.5, None, None),
-    "Harmony Final L":     ("harmony", -11.6, -0.70, 0.65, 0.5, None, FX["harmony copy"]),
+    "Harmony Final":       ("harmony", -10.7, 0.70, 0.65, 0.5, None, None),
+    "Harmony Final L":     ("harmony", -12.2, -0.70, 0.65, 0.5, None, FX["harmony copy"]),
     # the lead's calls in other voices' sections: its own voice, a step to the right
     "AI Answer":           ("answer", -2.0, 0.18, 0.55, 0.6, None, None),
     # the lead's thrown-in sounds: off-centre, band-limited, little room; ハイ ハイ is thrown into the delay
-    "AI Click":            ("click", 0.0, -0.40, 0.15, 0.0, None, FX["click"]),
-    "AI Hai":              ("ad-lib", -3.0, -0.40, 0.15, 1.3, None, None),
+    "AI Click":            ("click", 1.0, -0.40, 0.15, 0.0, None, FX["click"]),
+    "AI Hai":              ("ad-lib", -1.6, -0.40, 0.15, 1.3, None, None),
     "AI Stutter":          ("stutter", 2.5, 0.0, 0.50, 0.3, None, FX["stutter"]),
     # the aliens' lines right of the centre; their answers and thrown-in sounds outside them
-    "Aliens":              ("alien lead", 1.5, 0.25, 0.30, 0.6, ALIEN, None),
-    "Aliens Verse":        ("alien lead", -1.0, 0.25, 0.30, 0.6, ALIEN, None),
-    "Aliens Bridge":       ("alien lead", 3.0, 0.30, 0.30, 0.6, ALIEN, None),
-    "Alien Answer":        ("alien answer", 1.0, 0.50, 0.30, 0.6, ALIEN, FX["alien answer"]),
-    "Alien Answer Bridge": ("alien answer", 2.5, 0.50, 0.30, 0.6, ALIEN, FX["alien answer"]),
-    "Aliens Hook":         ("alien backing", -5.0, 0.25, 0.40, 0.3, ALIEN_UNDER, FX["alien backing"]),
-    "Alien Unison":        ("alien backing", -1.5, -0.45, 0.40, 0.3, ALIEN_UNDER, FX["alien backing"]),
-    "Alien Ouch":          ("alien ad-lib", 0.5, 0.70, 0.15, 0.8, ALIEN, FX["alien adlib"]),
-    "Alien Nande":         ("alien ad-lib", 2.0, 0.70, 0.15, 1.3, ALIEN, FX["alien adlib"]),
-    "Alien Click":         ("alien click", 0.5, 0.70, 0.15, 0.0, ALIEN, FX["alien click"]),
-    "Alien Laugh":         ("alien laugh", -1.0, 0.70, 0.15, 1.0, ALIEN, FX["alien laugh"]),
-    "Alien Stutter":       ("alien stutter", 2.5, 0.50, 0.30, 0.3, ALIEN, None),
+    "Aliens":              ("alien lead", 2.1, 0.25, 0.30, 0.6, ALIEN, None),
+    "Aliens Verse":        ("alien lead", -0.4, 0.25, 0.30, 0.6, ALIEN, None),
+    "Aliens Bridge":       ("alien lead", 3.6, 0.30, 0.30, 0.6, ALIEN, None),
+    "Alien Answer":        ("alien answer", 1.7, 0.50, 0.30, 0.6, ALIEN, FX["alien answer"]),
+    "Alien Answer Bridge": ("alien answer", 4.9, 0.50, 0.30, 0.6, ALIEN, FX["alien answer"]),
+    "Aliens Hook":         ("alien backing", -2.0, 0.25, 0.40, 0.3, ALIEN_UNDER, FX["alien backing"]),
+    "Alien Unison":        ("alien backing", 1.6, -0.45, 0.40, 0.3, ALIEN_UNDER, FX["alien backing"]),
+    "Alien Ouch":          ("alien ad-lib", 3.9, 0.70, 0.15, 0.8, ALIEN, FX["alien adlib"]),
+    "Alien Nande":         ("alien ad-lib", 4.4, 0.70, 0.15, 1.3, ALIEN, FX["alien adlib"]),
+    "Alien Click":         ("alien click", 4.6, 0.70, 0.15, 0.0, ALIEN, FX["alien click"]),
+    "Alien Laugh":         ("alien laugh", 1.9, 0.70, 0.15, 1.0, ALIEN, FX["alien laugh"]),
+    "Alien Stutter":       ("alien stutter", 5.6, 0.50, 0.30, 0.3, ALIEN, None),
     # the two chant voices left and right of everything the aliens sing
-    "Alien Chant":         ("alien chant", 1.0, 0.60, 0.45, 0.6, ALIEN, FX["alien chant"]),
-    "Alien Chant 2":       ("alien chant", 0.0, -0.60, 0.50, 0.8, {"eq_add": [["peak", 280, -3.0, 1.0]]},
+    "Alien Chant":         ("alien chant", 4.8, 0.60, 0.45, 0.6, ALIEN, FX["alien chant"]),
+    "Alien Chant 2":       ("alien chant", 2.5, -0.60, 0.50, 0.8, {"eq_add": [["peak", 280, -3.0, 1.0]]},
                             FX["alien chant"]),
 }
-# The crowd: three voices wide apart (the third, an octave up, 2 dB lower), each kind at its own level and
-# send, dry of the delay. The whisper's fader is high because a whisper is quiet.
+# The crowd: three voices wide apart, each kind at its own level and send, dry of the delay:
+# kind -> (kind of sound, fader of voices 1 and 2, fader of voice 3 (an octave up), reverb send).
+# The whisper's fader is high because a whisper is quiet.
 CROWD_PAN = {"": -0.85, "2": 0.85, "3": -0.30}
-CROWD_KINDS = {"": ("crowd", -3.0, 0.55), "Answer": ("crowd", -3.0, 0.55), "Whisper": ("crowd", 3.0, 0.55),
-               "Hook": ("crowd", -8.5, 0.55), "Shout": ("crowd shout", -4.0, 0.40),
-               "Click": ("crowd shout", -3.5, 0.40)}
+CROWD_KINDS = {"": ("crowd", -4.5, -8.0, 0.55), "Answer": ("crowd", -5.0, -7.0, 0.55),
+               "Whisper": ("crowd", 4.0, 4.0, 0.55), "Hook": ("crowd", -9.0, -12.0, 0.55),
+               "Shout": ("crowd shout", -5.0, -7.0, 0.40), "Click": ("crowd shout", -4.5, -6.5, 0.40)}
 LEAD_TRACKS = tuple(k for k, v in VOCAL_MIX.items() if v[0] == "lead")  # the lead vocal (on several mixer channels)
 
 
@@ -190,8 +195,8 @@ def vocal_mix(name: str) -> dict | None:
     kind = next((x for x in w[1:] if x not in ("2", "3")), "")
     if kind not in CROWD_KINDS:
         return None
-    role, gain, send = CROWD_KINDS[kind]
-    return dict(zip(keys, (role, gain - (2.0 if voice == "3" else 0.0), CROWD_PAN[voice], send, 0.0, CROWD, FX[role])))
+    role, gain, gain3, send = CROWD_KINDS[kind]
+    return dict(zip(keys, (role, gain3 if voice == "3" else gain, CROWD_PAN[voice], send, 0.0, CROWD, FX[role])))
 
 
 # ------------------------------------------------------------------------------------------- the band mix
@@ -238,22 +243,33 @@ SYNTH_MIX: dict[str, dict] = {
 # vocals in that band, so the band came out 5 dB lower under the voice. These entries put each sampled stem
 # back at the level and the 1-5 kHz level its synthesised stem has in the mix.
 SAMPLED_MIX: dict[str, dict] = {
-    "drums kick": {"gain_db": 0.0,
-                   "eq_add": [["lowshelf", 60, -1.5, 0.7], ["peak", 2500, -4.0, 0.8], ["highshelf", 6000, -3.0, 0.7]]},
+    # (the sampled kick and bass are lighter under 120 Hz than the synthesised ones: no low cut, the bass up)
+    "drums kick": {"gain_db": 0.0, "eq_add": [["peak", 2500, -4.0, 0.8], ["highshelf", 6000, -3.0, 0.7]]},
     # the sampled snare, clap and toms hit 5 to 8 dB harder at their peaks than the synthesised ones
-    "drums snare": {"gain_db": -6.5, "crest_db": 10.0, "eq_add": [["peak", 3500, 2.0, 0.8]]},
-    "drums clap": {"gain_db": -3.0},
-    "drums toms": {"gain_db": -4.5},
-    # sampled hats and cymbals have a body between 1 and 5 kHz that the synthesised ones (all above 6 kHz) lack
-    "drums hat": {"gain_db": -5.5, "eq_add": [["peak", 2500, -6.0, 0.6]]},
-    "drums ohat": {"gain_db": -5.5, "eq_add": [["peak", 2500, -6.0, 0.6]]},
+    # (and the snare has more body and less crack: its rolls carry the pre-choruses)
+    "drums snare": {"gain_db": -4.0, "crest_db": 10.0, "eq_add": [["peak", 3000, 5.0, 0.7]]},
+    "drums clap": {"gain_db": -3.0, "crest_db": 10.0},
+    "drums toms": {"gain_db": -4.5, "crest_db": 10.0},
+    # sampled hats and cymbals have a body between 1 and 5 kHz that the synthesised ones (all above 6 kHz) lack,
+    # and the sampled cowbell of the bridge sits right in the voice's band
+    "drums hat": {"gain_db": -3.5, "eq_add": [["peak", 2500, -6.0, 0.6]]},
+    "drums ohat": {"gain_db": -3.5, "eq_add": [["peak", 2500, -6.0, 0.6]]},
+    "drums cowbell": {"gain_db": -5.0},
     "drums crash": {"gain_db": -2.0, "eq_add": [["peak", 2500, -5.0, 0.6]]},
     "drums ride": {"gain_db": -2.0, "eq_add": [["peak", 2500, -5.0, 0.6]]},
-    "bass": {"eq_add": [["highshelf", 1200, -9.5, 0.7]]},
-    "gtrL": {"gain_db": -1.0, "eq_add": [["peak", 1000, -1.5, 1.0], ["peak", 2600, -5.0, 0.7]]},
-    "gtrR": {"gain_db": -1.5, "eq_add": [["peak", 1000, -1.5, 1.0], ["peak", 2600, -4.0, 0.7]]},
+    "bass": {"gain_db": 0.0, "eq_add": [["highshelf", 1200, -9.5, 0.7]]},
+    "slap": {"gain_db": 0.5},
+    # the sampled guitars are mono sounds (the synthesised ones are detuned stereo stacks): further apart, so
+    # that the band stays as wide as it was
+    "gtrL": {"gain_db": -1.0, "pan": -0.8, "eq_add": [["peak", 1000, -1.5, 1.0], ["peak", 2600, -6.0, 0.7]]},
+    "gtrR": {"gain_db": -1.5, "pan": 0.8, "eq_add": [["peak", 1000, -1.5, 1.0], ["peak", 2600, -5.0, 0.7]]},
     "mute": {"gain_db": -3.0, "eq_add": [["highshelf", 1500, -8.0, 0.7]]},
     "bell": {"gain_db": -3.0},
+    # the pizzicato is duller than the synthesised pluck, the music box quieter
+    "pluck": {"gain_db": 2.5, "eq_add": [["peak", 550, -3.0, 1.0], ["peak", 2500, 2.0, 0.7]]},
+    "mbox": {"gain_db": 1.0},
+    # the sampled pad carries 13 dB more level under 700 Hz than the glassy synthesised one
+    "pad": {"gain_db": 1.5, "eq_add": [["lowshelf", 700, -6.0, 0.7]]},
 }
 
 MASTER: dict = {
@@ -616,7 +632,8 @@ def main(argv=None) -> int:
     ap.add_argument("--start-bar", type=int, default=None, help="first bar of a section render (1-based)")
     ap.add_argument("--end-bar", type=int, default=None, help="last bar of a section render (inclusive)")
     ap.add_argument("--out", type=Path, default=OUT, help=f"output folder (default {OUT})")
-    ap.add_argument("--no-stems", action="store_true", help="do not write the stems")
+    ap.add_argument("--stems", action="store_true", help="write the stems (about 100 files of 50 MB for the song)")
+    ap.add_argument("--no-stems", action="store_true", help=argparse.SUPPRESS)  # (the default now)
     ap.add_argument("--no-mp3", action="store_true", help="do not encode the mp3")
     ap.add_argument("--pitch", action="store_true", help="measure the pitch accuracy of every vocal track (slow)")
     ap.add_argument("--no-pitch", action="store_true", help=argparse.SUPPRESS)  # (the default now)
@@ -669,7 +686,7 @@ def main(argv=None) -> int:
     dest.mkdir(parents=True, exist_ok=True)
     write_wav(wav, res.audio, res.sample_rate, 24)
     print(f"  wrote {wav}")
-    if not args.no_stems:
+    if args.stems and not args.no_stems:
         sd = dest / ("stems" if not partial else f"stems_bars_{a}-{b}")
         if sd.exists():
             shutil.rmtree(sd)
