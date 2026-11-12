@@ -24,6 +24,12 @@ basses, the guitars, the plucks, bells, music box and pad (``synth2 sounds insta
 karoryfer-growlybass``). An instrument whose set is not installed plays its synthesised preset instead; the
 render report says which did, and carries the credits of the voicebank and of the sound sets used.
 
+The balance dial (``--balance``, :data:`BALANCES`): the same song and takes at four balances of the vocals
+against the band. ``A`` is the sampled band as it was first mixed, ``S`` the synthesised band, ``B`` (the
+default) the sampled band with its low end, punch, section dynamics and width restored, the vocal stack
+without its low mids and the vocals 2 dB lower against the band than in A, ``C`` the same with the vocals
+4 dB lower. Without the sound sets, B and C play the synthesised band with the vocals lower.
+
 The mix: the lead alone in the centre; its double close around it; the harmony on both sides; answers,
 ad-libs, the aliens and the crowd each in a place of their own, further back, ducked under the lead where
 they overlap it. The values are documented next to the tables below; every one of them came from a
@@ -44,6 +50,7 @@ Usage (from the repository root)::
     python examples/select_all_invaders/build.py --start-bar 33 --end-bar 48   # a quick section render
     python examples/select_all_invaders/build.py --engine formant         # without the neural models
     python examples/select_all_invaders/build.py --stems                  # with the stems (5 GB for the song)
+    python examples/select_all_invaders/build.py --balance C              # band-forward (A, S, B or C)
 
 A section render goes to ``out/select_all_invaders/preview/``. After a full render the mix levels
 (band gain, compressor thresholds, master gain) are saved in ``mix_levels.json``, and a section render
@@ -178,13 +185,22 @@ CROWD_KINDS = {"": ("crowd", -4.5, -8.0, 0.55), "Answer": ("crowd", -5.0, -7.0, 
 LEAD_TRACKS = tuple(k for k, v in VOCAL_MIX.items() if v[0] == "lead")  # the lead vocal (on several mixer channels)
 
 
-def vocal_mix(name: str) -> dict | None:
-    """``{kind, gain_db, pan, reverb_send, delay, strip, fx}`` of a vocal track, or None for an unknown one. A
-    second take (vocals.SECOND_TAKES) sits where its first take does, at its own level against it."""
+def vocal_mix(name: str, balance: str | None = None) -> dict | None:
+    """``{kind, gain_db, pan, reverb_send, delay, strip, fx}`` of a vocal track at a balance setting
+    (:data:`BALANCES`; None = the default), or None for an unknown one. A second take (vocals.SECOND_TAKES) sits where its first
+    take does, at its own level against it."""
+    balance = balance or DEFAULT_BALANCE
     second = vocals.second_take_of(name)
     if second:
-        mix = vocal_mix(second[0])
+        mix = vocal_mix(second[0], balance)
         return mix and dict(mix, gain_db=mix["gain_db"] + second[1]["gain_db"])
+    mix = _vocal_mix(name)
+    if mix and BALANCES[balance]["restored"] and mix["kind"] in CLEAN_EQ:
+        mix["fx"] = dict(mix["fx"] or {}, eq=CLEAN_EQ[mix["kind"]])
+    return mix
+
+
+def _vocal_mix(name: str) -> dict | None:
     keys = ("kind", "gain_db", "pan", "reverb_send", "delay", "strip", "fx")
     if name in VOCAL_MIX:
         return dict(zip(keys, VOCAL_MIX[name]))
@@ -272,6 +288,78 @@ SAMPLED_MIX: dict[str, dict] = {
     "pad": {"gain_db": 1.5, "eq_add": [["lowshelf", 700, -6.0, 0.7]]},
 }
 
+# What changes again for a sampled stem at the balance settings B and C (:data:`BALANCES`): the sampled band
+# measured against the synthesised one, stem by stem, in the mix (bars 33-48 and 9-24). Entries are merged
+# over BAND_MIX and SAMPLED_MIX.
+RESTORED_MIX: dict[str, dict] = {
+    # the sampled kick (tuned down, see restore_band) and bass have 4 dB more crest than the synthesised ones
+    "drums kick": {"crest_db": 5.0},
+    # the sampled bass: weak fundamentals (the sine under it is "basslo"), 5 to 8 dB more at 200-320 Hz
+    "bass": {"crest_db": 7.0, "eq_add": [["peak", 280, -3.0, 0.8], ["peak", 750, -3.5, 0.8],
+                                         ["highshelf", 1200, -9.5, 0.7]]},
+    "basslo": {"gain_db": 3.0, "crest_db": None, "eq_add": [["lp", 110, 0, 0.7071, 2]]},
+    # (an entry named after a role reaches every stem of that role: the synthesised growl and sub basses keep
+    # the level and tone they have next to the synthesised bass, the slap bass the pick bass's high cut)
+    "growl": {"gain_db": -1.0, "crest_db": 10.0, "eq_add": []},
+    "sub": {"gain_db": -1.0, "crest_db": 10.0, "eq_add": []},
+    # the slap bass carried 5 dB more at 200-500 Hz than the synthesised one
+    "slap": {"eq_add": [["peak", 320, -4.0, 0.9], ["highshelf", 1200, -9.5, 0.7]]},
+    # the backbeat: the sampled snare sat 2 dB over the synthesised one, the clap 5.7 dB under it; both are mono
+    # samples (the synthesised clap is stereo noise), as are the toms
+    # (the clap's peaks stood as high as the kick's, 26 dB over its level: with the kick and the snare under
+    # them they were the master limiter's deepest dips)
+    "drums snare": {"gain_db": -5.5, "crest_db": 8.0, "spread": 0.2, "reverb": 0.12},
+    "drums clap": {"gain_db": 1.5, "crest_db": 5.0, "spread": 0.7, "reverb": 0.2},
+    "drums toms": {"crest_db": 8.0, "spread": 0.35},
+    # the sampled crash sat 5 dB under the synthesised one, and all the kit's metal on the right
+    "drums crash": {"gain_db": 3.5, "width": 1.0, "pan": -0.7, "eq_add": [["peak", 2500, -5.0, 0.6]]},
+    "drums tamb": {"pan": -0.5},
+    # the sampled power chords are thinner under 500 Hz than the synthesised ones (the right one 10 dB at
+    # 60-200 Hz) and carry 10 to 15 dB more above 5 kHz
+    "gtrL": {"gain_db": 0.0, "eq_add": [["lowshelf", 250, 2.0, 0.7], ["peak", 700, 3.0, 0.9], ["peak", 1000, -1.5, 1.0],
+                                        ["peak", 2600, -6.0, 0.7], ["highshelf", 6500, -5.0, 0.7]]},
+    "gtrR": {"gain_db": -0.5, "eq_add": [["lowshelf", 220, 4.0, 0.7], ["peak", 1000, -1.5, 1.0],
+                                         ["peak", 2600, -5.0, 0.7], ["highshelf", 6500, -4.0, 0.7]]},
+    # the sampled pad is a warm pad where the synthesised one is glassy: 15 dB more at 200-500 Hz, which filled
+    # the pre-choruses, the breakdown and the final chorus; the music box has a body the synthesised one lacks
+    # and stood 4 dB under the lead in the breakdown
+    "pad": {"eq_add": [["hp", 450, 0, 0.7071, 2], ["lowshelf", 700, -6.0, 0.7]]},
+    "mbox": {"gain_db": -1.0, "eq_add": [["hp", 350, 0, 0.7071, 2]]},
+    # mono samples where the synthesised presets are stereo: the muted guitar, the pizzicato
+    "mute": {"spread": 0.45},
+    # the pizzicato carried 5 dB more under 500 Hz than the synthesised pluck
+    "pluck": {"spread": 0.45, "eq_add": [["lowshelf", 320, -5.0, 0.7], ["peak", 550, -3.0, 1.0],
+                                                         ["peak", 2500, 2.0, 0.7]]},
+}
+# the synthesised stems whose RESTORED_MIX entry holds while another instrument plays its sampled sound
+RESTORED_FOR = {"basslo": "bass", "growl": "bass", "sub": "bass"}
+# ... and for the vocal stack (by kind of channel): the doubles, the harmony and the crowd without their
+# 200-500 Hz, which the lead and the band already fill. These replace the kind's tone (``fx`` ``eq``).
+_LOW_CUT = [["hp", 190, 0, 0.7071, 2], ["peak", 360, -3.0, 1.0]]
+CLEAN_EQ: dict[str, list] = {
+    "double": _LOW_CUT,
+    "harmony": [*_LOW_CUT, ["peak", 2800, -3.0, 0.9]],
+    "crowd": [["hp", 230, 0, 0.7071, 2], ["peak", 400, -3.0, 1.0], ["highshelf", 3800, -4.0, 0.7]],
+    "crowd shout": [["hp", 260, 0, 0.7071, 2], ["peak", 420, -3.0, 1.0], ["highshelf", 5000, -2.0, 0.7]],
+}
+# The balance dial: the same song and takes at four balances of the vocals against the band.
+#   A  the sampled band as it was first mixed: every sampled stem at its synthesised stem's 1-5 kHz level
+#   S  the synthesised band (no sampled sound plays, whatever is installed)
+#   B  the sampled band with its low end, punch and width restored, the vocal stack cleaned, the vocals 2 dB
+#      lower against the band than in A
+#   C  as B, the vocals 4 dB lower than in A (band-forward)
+# ``vocal_balance_db``: the vocals' 1-5 kHz level over the band that the mixer sets the band's gain by. The
+# values of B and C are set on the whole song so that the loudness of the vocals' stems together against the
+# band's stems together (LUFS) is 2 and 4 LU lower than at A (A: +0.5 LU); the 1-5 kHz figure moves less than
+# that because the restored band carries more of that range (its backbeat, its guitars at their written level).
+BALANCES: dict[str, dict] = {
+    "A": {"sampled": True, "restored": False, "vocal_balance_db": 8.0},
+    "S": {"sampled": False, "restored": False, "vocal_balance_db": 8.0},
+    "B": {"sampled": True, "restored": True, "vocal_balance_db": 5.3},
+    "C": {"sampled": True, "restored": True, "vocal_balance_db": 3.3},
+}
+DEFAULT_BALANCE = "B"
+
 MASTER: dict = {
     "loudness_target": -11.5,  # (-11 kept the master limiter over 1 dB for ~20 % of the final chorus)
     "ceiling_db": -1.0,
@@ -335,31 +423,103 @@ def tweak_sections(arrangement: dict, tweaks: dict[str, dict[str, float]]) -> li
     return out
 
 
-def master_settings(sampled: set[str] | None = None, tracks=None) -> dict:
+def master_settings(sampled: set[str] | None = None, tracks=None, balance: str | None = None) -> dict:
     """MASTER with the mix_overrides of every vocal track of ``tracks`` (delay send, strip overrides, in-channel
-    effects) and of the band's stems. ``sampled``: the instruments that play a sampled sound (their stems get
-    the SAMPLED_MIX entries, the others the SYNTH_MIX entries); None = none does."""
+    effects) and of the band's stems, at a balance setting (:data:`BALANCES`; None = the default). ``sampled``: the instruments
+    that play a sampled sound (their stems get the SAMPLED_MIX entries and, at the settings B and C, the
+    RESTORED_MIX entries; the others the SYNTH_MIX entries); None = none does."""
+    bal = BALANCES[balance or DEFAULT_BALANCE]
     m = json.loads(json.dumps(MASTER))
+    m["vocal_balance_db"] = bal["vocal_balance_db"]
     mo = m["mix_overrides"] = {}
     for t in tracks or []:
-        mix = vocal_mix(t.name)
+        mix = vocal_mix(t.name, balance)
         if mix is None:
             continue
         o = dict(mix["strip"] or {}, delay=mix["delay"])
         if mix["fx"]:
             o["fx"] = mix["fx"]
         mo[t.name] = o
-    for stem in sorted(set(BAND_MIX) | set(SYNTH_MIX) | set(SAMPLED_MIX)):
-        which = SAMPLED_MIX if stem.split()[0] in (sampled or ()) else SYNTH_MIX
-        mo[stem] = {**BAND_MIX.get(stem, {}), **which.get(stem, {})}
+    sampled = set(sampled or ())
+    for stem in sorted(set(BAND_MIX) | set(SYNTH_MIX) | set(SAMPLED_MIX) | set(RESTORED_MIX)):
+        which = SAMPLED_MIX if stem.split()[0] in sampled else SYNTH_MIX
+        restored = bal["restored"] and RESTORED_FOR.get(stem, stem.split()[0]) in sampled
+        entry = {**BAND_MIX.get(stem, {}), **which.get(stem, {}), **(RESTORED_MIX.get(stem, {}) if restored else {})}
+        if entry:
+            mo[stem] = entry
     return json.loads(json.dumps(m))
 
 
-# ------------------------------------------------------------------------------------------- build
-def build_session(log=print) -> Session:
-    """The finished project in a tool session (vocals, production, backing, arrangement, mixer, master)."""
+# The sampled sounds that ring (the synthesised presets they replace are detuned stereo stacks): at the
+# settings B and C each plays as two layers of the same sound a few cents apart, left and right of the
+# instrument's place, each 3 dB down. (Two layers do not part a short sound: the plucks, the muted guitar and
+# the clap get the mixer's ``spread`` instead, RESTORED_MIX.)
+# instrument -> (cents up / down, pan left / right of the place)
+STEREO_PAIRS: dict[str, tuple[float, float]] = {"pad": (6.0, 0.8), "mbox": (4.0, 0.5), "bell": (3.0, 0.4)}
+
+
+def restore_band(arrangement: dict, sampled: set[str]) -> None:
+    """The arrangement as the settings B and C play it (in place), for the instruments of ``sampled`` (those
+    that play a sampled sound here; a synthesised instrument is left as it is).
+
+    * The sampled kick's fundamental sits at 75-80 Hz, the synthesised kick's at 54 Hz: five semitones down.
+    * The sampled pick bass has 9 to 14 dB less under 60 Hz than the synthesised one (its fundamentals are
+      weak): a sine under it ("basslo") plays every line the bass plays.
+    * :data:`STEREO_PAIRS`.
+    * Velocity: a sampled sound's level follows the square of the velocity (the formats' default), a
+      synthesised preset's follows it linearly at 70 % (the kit: to the power 1.35), and the sampler matches
+      the two at a normal hit only. The section tweaks (BAND_TWEAKS: x 0.7 to x 1.25) and the soft notes of
+      the patterns therefore moved a sampled instrument 2.5 to 4.5 dB further than the synthesised one (the
+      pre-choruses' and the bridge's band came out 2 dB low): every sampled sound follows velocity as the
+      preset it replaces does.
+    """
+    inst = arrangement["instruments"]
+    for name in sorted(sampled):
+        sound = inst[name].get("sound")
+        if isinstance(sound, str):
+            sound = {"set": sound}
+        law = {"velocity_curve": 1.35} if inst[name].get("type") == "drums" else {"velocity_curve": 1.0, "vel_sens": 0.72}
+        inst[name]["sound"] = [dict(layer, **law) for layer in sound] if isinstance(sound, list) else dict(sound, **law)
+    if "drums" in sampled:
+        inst["drums"].setdefault("voices", {}).setdefault("kick", {})["tune"] = -5
+    if "bass" in sampled:
+        inst["basslo"] = {"preset": "bass_sub", "gain_db": -9}
+        for sec in arrangement["sections"]:
+            if sec["parts"].get("bass") is not None:
+                sec["parts"]["basslo"] = json.loads(json.dumps(sec["parts"]["bass"]))
+    for name, (cents, pan) in STEREO_PAIRS.items():
+        sound = inst[name].get("sound")
+        if name in sampled and isinstance(sound, dict):
+            inst[name]["sound"] = [dict(sound, tune=cents, pan=-pan, gain_db=-3.0),
+                                   dict(sound, tune=-cents, pan=pan, gain_db=-3.0)]
+
+
+def band_tweaks(arrangement: dict) -> dict[str, dict[str, float]]:
+    """BAND_TWEAKS for an arrangement: the sine under the bass (restore_band) follows the bass."""
+    tweaks = json.loads(json.dumps(BAND_TWEAKS))
+    if "basslo" in arrangement["instruments"]:
+        for parts in tweaks.values():
+            if "bass" in parts:
+                parts["basslo"] = parts["bass"]
+    return tweaks
+
+
+def _sampled(project) -> set[str]:
+    """The instruments of the project's band that play a sampled sound on this machine."""
     from synth2 import arranger
 
+    return {k for k, v in arranger.sound_report(project)["instruments"].items() if v["plays"] == "sampled"}
+
+
+# ------------------------------------------------------------------------------------------- build
+def build_session(log=print, balance: str | None = None) -> Session:
+    """The finished project in a tool session (vocals, production, backing, arrangement, mixer, master) at a
+    balance setting (:data:`BALANCES`; None = :data:`DEFAULT_BALANCE`)."""
+    from synth2 import arranger
+
+    balance = balance or DEFAULT_BALANCE
+    if balance not in BALANCES:
+        raise KeyError(f"no balance setting {balance!r} (one of {', '.join(BALANCES)})")
     s = Session()
     r = call_tool(s, "new_project", {"score": (HERE / "vocals.s2s").read_text(encoding="utf-8")})
     for w in r.get("warnings", []) or []:
@@ -368,11 +528,19 @@ def build_session(log=print) -> Session:
     log(f"  vocal production: {len(prod['tracks'])} tracks, AI Double {prod['ai_double_notes']} notes, "
         f"Harmony {prod['harmony_notes']} notes, fan-voice regions {prod['fan_chop_regions']}")
     arrangement = json.loads((HERE / "backing.json").read_text(encoding="utf-8"))
+    if not BALANCES[balance]["sampled"]:
+        for inst in arrangement["instruments"].values():
+            inst.pop("sound", None)
     r = call_tool(s, "set_backing", {"arrangement": arrangement})
+    sampled = _sampled(s.project)
+    if BALANCES[balance]["restored"] and sampled:
+        restore_band(arrangement, sampled)
+        r = call_tool(s, "set_backing", {"arrangement": arrangement})
     for w in r.get("warnings", []):
         log(f"  backing {w}")
-    if BAND_TWEAKS:
-        r = call_tool(s, "set_backing", {"arrangement": {"sections": tweak_sections(arrangement, BAND_TWEAKS)},
+    tweaks = band_tweaks(arrangement)
+    if tweaks:
+        r = call_tool(s, "set_backing", {"arrangement": {"sections": tweak_sections(arrangement, tweaks)},
                                          "merge": True})
         for w in r.get("warnings", []):
             log(f"  backing {w}")
@@ -380,18 +548,18 @@ def build_session(log=print) -> Session:
     roles = sorted({t["role"].split(":")[0] for t in arr["tracks"] if t["role"]})
     log(f"  arrangement: {len(arr['tracks'])} vocal tracks, roles {', '.join(roles)}")
     for t in s.project.tracks:
-        mix = vocal_mix(t.name)
+        mix = vocal_mix(t.name, balance)
         if mix is None:
             raise KeyError(f"no mix for the vocal track {t.name!r}")
         call_tool(s, "update_track", {"track": t.name, "gain_db": mix["gain_db"], "pan": mix["pan"],
                                       "reverb_send": mix["reverb_send"]})
     sound = arranger.sound_report(s.project)
-    sampled = {k for k, v in sound["instruments"].items() if v["plays"] == "sampled"}
     log("  band: " + (f"{len(sampled)} instruments play sampled sounds ({', '.join(sorted(sampled))})" if sampled
                       else "every instrument is synthesised (no sound set installed)"))
     for w in sound["warnings"]:
         log(f"  band: {w}")
-    call_tool(s, "update_project", {"master": master_settings(sampled, s.project.tracks)})
+    log(f"  balance setting {balance}: vocals {BALANCES[balance]['vocal_balance_db']:g} dB over the band (1-5 kHz)")
+    call_tool(s, "update_project", {"master": master_settings(sampled, s.project.tracks, balance)})
     return s
 
 
@@ -640,13 +808,17 @@ def main(argv=None) -> int:
     ap.add_argument("--engine", default=None,
                     help="singing engine: auto (the score's choice), formant, neural or neural:<voicebank>")
     ap.add_argument("--quality", default=None, choices=("draft", "normal", "high"), help="neural render quality")
+    ap.add_argument("--balance", default=DEFAULT_BALANCE, choices=tuple(BALANCES),
+                    help="the vocals against the band: A = the first sampled mix, S = the synthesised band, "
+                         "B = sampled band restored, vocals 2 dB lower, C = vocals 4 dB lower "
+                         f"(default {DEFAULT_BALANCE})")
     args = ap.parse_args(argv)
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
     t_wall = time.perf_counter()
 
     print("building the project through the tool layer ...")
-    s = build_session()
+    s = build_session(balance=args.balance)
     project = s.project
     last_bar = len(vocals.CHORDS)
     partial = args.start_bar is not None or args.end_bar is not None

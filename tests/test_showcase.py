@@ -117,10 +117,61 @@ def test_every_track_and_stem_has_its_place_in_the_mix(song):
     assert p.master.loudness_target == -11.5 and p.master.ceiling_db == -1.0 and p.master.reverb_room == 0.1
     # nothing is installed here: every stem gets the settings of the synthesised sound
     assert mo["drums snare"]["eq_add"][-1][0] == "highshelf" and mo["gtrL"] == build.BAND_MIX["gtrL"]
-    sampled = build.master_settings({"drums", "gtrL"}, p.tracks)["mix_overrides"]
+    sampled = build.master_settings({"drums", "gtrL"}, p.tracks, "A")["mix_overrides"]
     assert sampled["drums snare"]["gain_db"] == build.SAMPLED_MIX["drums snare"]["gain_db"]
     assert sampled["gtrL"]["gain_db"] == build.SAMPLED_MIX["gtrL"]["gain_db"] and sampled["gtrR"] == build.BAND_MIX["gtrR"]
     assert sampled["bass"] == build.BAND_MIX["bass"] and sampled["drums hat"]["duck"] == 1.5
+
+
+def test_the_balance_dial_is_one_switch_and_only_restores_what_plays_sampled(song):
+    build, p = song
+    assert set(build.BALANCES) == {"A", "S", "B", "C"} and build.DEFAULT_BALANCE in ("B", "C")
+    vb = {k: v["vocal_balance_db"] for k, v in build.BALANCES.items()}
+    assert p.master.vocal_balance_db == vb[build.DEFAULT_BALANCE] and vb["A"] == vb["S"] == 8.0
+    assert vb["B"] - vb["C"] == pytest.approx(2.0) and vb["B"] < vb["A"]  # the vocals step down against the band
+    with pytest.raises(KeyError):
+        build.build_session(log=lambda *a: None, balance="D")
+    # A: the first sampled mix, the vocal stack as it was; B and C: the stack without its 200-500 Hz
+    assert build.vocal_mix("Harmony", "A")["fx"] is None and build.vocal_mix("AI Double", "S")["fx"] is None
+    for name, kind in (("AI Double", "double"), ("Harmony L", "harmony"), ("Crowd Hook B", "crowd")):
+        fx = build.vocal_mix(name, "B")["fx"]
+        assert fx["eq"] == build.CLEAN_EQ[kind] == build.vocal_mix(name, "C")["fx"]["eq"] and fx["eq"][0][0] == "hp"
+    assert build.vocal_mix("Crowd Hook B", "B")["fx"]["duck_db"] == 3.0  # the rest of the kind's effects stays
+    assert all(build.vocal_mix(n, "B") == build.vocal_mix(n, "A") for n in build.LEAD_TRACKS)  # the lead is the lead
+    # the band's stems: the restored entries reach a stem only while its instrument plays a sampled sound
+    a = build.master_settings({"drums", "bass", "slap", "pluck"}, p.tracks, "A")["mix_overrides"]
+    b = build.master_settings({"drums", "bass", "slap", "pluck"}, p.tracks, "B")["mix_overrides"]
+    assert "basslo" not in a and "spread" not in a["pluck"] and a["drums kick"].get("crest_db") == 7.0
+    assert b["drums kick"]["crest_db"] == 5.0 and b["pluck"]["spread"] > 0 and b["drums clap"]["spread"] > 0
+    assert b["basslo"]["eq_add"][0][0] == "lp" and b["growl"]["eq_add"] == [] and b["slap"]["eq_add"][-1][0] == "highshelf"
+    assert "spread" not in b["mute"] and b["gtrL"] == build.BAND_MIX["gtrL"]  # (these two are not sampled here)
+    none = build.master_settings(set(), p.tracks, "B")["mix_overrides"]
+    assert "basslo" not in none and "growl" not in none and none["drums kick"] == build.BAND_MIX["drums kick"]
+    # the arrangement: kick tuning, the sine under the bass and the stereo pairs, for sampled instruments only
+    arr = json.loads((SONG / "backing.json").read_text(encoding="utf-8"))
+    same = json.loads(json.dumps(arr))
+    build.restore_band(same, set())
+    assert same == arr and "basslo" not in p.backing["instruments"]  # nothing is installed here
+    build.restore_band(same, {"drums", "bass", "pad"})
+    assert same["instruments"]["drums"]["voices"]["kick"]["tune"] == -5
+    assert same["instruments"]["drums"]["sound"]["velocity_curve"] == 1.35  # velocity as the synthesised kit ...
+    assert (same["instruments"]["bass"]["sound"]["velocity_curve"], same["instruments"]["bass"]["sound"]["vel_sens"]) \
+        == (1.0, 0.72)  # ... and as the synthesised presets take it
+    assert "velocity_curve" not in arr["instruments"]["gtrL"]["sound"] and same["instruments"]["gtrL"] == arr["instruments"]["gtrL"]
+    with_bass = [sec["name"] for sec in arr["sections"] if sec["parts"].get("bass") is not None]
+    assert len(with_bass) >= 8 and all(sec["parts"].get("basslo") == sec["parts"].get("bass") for sec in same["sections"])
+    left, right = same["instruments"]["pad"]["sound"]
+    assert left["pan"] == -right["pan"] < 0 and left["tune"] == -right["tune"] and left["preset"] == "Warm Pad"
+    assert left["velocity_curve"] == right["velocity_curve"] == 1.0
+    assert same["instruments"]["mbox"]["sound"] == arr["instruments"]["mbox"]["sound"]  # (not sampled here)
+    assert build.band_tweaks(same)["Intro"]["basslo"] == build.BAND_TWEAKS["Intro"]["bass"]
+    assert build.band_tweaks(arr) == build.BAND_TWEAKS
+    # S: no instrument asks for a sampled sound, whatever is installed
+    from synth2 import arranger
+
+    synth = build.build_session(log=lambda *a: None, balance="S").project
+    assert not any(v["sound"] for v in arranger.sound_report(synth)["instruments"].values())
+    assert synth.master.vocal_balance_db == 8.0 and "fx" not in synth.master.mix_overrides["Harmony"]
 
 
 def test_the_band_is_in_the_songs_key_and_falls_back_to_its_synthesised_presets(song):

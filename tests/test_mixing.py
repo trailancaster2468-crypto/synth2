@@ -474,6 +474,29 @@ def test_low_end_balance_and_drum_transient_limiter():
     assert np.max(np.abs(mix.stems["h"])) < 0.5 * 0.9
 
 
+def test_spread_makes_a_mono_stem_stereo_and_keeps_its_mono_sum():
+    rng = np.random.default_rng(11)
+    n = SR * 2
+    x = (0.1 * rng.standard_normal(n) * (np.mod(np.arange(n) / SR, 0.25) < 0.08)).astype(np.float32)  # short hits
+
+    def stem(over):
+        src = M.Source("k", "keys", "backing", np.stack([x, x], 1), role="keys")
+        src.overrides = over
+        return M.mix_sources([src], SR, band_mode=True, settings=MasterSettings(band_glue=0.0),
+                             reverb_wet=0.0).stems["k"]
+
+    plain, same, wide = stem({}), stem({"spread": 0.0}), stem({"spread": 0.5})
+    assert np.array_equal(plain, same) and np.max(np.abs(plain[:, 0] - plain[:, 1])) == 0.0  # off = as before
+    mid, side = wide.mean(axis=1), (wide[:, 0] - wide[:, 1]) / 2
+    assert np.max(np.abs(mid - plain.mean(axis=1))) < 1e-5  # the mono sum does not change
+    hi = lambda v: M.eq(v.astype(np.float64), [("hp", 600, 0, 0.7071, 4)], SR)  # noqa: E731
+    ratio = 10 * np.log10(np.mean(hi(side) ** 2) / np.mean(hi(mid) ** 2))
+    assert ratio == pytest.approx(-6.0, abs=1.0)  # spread = the side's level against the mid
+    lo = lambda v: M.eq(v.astype(np.float64), [("lp", 80, 0, 0.7071, 4)], SR)  # noqa: E731
+    assert np.mean(lo(side) ** 2) < 1e-2 * np.mean(lo(mid) ** 2)  # the low end stays in the centre
+    assert np.max(np.abs(side[: int(0.005 * SR)])) < 1e-6  # the first reflection comes 7 ms after the hit
+
+
 def test_vocal_transient_limiter_is_opt_in():
     n = SR * 2
     t = np.arange(n) / SR

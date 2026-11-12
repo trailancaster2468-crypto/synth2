@@ -111,6 +111,30 @@ crowd have none and keep the mixer's channel strip.
   basses, the chip kit (tick and glitch percussion) and the effects (transitions and gags) are synthesised
   on purpose: they are the song's chiptune side.
 
+## The balance dial
+
+`build.py --balance A|S|B|C` renders the same song and takes at four balances of the vocals against the band
+(`BALANCES` in `build.py`; the default is B):
+
+| Setting | Band | Vocals against the band |
+|---|---|---|
+| `A` | sampled, as first mixed: every sampled stem at its synthesised stem's 1-5 kHz level | as the clarity study's crisp mix (8 dB over the band in 1-5 kHz) |
+| `S` | synthesised (no sampled sound plays, whatever is installed) | as A |
+| `B` | sampled, restored (below) | 2 dB lower than A |
+| `C` | as B | 4 dB lower than A: band-forward |
+
+What "restored" changes for the instruments that play sampled sounds (`restore_band`, `RESTORED_MIX`,
+`CLEAN_EQ`): the kick tuned five semitones down (its fundamental back at 54 Hz) and a sine under the pick
+bass (`basslo`), because the sampled kick and bass had 9 to 10 dB less under 60 Hz; every sampled sound
+follows velocity as its synthesised preset does (the square law of the sample formats made the quiet
+sections' band 2 to 5 dB quieter than written); the pad, the music box and the bell as two layers a few
+cents apart, left and right; the clap, the snare, the toms, the pizzicato and the muted guitar with the
+mixer's `spread` (they are mono samples); the crash on the left (the kit has all its metal on the right);
+the pad and the music box without the low mids their synthesised presets do not have; the clap's and the
+snare's peaks held, so that the master limiter works no harder than before. The doubles, the harmony and
+the crowd lose their 200-500 Hz (a high-pass at 190-260 Hz and a 3 dB dip); the lead is untouched.
+Without the sound sets, B and C are the synthesised band with the vocals lower and the stack cleaned.
+
 ## Credits a render carries
 
 The render report lists them (`report["credits"]`), and a published version should too:

@@ -1203,6 +1203,24 @@ def role_preset(role: str, name: str = "") -> dict[str, Any]:
 
 
 CARVE_HZ, CARVE_Q = 2600.0, 0.8  # vocal pocket carved out of the band while the vocals sing
+# The stereo spread of a backing stem (``mix_overrides`` ``spread``): its mid through these taps (ms, gain)
+# becomes side signal, like the first reflections of a small room, left and right in opposite polarity. The
+# mono sum of the stem does not change. Gains are normalised to unit energy, so ``spread`` is the level of
+# the added side against the mid.
+SPREAD_TAPS = ((7.3, 1.0), (11.9, -0.85), (15.2, 0.72), (19.7, -0.6), (23.1, 0.5), (28.4, -0.42), (33.9, 0.34),
+               (39.6, -0.27))
+SPREAD_HP_HZ = 200.0  # the spread leaves the low end where it is
+
+
+def spread_dense(sr: int) -> np.ndarray:
+    """The response of the spread's taps (mid to side, :data:`SPREAD_TAPS`) on the dense design grid."""
+    z1, _ = _dense_z(sr)
+    w = np.angle(z1)  # -2 pi k / K
+    norm = math.sqrt(sum(g * g for _, g in SPREAD_TAPS))
+    h = np.zeros(len(z1), dtype=np.complex128)
+    for ms, g in SPREAD_TAPS:
+        h += (g / norm) * np.exp(1j * w * round(ms * 1e-3 * sr))
+    return h * eq_dense([("hp", SPREAD_HP_HZ, 0, 0.7071, 2)], sr)
 VBR_BAND = (1000.0, 5000.0)  # vocal-to-band ratio is measured in this band
 MASTER_EQ = [("hp", 25, 0, 0.7071, 2), ("highshelf", 12000, 1.0, 0.7)]  # folded into every source
 RETURN_EQ = [("hp", 220, 0, 0.7071, 2), ("highshelf", 7000, -3.0, 0.7)]  # reverb / delay returns (band mode)
@@ -1624,6 +1642,9 @@ def _band_job(s: Source, sr: int, n: int, S: "_Settings", band_mode: bool, maste
     use_carve = band_mode and have_vocals and carve_amt > 0
     H = np.zeros((3 if use_carve else 2, 2, F), dtype=np.complex128)
     H[0, 0], H[1, 1] = Hd, Hs
+    spread = float(pre.get("spread") or 0.0)
+    if spread > 0:  # (a mono stem gets a side signal; with the stem's width and the low end kept mono, like its own)
+        H[1, 0] = Hs * spread * spread_dense(sr)
     if use_carve:
         H[2, 0] = Hd * eq_dense([("bandpass", CARVE_HZ, 0, CARVE_Q)], sr)
     outs = filter_mimo(np.stack([mid, side]), H, sr)
@@ -1697,7 +1718,8 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
     role they replace the role's own, entry by entry) -> fader / pan -> stem; sends to the
     reverb (track ``reverb_send``) and the ping-pong delay (``settings.vocal_delay``).
     Backing path (``band_mode``): balance -> mid/side -> role EQ (mid) and EQ x width with mono
-    bass (side), one FFT pass -> role compressor -> kick sidechain duck (stems flagged
+    bass (side), with ``mix_overrides`` ``spread`` > 0 a side signal made from the mid
+    (:data:`SPREAD_TAPS`: stereo for a mono stem, its mono sum unchanged), one FFT pass -> role compressor -> kick sidechain duck (stems flagged
     ``sidechain``) -> vocal-keyed ducking and a 1.5-4 kHz carve of the mid -> gain -> instrument
     bus (auto vocal balance, bus compressor). The master EQ is folded into every source.
     ``settings`` is a ``MasterSettings`` (missing fields fall back to defaults). Sources are
