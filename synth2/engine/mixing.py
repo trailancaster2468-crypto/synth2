@@ -1719,9 +1719,10 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
     reverb (track ``reverb_send``) and the ping-pong delay (``settings.vocal_delay``).
     Backing path (``band_mode``): balance -> mid/side -> role EQ (mid) and EQ x width with mono
     bass (side), with ``mix_overrides`` ``spread`` > 0 a side signal made from the mid
-    (:data:`SPREAD_TAPS`: stereo for a mono stem, its mono sum unchanged), one FFT pass -> role compressor -> kick sidechain duck (stems flagged
-    ``sidechain``) -> vocal-keyed ducking and a 1.5-4 kHz carve of the mid -> gain -> instrument
-    bus (auto vocal balance, bus compressor). The master EQ is folded into every source.
+    (:data:`SPREAD_TAPS`: stereo for a mono stem, its mono sum unchanged), one FFT pass -> role
+    compressor -> kick sidechain duck (stems flagged ``sidechain``) -> vocal-keyed ducking and a
+    1.5-4 kHz carve of the mid -> gain -> instrument bus (auto vocal balance, bus compressor).
+    The master EQ is folded into every source.
     ``settings`` is a ``MasterSettings`` (missing fields fall back to defaults). Sources are
     processed on :func:`mix_threads` threads and summed in order (the result does not depend on
     the thread count). ``fixed`` may hold ``band_gain_db``, ``bus_threshold_db`` and

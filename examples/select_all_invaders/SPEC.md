@@ -131,7 +131,8 @@ sections' band 2 to 5 dB quieter than written); the pad, the music box and the b
 cents apart, left and right; the clap, the snare, the toms, the pizzicato and the muted guitar with the
 mixer's `spread` (they are mono samples); the crash on the left (the kit has all its metal on the right);
 the pad and the music box without the low mids their synthesised presets do not have; the clap's and the
-snare's peaks held, so that the master limiter works no harder than before. The doubles, the harmony and
+snare's peaks held, so that the master limiter works no harder than before; the band's sides 0.6 dB up
+(`band_width` 1.4). The doubles, the harmony and
 the crowd lose their 200-500 Hz (a high-pass at 190-260 Hz and a 3 dB dip); the lead is untouched.
 Without the sound sets, B and C are the synthesised band with the vocals lower and the stack cleaned.
 

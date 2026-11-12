@@ -187,8 +187,8 @@ LEAD_TRACKS = tuple(k for k, v in VOCAL_MIX.items() if v[0] == "lead")  # the le
 
 def vocal_mix(name: str, balance: str | None = None) -> dict | None:
     """``{kind, gain_db, pan, reverb_send, delay, strip, fx}`` of a vocal track at a balance setting
-    (:data:`BALANCES`; None = the default), or None for an unknown one. A second take (vocals.SECOND_TAKES) sits where its first
-    take does, at its own level against it."""
+    (:data:`BALANCES`; None = the default), or None for an unknown one. A second take (vocals.SECOND_TAKES)
+    sits where its first take does, at its own level against it."""
     balance = balance or DEFAULT_BALANCE
     second = vocals.second_take_of(name)
     if second:
@@ -297,39 +297,43 @@ RESTORED_MIX: dict[str, dict] = {
     # the sampled bass: weak fundamentals (the sine under it is "basslo"), 5 to 8 dB more at 200-320 Hz
     "bass": {"crest_db": 7.0, "eq_add": [["peak", 280, -3.0, 0.8], ["peak", 750, -3.5, 0.8],
                                          ["highshelf", 1200, -9.5, 0.7]]},
-    "basslo": {"gain_db": 3.0, "crest_db": None, "eq_add": [["lp", 110, 0, 0.7071, 2]]},
+    "basslo": {"gain_db": 5.0, "crest_db": None, "eq_add": [["lp", 110, 0, 0.7071, 2]]},
     # (an entry named after a role reaches every stem of that role: the synthesised growl and sub basses keep
     # the level and tone they have next to the synthesised bass, the slap bass the pick bass's high cut)
     "growl": {"gain_db": -1.0, "crest_db": 10.0, "eq_add": []},
     "sub": {"gain_db": -1.0, "crest_db": 10.0, "eq_add": []},
     # the slap bass carried 5 dB more at 200-500 Hz than the synthesised one
-    "slap": {"eq_add": [["peak", 320, -4.0, 0.9], ["highshelf", 1200, -9.5, 0.7]]},
-    # the backbeat: the sampled snare sat 2 dB over the synthesised one, the clap 5.7 dB under it; both are mono
-    # samples (the synthesised clap is stereo noise), as are the toms
-    # (the clap's peaks stood as high as the kick's, 26 dB over its level: with the kick and the snare under
-    # them they were the master limiter's deepest dips)
-    "drums snare": {"gain_db": -5.5, "crest_db": 8.0, "spread": 0.2, "reverb": 0.12},
+    "slap": {"gain_db": 1.5, "eq_add": [["peak", 320, -4.0, 0.9], ["highshelf", 1200, -9.5, 0.7]]},
+    # the backbeat: the sampled clap sat 5.7 dB under the synthesised one; clap, snare and toms are mono samples
+    # (the synthesised clap is stereo noise). The clap's peaks stood as high as the kick's, 26 dB over its
+    # level: with the kick and the snare under them they were the master limiter's deepest dips.
+    "drums snare": {"gain_db": -4.5, "crest_db": 8.0, "spread": 0.2, "reverb": 0.12},
     "drums clap": {"gain_db": 1.5, "crest_db": 5.0, "spread": 0.7, "reverb": 0.2},
     "drums toms": {"crest_db": 8.0, "spread": 0.35},
     # the sampled crash sat 5 dB under the synthesised one, and all the kit's metal on the right
     "drums crash": {"gain_db": 3.5, "width": 1.0, "pan": -0.7, "eq_add": [["peak", 2500, -5.0, 0.6]]},
     "drums tamb": {"pan": -0.5},
+    "drums ride": {"gain_db": -0.5, "width": 1.0},
     # the sampled power chords are thinner under 500 Hz than the synthesised ones (the right one 10 dB at
-    # 60-200 Hz) and carry 10 to 15 dB more above 5 kHz
-    "gtrL": {"gain_db": 0.0, "eq_add": [["lowshelf", 250, 2.0, 0.7], ["peak", 700, 3.0, 0.9], ["peak", 1000, -1.5, 1.0],
-                                        ["peak", 2600, -6.0, 0.7], ["highshelf", 6500, -5.0, 0.7]]},
-    "gtrR": {"gain_db": -0.5, "eq_add": [["lowshelf", 220, 4.0, 0.7], ["peak", 1000, -1.5, 1.0],
-                                         ["peak", 2600, -5.0, 0.7], ["highshelf", 6500, -4.0, 0.7]]},
+    # 60-200 Hz, with 5 dB more at 500-1000 Hz) and carry 10 to 15 dB more above 5 kHz
+    "gtrL": {"gain_db": 0.0, "eq_add": [["lowshelf", 250, 2.0, 0.7], ["peak", 700, 3.0, 0.9],
+                                        ["peak", 1000, -1.5, 1.0], ["peak", 2600, -6.0, 0.7],
+                                        ["highshelf", 6500, -5.0, 0.7]]},
+    "gtrR": {"gain_db": -0.5, "eq_add": [["lowshelf", 220, 4.0, 0.7], ["peak", 750, -3.5, 0.9],
+                                         ["peak", 1000, -1.5, 1.0], ["peak", 2600, -5.0, 0.7],
+                                         ["highshelf", 6500, -4.0, 0.7]]},
     # the sampled pad is a warm pad where the synthesised one is glassy: 15 dB more at 200-500 Hz, which filled
     # the pre-choruses, the breakdown and the final chorus; the music box has a body the synthesised one lacks
     # and stood 4 dB under the lead in the breakdown
-    "pad": {"eq_add": [["hp", 450, 0, 0.7071, 2], ["lowshelf", 700, -6.0, 0.7]]},
-    "mbox": {"gain_db": -1.0, "eq_add": [["hp", 350, 0, 0.7071, 2]]},
-    # mono samples where the synthesised presets are stereo: the muted guitar, the pizzicato
-    "mute": {"spread": 0.45},
-    # the pizzicato carried 5 dB more under 500 Hz than the synthesised pluck
-    "pluck": {"spread": 0.45, "eq_add": [["lowshelf", 320, -5.0, 0.7], ["peak", 550, -3.0, 1.0],
-                                                         ["peak", 2500, 2.0, 0.7]]},
+    "pad": {"gain_db": 0.0, "eq_add": [["hp", 450, 0, 0.7071, 2], ["lowshelf", 700, -6.0, 0.7]]},
+    "mbox": {"gain_db": -2.0, "eq_add": [["hp", 350, 0, 0.7071, 2]]},
+    # mono samples where the synthesised presets are stereo: the muted guitar (7 dB more at 500-1000 Hz than
+    # the synthesised chug), the pizzicato
+    "mute": {"gain_db": -4.0, "spread": 0.45,
+             "eq_add": [["peak", 800, -4.0, 0.8], ["highshelf", 1500, -8.0, 0.7]]},
+    # the pizzicato carried 5 dB more under 500 Hz than the synthesised pluck and 3 dB less of 1-5 kHz
+    "pluck": {"spread": 0.45, "eq_add": [["lowshelf", 320, -6.0, 0.7], ["peak", 550, -3.0, 1.0],
+                                         ["peak", 2500, 4.0, 0.7]]},
 }
 # the synthesised stems whose RESTORED_MIX entry holds while another instrument plays its sampled sound
 RESTORED_FOR = {"basslo": "bass", "growl": "bass", "sub": "bass"}
@@ -355,9 +359,10 @@ CLEAN_EQ: dict[str, list] = {
 BALANCES: dict[str, dict] = {
     "A": {"sampled": True, "restored": False, "vocal_balance_db": 8.0},
     "S": {"sampled": False, "restored": False, "vocal_balance_db": 8.0},
-    "B": {"sampled": True, "restored": True, "vocal_balance_db": 5.3},
-    "C": {"sampled": True, "restored": True, "vocal_balance_db": 3.3},
+    "B": {"sampled": True, "restored": True, "vocal_balance_db": 5.8},
+    "C": {"sampled": True, "restored": True, "vocal_balance_db": 3.8},
 }
+RESTORED_BAND_WIDTH = 1.4  # "band_width" at B and C while sampled sounds play: as wide as the synthesised band
 DEFAULT_BALANCE = "B"
 
 MASTER: dict = {
@@ -425,12 +430,14 @@ def tweak_sections(arrangement: dict, tweaks: dict[str, dict[str, float]]) -> li
 
 def master_settings(sampled: set[str] | None = None, tracks=None, balance: str | None = None) -> dict:
     """MASTER with the mix_overrides of every vocal track of ``tracks`` (delay send, strip overrides, in-channel
-    effects) and of the band's stems, at a balance setting (:data:`BALANCES`; None = the default). ``sampled``: the instruments
-    that play a sampled sound (their stems get the SAMPLED_MIX entries and, at the settings B and C, the
-    RESTORED_MIX entries; the others the SYNTH_MIX entries); None = none does."""
+    effects) and of the band's stems, at a balance setting (:data:`BALANCES`; None = the default).
+    ``sampled``: the instruments that play a sampled sound (their stems get the SAMPLED_MIX entries and, at
+    the settings B and C, the RESTORED_MIX entries; the others the SYNTH_MIX entries); None = none does."""
     bal = BALANCES[balance or DEFAULT_BALANCE]
     m = json.loads(json.dumps(MASTER))
     m["vocal_balance_db"] = bal["vocal_balance_db"]
+    if bal["restored"] and sampled:
+        m["band_width"] = RESTORED_BAND_WIDTH
     mo = m["mix_overrides"] = {}
     for t in tracks or []:
         mix = vocal_mix(t.name, balance)
@@ -478,8 +485,10 @@ def restore_band(arrangement: dict, sampled: set[str]) -> None:
         sound = inst[name].get("sound")
         if isinstance(sound, str):
             sound = {"set": sound}
-        law = {"velocity_curve": 1.35} if inst[name].get("type") == "drums" else {"velocity_curve": 1.0, "vel_sens": 0.72}
-        inst[name]["sound"] = [dict(layer, **law) for layer in sound] if isinstance(sound, list) else dict(sound, **law)
+        kit = inst[name].get("type") == "drums"
+        law = {"velocity_curve": 1.35} if kit else {"velocity_curve": 1.0, "vel_sens": 0.72}
+        layers = [dict(layer, **law) for layer in (sound if isinstance(sound, list) else [sound])]
+        inst[name]["sound"] = layers if isinstance(sound, list) else layers[0]
     if "drums" in sampled:
         inst["drums"].setdefault("voices", {}).setdefault("kick", {})["tune"] = -5
     if "bass" in sampled:

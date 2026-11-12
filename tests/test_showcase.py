@@ -143,8 +143,12 @@ def test_the_balance_dial_is_one_switch_and_only_restores_what_plays_sampled(son
     b = build.master_settings({"drums", "bass", "slap", "pluck"}, p.tracks, "B")["mix_overrides"]
     assert "basslo" not in a and "spread" not in a["pluck"] and a["drums kick"].get("crest_db") == 7.0
     assert b["drums kick"]["crest_db"] == 5.0 and b["pluck"]["spread"] > 0 and b["drums clap"]["spread"] > 0
-    assert b["basslo"]["eq_add"][0][0] == "lp" and b["growl"]["eq_add"] == [] and b["slap"]["eq_add"][-1][0] == "highshelf"
+    assert b["basslo"]["eq_add"][0][0] == "lp" and b["growl"]["eq_add"] == []
+    assert b["slap"]["eq_add"][-1][0] == "highshelf"  # (an entry named "bass" reaches every stem of that role)
     assert "spread" not in b["mute"] and b["gtrL"] == build.BAND_MIX["gtrL"]  # (these two are not sampled here)
+    wide = build.master_settings({"gtrL"}, p.tracks, "B")["band_width"]
+    assert wide == build.RESTORED_BAND_WIDTH > build.MASTER["band_width"] == p.master.band_width
+    assert build.master_settings({"gtrL"}, p.tracks, "A")["band_width"] == build.MASTER["band_width"]
     none = build.master_settings(set(), p.tracks, "B")["mix_overrides"]
     assert "basslo" not in none and "growl" not in none and none["drums kick"] == build.BAND_MIX["drums kick"]
     # the arrangement: kick tuning, the sine under the bass and the stereo pairs, for sampled instruments only
@@ -155,11 +159,12 @@ def test_the_balance_dial_is_one_switch_and_only_restores_what_plays_sampled(son
     build.restore_band(same, {"drums", "bass", "pad"})
     assert same["instruments"]["drums"]["voices"]["kick"]["tune"] == -5
     assert same["instruments"]["drums"]["sound"]["velocity_curve"] == 1.35  # velocity as the synthesised kit ...
-    assert (same["instruments"]["bass"]["sound"]["velocity_curve"], same["instruments"]["bass"]["sound"]["vel_sens"]) \
-        == (1.0, 0.72)  # ... and as the synthesised presets take it
-    assert "velocity_curve" not in arr["instruments"]["gtrL"]["sound"] and same["instruments"]["gtrL"] == arr["instruments"]["gtrL"]
+    bass = same["instruments"]["bass"]["sound"]
+    assert (bass["velocity_curve"], bass["vel_sens"]) == (1.0, 0.72)  # ... and as the synthesised presets take it
+    assert same["instruments"]["gtrL"] == arr["instruments"]["gtrL"]  # (not sampled here)
     with_bass = [sec["name"] for sec in arr["sections"] if sec["parts"].get("bass") is not None]
-    assert len(with_bass) >= 8 and all(sec["parts"].get("basslo") == sec["parts"].get("bass") for sec in same["sections"])
+    assert len(with_bass) >= 8
+    assert all(sec["parts"].get("basslo") == sec["parts"].get("bass") for sec in same["sections"])
     left, right = same["instruments"]["pad"]["sound"]
     assert left["pan"] == -right["pan"] < 0 and left["tune"] == -right["tune"] and left["preset"] == "Warm Pad"
     assert left["velocity_curve"] == right["velocity_curve"] == 1.0
