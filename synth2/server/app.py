@@ -13,7 +13,11 @@ Endpoints
 ``PUT  /api/project``            replace the project (validated, pushes an undo snapshot)
 ``GET  /api/tools``              tool registry (JSON schema)
 ``POST /api/tool``               ``{name, args}`` -> tool result, or ``{error}`` (400)
-``POST /api/render``             ``{start_beat?, end_beat?, track_ids?}`` -> ``audio/wav``,
+``GET  /api/engines``            singing engines, what can run here, voicebanks, credits, roles
+``GET  /api/sounds``             installed sound sets (``?set=<id>&search=`` lists one set's presets)
+``GET  /api/render/status``      progress of the render that is running, if any
+``GET  /api/render/report``      the full report of the last render as JSON
+``POST /api/render``             ``{start_beat?, end_beat?, track_ids?, engine?, quality?}`` -> ``audio/wav``,
                                  report JSON in the ``X-Render-Report`` header
 ``GET  /api/render/last``        the last rendered WAV
 ``GET  /api/meta``               voices, styles, curve specs, note attributes, phonemes, ...
@@ -320,6 +324,26 @@ class StudioState:
         self.last_wav: bytes | None = None
         self.last_report: dict | None = None
         self.revision = 0
+        # the render that is running (``/api/render/status``): renders run one at a time, outside the
+        # project lock, so every other request is answered while one is under way
+        self.render_status: dict = {"active": False, "waiting": 0}
+        self._status_lock = threading.Lock()
+
+    def set_render_status(self, **changes) -> None:
+        with self._status_lock:
+            self.render_status = {**self.render_status, **changes}
+
+    def render_waiting(self, delta: int) -> None:
+        with self._status_lock:
+            self.render_status = {**self.render_status,
+                                  "waiting": max(0, int(self.render_status.get("waiting", 0)) + delta)}
+
+    def get_render_status(self) -> dict:
+        with self._status_lock:
+            out = dict(self.render_status)
+        if out.get("active") and out.get("started"):
+            out["elapsed_s"] = round(time.time() - out["started"], 1)
+        return out
 
     @property
     def lock(self):
@@ -473,8 +497,37 @@ def compute_phonemes(project: Project) -> dict:
     return {"tracks": out, "errors": errors}
 
 
-def render_wav(project: Project, start_beat=None, end_beat=None, track_ids=None) -> tuple[bytes, dict, Any]:
-    """Render ``project`` and return ``(wav bytes, report, RenderResult)``."""
+def _render_lock():
+    """The process-wide render lock of the tool layer (renders queue on it), or a private one without it."""
+    try:
+        from ..ai.tools import RENDER_LOCK
+
+        return RENDER_LOCK
+    except Exception:  # pragma: no cover - tool layer missing
+        return _FALLBACK_RENDER_LOCK
+
+
+_FALLBACK_RENDER_LOCK = threading.Lock()
+
+
+def engine_args(engine=None, quality=None) -> tuple[str | None, str | None]:
+    """Validate the ``engine`` and ``quality`` of a render request: ``(engine spec or None, quality or
+    None)``. Raises ``ValueError`` with the reason for anything that is not a known engine spec (auto,
+    formant, neural, neural:<voicebank id>) or quality (draft, normal, high)."""
+    from ..engine.backend import normalize_engine, parse_quality
+
+    for name, value in (("engine", engine), ("quality", quality)):
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be a string, got {type(value).__name__}")
+    return normalize_engine(engine) or None, parse_quality(quality)
+
+
+def render_wav(project: Project, start_beat=None, end_beat=None, track_ids=None, engine=None, quality=None,
+               progress=None) -> tuple[bytes, dict, Any]:
+    """Render ``project`` and return ``(wav bytes, report, RenderResult)``.
+
+    ``engine`` and ``quality`` are those of :func:`synth2.engine.render_project`; ``progress`` is called
+    with ``(fraction, message)`` while the render runs. One render runs at a time in the process."""
     from ..engine import render_project
 
     kwargs = {}
@@ -486,7 +539,14 @@ def render_wav(project: Project, start_beat=None, end_beat=None, track_ids=None)
         track_ids = [track_ids]
     if track_ids:
         kwargs["track_ids"] = list(track_ids)
-    res = render_project(project, **kwargs)
+    if engine:
+        kwargs["engine"] = engine
+    if quality:
+        kwargs["quality"] = quality
+    if progress is not None:
+        kwargs["progress"] = progress
+    with _render_lock():
+        res = render_project(project, **kwargs)
     fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="synth2-render-")
     os.close(fd)
     try:
@@ -507,6 +567,32 @@ def render_wav(project: Project, start_beat=None, end_beat=None, track_ids=None)
     if hasattr(res, "start_seconds"):
         report["start_seconds"] = float(res.start_seconds)
     return data, report, res
+
+
+def add_render_notes(project: Project, report: dict, quality: str | None = None) -> dict:
+    """Put what the user has to see next to a render into ``report``: the ``engines`` that sang, the
+    ``quality``, the ``credits`` to show when publishing (voicebank, vocoder, sound sets), ``licence_notes``
+    and the ``warnings`` (with sampled sounds that fell back to the synth)."""
+    try:
+        from ..ai.tools import render_notes
+        from ..engine.backend import current_quality
+
+        notes = render_notes(project, report)
+        report.update(engines=notes["engines"], voicebanks=notes["voicebanks"], credits=notes["credits"],
+                      licence_notes=notes["licence_notes"], warnings=notes["warnings"],
+                      quality=quality or current_quality())
+    except Exception:  # pragma: no cover - tool layer missing: the report keeps what the engine gave
+        report.setdefault("credits", [])
+    return report
+
+
+def engines_payload() -> dict:
+    """``GET /api/engines``."""
+    from ..ai.tools import ROLE_DOCS, engines_info
+
+    out = engines_info()
+    out["roles"] = [{"id": k, "description": v} for k, v in ROLE_DOCS.items()]
+    return out
 
 
 def _beat_value(value, name: str) -> float | None:
@@ -558,7 +644,7 @@ def render_args(project: Project, start_beat=None, end_beat=None, track_ids=None
     return start, end, track_ids
 
 
-def _record_render(session, project: Project, res, start_beat, end_beat) -> None:
+def _record_render(session, project: Project, res, start_beat, end_beat, engine=None, quality=None) -> None:
     """Let the tool layer know about a studio render (so ``analyze_render`` works on it)."""
     if not hasattr(session, "last_render"):
         return
@@ -569,7 +655,8 @@ def _record_render(session, project: Project, res, start_beat, end_beat) -> None
         if hasattr(session, "last_render_state"):
             from ..ai.tools import _fingerprint  # type: ignore[attr-defined]
 
-            session.last_render_state = _fingerprint(project)
+            session.last_render_state = _fingerprint(project, engine, quality)
+            session.last_render_options = (engine, quality)
     except Exception:  # pragma: no cover - bookkeeping only
         pass
 
@@ -593,6 +680,13 @@ def report_header(report: dict, limit: int = 7000) -> str:
     slim["tracks"] = tracks
     slim["truncated"] = True
     s = enc(slim)
+    if len(s) <= limit:
+        return s
+    # the last resort keeps what must be shown with the audio; the full report is at /api/render/report
+    keep = {k: slim[k] for k in ("engines", "voicebanks", "credits", "licence_notes") if k in slim}
+    if isinstance(slim.get("warnings"), list):
+        keep["warnings"] = [str(w)[:200] for w in slim["warnings"][:8]]
+    s = enc({k: v for k, v in slim.items() if not isinstance(v, (list, dict))} | keep | {"truncated": True})
     if len(s) <= limit:
         return s
     return enc({k: v for k, v in slim.items() if not isinstance(v, (list, dict))} | {"truncated": True})

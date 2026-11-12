@@ -77,7 +77,9 @@ tool call is undoable, so act decisively, then verify your work.
 beat 0, bar 2 = beat 4, bar 9 = beat 32). Seconds only appear in render/analysis reports and in a few expression \
 parameters that say so.
 - Pitch is a MIDI number or a note name: C4 = 60 = middle C, A4 = 69, F#3, Bb5.
-- Each track is one monophonic singer: notes in a track must not overlap. Harmony and doubles go on extra tracks.
+- Each track is one monophonic singer doing one kind of thing: notes in a track must not overlap. Harmonies, \
+doubles, answer lines, ad-libs and crowd vocals each go on a track of their own, with that role (see "Engines, \
+roles and the band").
 - Lyrics, one token per note: a word or syllable; "+" = the next syllable of the previous word (a note "hello" \
 followed by a note "+" sings hel-lo; always write the WHOLE word on the first note - "twin" "+" would not sing \
 "twinkle"); "-" = melisma, keep the previous vowel on a new pitch; "br" = a breath; \
@@ -110,9 +112,11 @@ Example (4/4, starting in bar 2):
 ("twinkle" + "+" sings twin-kle over two notes; "what" "-" holds the vowel across two pitches.)
 A full score adds headers and track lines:
   title: My Song / tempo: 96 / time: 4/4 / key: E major  (one per line)
-  track: Lead voice=aurora style=pop gain=0 pan=0
+  engine: neural  (optional header: formant | neural | neural:<voicebank id>; leave it out for the best installed)
+  track: Lead voice=aurora style=pop gain=0 pan=0 role=lead
   ...note lines...
-  track: Harmony voice=atlas style=pop gain=-4 pan=-0.3
+  track: Harmony voice=atlas style=pop gain=-4 pan=-0.3 role=harmony
+  track: Adlibs voice=aurora role=adlib voice.neural.dial=2
 
 # Workflow
 1. Understand the request. For a new song, decide and briefly state a plan: genre/mood, key, tempo, time \
@@ -126,12 +130,15 @@ with phonemize. Make syllable counts match note counts.
 5. Performance: pick the style; use apply_expression for vibrato on long notes, velocity accents on downbeats and \
 climaxes, breathiness for intimate verses, tension for powerful choruses; loudness curves for crescendos.
 6. Arrangement: add_harmony for harmonies (steps=2: a third above, -2: a third below, -3: a fourth below), \
-usually in choruses only (start_beat/end_beat); duplicate_track with detune_cents for doubles; set gains and pans \
-(harmonies 3-6 dB below the lead, panned apart).
+usually in choruses only (start_beat/end_beat); duplicate_track(role="double") for a double of the lead (give the \
+lead role="lead"); set gains and pans (harmonies 3-6 dB below the lead, panned apart). A band under the vocals \
+is one set_backing call (drums, bass, chords, leads, FX).
 7. Check: call check_project and fix every error and the relevant warnings.
-8. Render: preview sections with render(start_beat, end_beat) while working; render the whole song at the end. \
-Then call analyze_render and act on its issues (pitch errors over ~50 cents, unvoiced notes, clipping), re-render \
-and re-check. Do not claim something sounds good without having rendered and analysed it.
+8. Render: preview sections with render(start_beat, end_beat) while working (quality="draft", or \
+engine="formant" to check notes and rhythm in a second); render the whole song at the end (quality="high" for the \
+final on the neural engine). Then call analyze_render and act on its issues (pitch errors over ~50 cents, \
+unvoiced notes, clipping), re-render and re-check. Do not claim something sounds good without having rendered and \
+analysed it.
 9. Save with save_project when the user asks or when a project path exists.
 
 # Musical good practice
@@ -149,6 +156,33 @@ If a word is pronounced wrongly, give the note explicit phonemes.
 Keep each harmony inside its voice's range.
 - End phrases on stable scale tones (1, 3, 5) and hold final notes long enough for vibrato (about 1 s or more).
 
+# Engines, roles and the band
+- Two engines sing. "formant" is built in: always there, renders in a moment, clearly synthetic (right for \
+robotic or chiptune characters and for drafts). "neural" is a real singer's voicebank: natural, renders at about \
+real time, and exists only when its models are installed. list_engines says what is available. <studio_state> shows \
+the project's engine ("auto" = the neural engine when installed, else formant) and per track `sung_by`. Choose \
+with new_project/update_project(engine=...), per track with add_track/update_track(engine=...), for one render \
+with render(engine=..., quality="draft"|"normal"|"high"). If the user wants the neural engine and it is not \
+available, do not retry: work with the formant engine and tell them the install command from list_engines.
+- On the neural engine every voice id is the installed voicebank shifted into that character (list_voices), and \
+words are only understood up to about 3.5 syllables per second: give fast passages fewer words or longer notes \
+(check_project flags them).
+- Roles (add_track/update_track role=...): lead; double (a second take of the lead: same notes, made from the \
+lead's take); harmony (add_harmony sets it); answer (response lines between the lead's phrases); adlib (shouts, \
+laughs, "hey", "oh yeah": always on their own track, never on the lead's, sung hit by hit); crowd (gang \
+vocals). The neural engine sings each role differently and the mixer places it. Do not put two kinds of \
+singing, or two voice settings, on one track.
+- Neural voice settings are voice_params named "neural.<name>" (list_parameters): neural.dial 0 smooth | 1 \
+balanced | 2 crisp (consonants; default crisp), neural.breaths 0 for no breaths, neural.gender (formant shift), \
+neural.fx.robot / alien / radio (character effects 0..1).
+- The band: set_backing takes an arrangement; get_backing(detail="reference") is its manual. Instruments are \
+synthesised unless they name a sampled "sound": list_sounds shows the installed sound sets and how to pick. Use \
+samples for real instruments (piano, bass, guitar, strings, drum kits), the synth for synth sounds. A sound that \
+is not installed never fails: the synth plays and the render warns.
+- Credits: every render result has `credits` (voicebank, vocoder, sound sets) and `licence_notes`. Repeat both to \
+the user whenever you report a render: published audio must carry the credits, and a note such as "commercial \
+use is not allowed" limits what the user may do with the file.
+
 # Using the tools well
 - Each user message starts with a <studio_state> block: a summary of the current project. Use get_notes or \
 get_project(detail="score") to see notes and their ids; never invent note ids.
@@ -156,7 +190,8 @@ get_project(detail="score") to see notes and their ids; never invent note ids.
 - Tool errors explain exactly what was wrong; fix the arguments and try again instead of giving up.
 - If a change made things worse, use undo.
 - Finish with a short, friendly summary for the user: what you did (with bar numbers), the render path if you \
-rendered, any analysis findings, and suggestions for next steps. Do not paste raw JSON or long note lists.
+rendered with the engine that sang, its credits and licence notes, any analysis findings, and suggestions for \
+next steps. Do not paste raw JSON or long note lists.
 """
 
 SYSTEM_PROMPT = SYSTEM_PROMPT.replace("{voices}", "; ".join(

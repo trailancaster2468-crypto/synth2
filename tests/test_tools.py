@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import surface_fakes as fakes
 from synth2.ai import composer
 from synth2.ai.tools import MUTATING_TOOLS, TOOLS, Session, ToolError, call_tool, tool_names
 from synth2.project import Note, Project
@@ -1300,3 +1301,307 @@ def test_hyphenated_compound_words_keep_each_parts_syllables():
 
     assert lyric_tokens("never-ending") == ["never", "+", "ending", "+"]
     assert lyric_tokens("beau-ti-ful") == ["beautiful", "+", "+"]
+
+
+# ================================================================== engines, roles, credits
+
+@pytest.fixture
+def auto_engine(monkeypatch):
+    """No engine or quality pinned by the environment (the suite pins the formant engine)."""
+    monkeypatch.delenv("SYNTH2_ENGINE", raising=False)
+    monkeypatch.delenv("SYNTH2_QUALITY", raising=False)
+
+
+def _twinkle(s, **track):
+    call_tool(s, "write_melody", {"score": "@ 4 C4 q twinkle C4 q + G4 q twinkle G4 q + A4 h star"})
+    if track:
+        call_tool(s, "update_track", {"track": 0, **track})
+
+
+def test_list_engines_without_models(auto_engine, s, monkeypatch, tmp_path):
+    base = fakes.empty_models(monkeypatch, tmp_path)
+    out = call_tool(s, "list_engines")
+    formant, neural = out["engines"]
+    assert (formant["name"], formant["available"]) == ("formant", True)
+    assert (neural["name"], neural["available"]) == ("neural", False)
+    assert str(base) in neural["reason"] and "synth2 models install" in neural["install_hint"]
+    assert out["default_engine"] == "formant" and out["install_hint"] == neural["install_hint"]
+    assert out["qualities"] == ["draft", "normal", "high"] and set(out["quality_notes"]) == set(out["qualities"])
+    assert out["neural"]["banks"] == [] and out["credits"] == [] and out["licence_notes"] == []
+    assert set(out["track_roles"]) == {"lead", "double", "harmony", "answer", "adlib", "crowd"}
+    assert out["project"] == {"engine": "auto", "tracks": [{"track": "Lead", "asks_for": "auto", "engine": "formant"}]}
+    json.dumps(out)
+
+
+def test_list_engines_with_a_voicebank(auto_engine, s, monkeypatch, tmp_path):
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    out = call_tool(s, "list_engines")
+    neural = out["engines"][1]
+    assert neural["available"] is True and "install_hint" not in neural and out["install_hint"] == ""
+    assert neural["voicebanks"] == ["fakebank"] and neural["default_voicebank"] == "fakebank"
+    assert out["default_engine"] == "neural"
+    assert out["credits"] == [fakes.BANK_CREDIT, fakes.VOCODER_CREDIT]
+    assert out["licence_notes"] == ["Fakevoc (vocoder): CC BY-NC 4.0 - commercial use is not allowed"]
+    assert out["neural"]["commercial_use"] is False
+    bank = out["neural"]["banks"][0]
+    assert bank["terms"] == ["Credit the voicebank."] and bank["languages"] == ["en", "ja"]
+    monkeypatch.setenv("SYNTH2_ENGINE", "neural:missing")          # a default that cannot run is said, not raised
+    out = call_tool(s, "list_engines")
+    assert out["default_engine"] is None and "voicebank 'missing' is not installed" in out["default_engine_problem"]
+
+
+def test_list_voices_says_what_each_voice_becomes_on_the_neural_engine(auto_engine, s, monkeypatch, tmp_path):
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    voices = {v["id"]: v for v in call_tool(s, "list_voices")["voices"]}
+    assert voices["aurora"]["neural"]["voicebank"] == "fakebank" and voices["aurora"]["neural"]["available"]
+    assert voices["basso"]["neural"]["tone"] == 12 and voices["basso"]["neural"]["gender"] < 0
+    assert "voicebank fakebank" in voices["pixel"]["neural"]["summary"]
+    assert voices["aurora"]["range"] and voices["aurora"]["default_style"] == "pop"     # the old fields stay
+
+
+def test_project_and_track_engine_fields(auto_engine, s, monkeypatch, tmp_path):
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    out = call_tool(s, "new_project", {"title": "E", "engine": " Neural "})
+    assert out["engine"] == "neural" and s.project.engine == "neural"
+    assert out["tracks"][0]["sung_by"] == "neural" and out["tracks"][0]["role"] == ""
+    assert call_tool(s, "update_project", {"engine": "auto"})["engine"] == "auto" and s.project.engine == ""
+    assert call_tool(s, "update_project", {"engine": "neural:fakebank"})["engine"] == "neural:fakebank"
+    tr = call_tool(s, "add_track", {"name": "Robot", "voice": "nova", "engine": "formant", "role": "answer"})["track"]
+    assert (tr["engine"], tr["role"]) == ("formant", "answer")
+    tr = call_tool(s, "update_track", {"track": "Robot", "engine": "auto", "role": ""})["track"]
+    assert (tr["engine"], tr["role"]) == ("auto", "") and s.project.tracks[1].engine == ""
+    summary = call_tool(s, "get_project")
+    assert summary["engine"] == "neural:fakebank"
+    assert [t["sung_by"] for t in summary["tracks"]] == ["neural:fakebank", "neural:fakebank"]
+    call_tool(s, "undo")
+    assert s.project.tracks[1].engine == "formant" and s.project.tracks[1].role == "answer"
+    # the score route: header line, track options and dotted voice parameters
+    out = call_tool(s, "new_project", {"score": "engine: formant\ntrack: Lead voice=aurora role=lead\nr q C4 q la\n"
+                                                "track: Ad voice=aurora role=adlib engine=neural "
+                                                "voice.neural.dial=1\nr q C4 q hey"})
+    assert out["engine"] == "formant" and [t["role"] for t in out["tracks"]] == ["lead", "adlib"]
+    assert [t["sung_by"] for t in out["tracks"]] == ["formant", "neural"]
+    assert s.project.tracks[1].voice_params == {"neural.dial": 1.0}
+    for bad in ("vocaloid", "neural:", "formant:x"):
+        with pytest.raises(ToolError, match="unknown engine"):
+            call_tool(s, "update_project", {"engine": bad})
+        with pytest.raises(ToolError, match="unknown engine"):
+            call_tool(s, "update_track", {"track": 0, "engine": bad})
+    assert s.project.engine == "formant"                         # a rejected call changes nothing
+
+
+def test_an_engine_that_cannot_run_is_a_warning_when_set_and_an_error_when_rendered(auto_engine, s, monkeypatch,
+                                                                                    tmp_path):
+    fakes.empty_models(monkeypatch, tmp_path)
+    _twinkle(s)
+    out = call_tool(s, "update_project", {"engine": "neural"})
+    assert len(out["warnings"]) == 1 and "synth2 models install" in out["warnings"][0]
+    assert call_tool(s, "get_project")["tracks"][0]["sung_by"] is None
+    check = call_tool(s, "check_project")
+    assert check["ok"] is False and check["engines"] == [{"track": "Lead", "engine": None}]
+    assert any(i["severity"] == "error" and "not available" in i["message"] for i in check["issues"])
+    with pytest.raises(ToolError, match="synth2 models install") as exc:
+        call_tool(s, "render", {"path": str(tmp_path / "x.wav")})
+    assert "list_engines" in str(exc.value) and not (tmp_path / "x.wav").exists()
+    with pytest.raises(ToolError, match="not available"):
+        call_tool(s, "render", {"path": str(tmp_path / "x.wav"), "engine": "neural:nobank"})
+    with pytest.raises(ToolError, match="unknown engine 'nueral'"):
+        call_tool(s, "render", {"path": str(tmp_path / "x.wav"), "engine": "nueral"})
+    with pytest.raises(ToolError, match="quality"):
+        call_tool(s, "render", {"path": str(tmp_path / "x.wav"), "quality": "ultra"})
+    out = call_tool(s, "render", {"path": str(tmp_path / "x.wav"), "engine": "formant"})   # formant still works
+    assert out["engines"] == ["formant"] and out["credits"] == [] and (tmp_path / "x.wav").exists()
+    out = call_tool(s, "update_track", {"track": 0, "engine": "formant"})                   # and per track
+    assert "warnings" not in out and call_tool(s, "check_project")["engines"] == [{"track": "Lead",
+                                                                                   "engine": "formant"}]
+
+
+def test_render_returns_engines_quality_credits_and_licence_notes(auto_engine, s, monkeypatch, tmp_path):
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    _twinkle(s)
+    out = call_tool(s, "render", {"path": str(tmp_path / "n.wav"), "quality": "draft"})
+    assert out["engines"] == ["neural"] and out["voicebanks"] == ["fakebank"] and out["quality"] == "draft"
+    assert out["credits"] == [fakes.BANK_CREDIT, fakes.VOCODER_CREDIT]
+    assert out["licence_notes"] == ["Fakevoc (vocoder): CC BY-NC 4.0 - commercial use is not allowed"]
+    assert fakes.CALLS == [("Lead", "draft")]
+    track = out["report"]["tracks"][0]
+    assert track["engine"] == "neural" and "alignment" not in track["neural"] and "phonemes" not in track
+    out = call_tool(s, "render", {"path": str(tmp_path / "n.wav"), "include_phonemes": True})
+    assert out["quality"] == "normal" and "alignment" in out["report"]["tracks"][0]["neural"]
+    out = call_tool(s, "render", {"path": str(tmp_path / "f.wav"), "engine": "formant"})
+    assert out["engines"] == ["formant"] and out["voicebanks"] == [] and out["credits"] == []
+    out = call_tool(s, "render", {"path": str(tmp_path / "n.wav"), "engine": "neural:fakebank", "quality": "high"})
+    assert out["report"]["tracks"][0]["bank"] == "fakebank" and fakes.CALLS[-1] == ("Lead", "high")
+    json.dumps(out)
+
+
+def test_the_state_of_the_last_render_includes_engine_and_quality(auto_engine, s, monkeypatch, tmp_path):
+    from synth2.ai.tools import _fingerprint
+
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    _twinkle(s)
+    p = s.project
+    keys = {_fingerprint(p), _fingerprint(p, "formant"), _fingerprint(p, None, "draft"),
+            _fingerprint(p, "neural:fakebank", "high")}
+    assert len(keys) == 4
+    assert _fingerprint(p, "neural") == _fingerprint(p)             # auto resolves to the neural engine here
+    call_tool(s, "render", {"path": str(tmp_path / "f.wav"), "engine": "formant", "quality": "draft"})
+    assert s.last_render_options == ("formant", "draft")
+    stale = "changed since this render"
+    assert not [i for i in call_tool(s, "analyze_render", {"include_pitch": False})["issues"] if stale in i]
+    call_tool(s, "update_project", {"engine": "formant"})           # the project changed
+    assert [i for i in call_tool(s, "analyze_render", {"include_pitch": False})["issues"] if stale in i]
+    call_tool(s, "undo")
+    call_tool(s, "render", {"path": str(tmp_path / "n.wav")})
+    assert not [i for i in call_tool(s, "analyze_render", {"include_pitch": False})["issues"] if stale in i]
+    fakes.empty_models(monkeypatch, tmp_path)                       # the voicebank went away: auto is formant now
+    monkeypatch.setattr("synth2.neural.available", lambda bank=None: (False, "no voicebank is installed"))
+    assert [i for i in call_tool(s, "analyze_render", {"include_pitch": False})["issues"] if stale in i]
+
+
+def test_render_reports_sampled_sound_credits_and_fallbacks(s, monkeypatch, tmp_path):
+    fakes.install_fake_sound(monkeypatch, tmp_path, share_alike=True, commercial_use_statement="Keep it open.")
+    _twinkle(s)
+    call_tool(s, "set_backing", {"arrangement": fakes.backing()})
+    out = call_tool(s, "render", {"path": str(tmp_path / "b.wav")})
+    assert out["credits"] == [fakes.SOUND_CREDIT]
+    assert out["licence_notes"] == ['Tiny Bass (samples): CC BY 4.0 - share-alike (the publisher says: "Keep it open.")']
+    assert not [w for w in out["report"]["warnings"] if "plays instead" in w]
+    assert call_tool(s, "check_project")["warnings"] == 0
+    call_tool(s, "set_backing", {"arrangement": fakes.backing("no-such-set")})
+    out = call_tool(s, "render", {"path": str(tmp_path / "b.wav")})
+    fallback = [w for w in out["report"]["warnings"] if "plays instead" in w]
+    assert len(fallback) == 1 and "synth2 sounds install no-such-set" in fallback[0] and out["credits"] == []
+    check = call_tool(s, "check_project")
+    assert [i for i in check["issues"] if i["severity"] == "warning" and "backing band: bass" in i["message"]]
+    # vocals alone (a track subset) play no band: no sound credits, no fallback warning
+    call_tool(s, "set_backing", {"arrangement": fakes.backing()})
+    out = call_tool(s, "render", {"path": str(tmp_path / "v.wav"), "tracks": [0]})
+    assert out["credits"] == [] and out["licence_notes"] == []
+
+
+def test_roles_and_neural_voice_parameters(auto_engine, s, monkeypatch, tmp_path):
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    _twinkle(s, role="Lead")
+    assert s.project.tracks[0].role == "lead"
+    tr = call_tool(s, "add_track", {"name": "Shouts", "role": "ad-lib",
+                                    "voice_params": {"neural.dial": 1, "neural.breaths": 0, "neural.fx.robot": 0.5,
+                                                     "neural.adlib.bend.hey": -2, "breathiness": 0.2}})["track"]
+    assert tr["role"] == "adlib"                                    # stored in the engine's spelling
+    assert tr["voice_params"] == {"neural.dial": 1.0, "neural.breaths": 0.0, "neural.fx.robot": 0.5,
+                                  "neural.adlib.bend.hey": -2.0, "breathiness": 0.2}
+    tr = call_tool(s, "update_track", {"track": "Shouts", "voice_params": {"neural.dial": None}})["track"]
+    assert "neural.dial" not in tr["voice_params"]
+    out = call_tool(s, "apply_expression", {"track": "Shouts", "voice_params": {"neural.gender": 0.3}})
+    assert out["voice_params"]["neural.gender"] == 0.3
+    for params, text in (({"neural.dial": 5}, "out of range 0..2"), ({"neural.gender": "high"}, "must be a number"),
+                         ({"neural.fx.alien": 2}, "out of range 0..1"), ({"neural.": 1}, "not a neural parameter"),
+                         ({"neural.a b": 1}, "not a neural parameter"), ({"nueral.dial": 1}, "unknown voice parameter")):
+        with pytest.raises(ToolError, match=text):
+            call_tool(s, "update_track", {"track": "Shouts", "voice_params": params})
+    for bad in ("singer", "lead:Other", "double:"):
+        if bad == "double:":
+            assert call_tool(s, "update_track", {"track": "Shouts", "role": bad})["track"]["role"] == "double"
+            continue
+        with pytest.raises(ToolError, match="role"):
+            call_tool(s, "update_track", {"track": "Shouts", "role": bad})
+    # doubles: made from a lead of the same voice, or from the track they name
+    out = call_tool(s, "duplicate_track", {"track": "Lead", "name": "Dbl", "role": "double"})
+    assert out["track"]["role"] == "double" and out["warnings"] == []
+    out = call_tool(s, "update_track", {"track": "Dbl", "role": "double:Nobody"})
+    assert "no other track named 'Nobody'" in out["warnings"][0]
+    out = call_tool(s, "update_track", {"track": "Dbl", "role": "double:lead"})
+    assert "warnings" not in out and s.project.tracks[-1].role == "double:lead"
+    call_tool(s, "update_track", {"track": "Lead", "role": ""})
+    out = call_tool(s, "update_track", {"track": "Dbl", "role": "double"})
+    assert "no track with role 'lead'" in out["warnings"][0]
+    check = call_tool(s, "check_project", {"track": "Dbl"})
+    assert [i for i in check["issues"] if "no track with role 'lead'" in i["message"]]
+    # harmonies get their role and the source's engine
+    call_tool(s, "update_track", {"track": "Lead", "engine": "formant"})
+    h = call_tool(s, "add_harmony", {"source_track": "Lead", "steps": 2})["track"]
+    assert (h["role"], h["engine"]) == ("harmony", "formant")
+    h = call_tool(s, "add_harmony", {"source_track": "Lead", "steps": -2, "role": ""})["track"]
+    assert h["role"] == ""
+    # the roles survive a save and a load in both native formats
+    for name in ("r.s2p.json", "r.s2s"):
+        call_tool(s, "save_project", {"path": str(tmp_path / name)})
+        loaded = Session.open(tmp_path / name).project
+        assert [t.role for t in loaded.tracks] == [t.role for t in s.project.tracks], name
+        assert loaded.tracks[1].voice_params["neural.fx.robot"] == 0.5
+
+
+def test_check_project_flags_lines_too_fast_for_the_neural_engine(auto_engine, s, monkeypatch, tmp_path):
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    call_tool(s, "set_tempo", {"bpm": 120})
+    fast = " ".join("C4 s la" for _ in range(16))                   # sixteenths at 120 bpm: 8 syllables a second
+    slow = " ".join("C4 q la" for _ in range(8))                    # quarters: 2 a second
+    call_tool(s, "write_melody", {"score": f"@ 4 {slow} r h {fast}"})
+    check = call_tool(s, "check_project")
+    hits = [i for i in check["issues"] if "syllables per second" in i["message"]]
+    assert len(hits) == 1 and hits[0]["severity"] == "warning" and "up to 8.0/s" in hits[0]["message"]
+    assert "starts at beat 14" in hits[0]["message"]
+    call_tool(s, "update_track", {"track": 0, "engine": "formant"})  # the formant engine is not judged by it
+    assert not [i for i in call_tool(s, "check_project")["issues"] if "syllables per second" in i["message"]]
+    call_tool(s, "update_track", {"track": 0, "engine": "auto"})
+    call_tool(s, "set_tempo", {"bpm": 50})                           # the same notes, slowly: 3.3 a second
+    assert not [i for i in call_tool(s, "check_project")["issues"] if "syllables per second" in i["message"]]
+
+
+def test_tool_text_teaches_engines_roles_and_sounds():
+    """What a model has to learn from the tool definitions alone."""
+    from synth2.ai import mcp_server
+    from synth2.ai.director import SYSTEM_PROMPT
+
+    by_name = {t["name"]: t for t in TOOLS}
+    assert "list_engines" in by_name and "list_sounds" in by_name
+    add = by_name["add_track"]
+    for text in ("own track with role 'adlib'", "one track = one singer doing one kind of thing",
+                 "3.5 syllables per second", "neural.dial", "neural.breaths"):
+        assert text in add["description"], text
+    for name in ("add_track", "update_track"):
+        props = by_name[name]["input_schema"]["properties"]
+        assert {"engine", "role", "voice_params"} <= set(props)
+        assert "adlib" in props["role"]["description"] and "neural:<voicebank id>" in props["engine"]["description"]
+    for name in ("new_project", "update_project", "render"):
+        assert "engine" in by_name[name]["input_schema"]["properties"], name
+    render = by_name["render"]
+    assert render["input_schema"]["properties"]["quality"]["enum"] == ["draft", "normal", "high"]
+    for text in ("credits", "licence_notes", "fell back to the synth"):
+        assert text in render["description"], text
+    assert "How to pick" in by_name["list_sounds"]["description"] and "gm" in by_name["list_sounds"]["description"]
+    assert "sound" in by_name["set_backing"]["description"]
+    params = call_tool(Session(), "list_parameters")
+    assert "neural.dial" in params["neural_voice_params"] and "adlib" in params["track_roles"]
+    for text in (SYSTEM_PROMPT, mcp_server.INSTRUCTIONS):
+        for word in ("list_engines", "neural", "formant", "adlib", "3.5 syllables", "credits", "licence_notes",
+                     "list_sounds", "quality"):
+            assert word in text, word
+
+
+def test_mcp_and_director_pass_engines_and_credits_through(auto_engine, monkeypatch, tmp_path):
+    from synth2.ai.director import _state_block
+    from synth2.ai.mcp_server import MCPServer
+
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    server = MCPServer()
+    init = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    assert "list_engines" in init["result"]["instructions"]
+    listed = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
+    assert "list_engines" in [t["name"] for t in listed]
+
+    def call(name, args):
+        res = server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                             "params": {"name": name, "arguments": args}})["result"]
+        return res.get("isError", False), json.loads(res["content"][0]["text"]) if not res.get("isError") \
+            else res["content"][0]["text"]
+
+    assert call("list_engines", {})[1]["default_engine"] == "neural"
+    call("write_melody", {"score": "@ 4 C4 q la D4 q la"})
+    err, out = call("render", {"path": str(tmp_path / "m.wav"), "quality": "draft"})
+    assert not err and out["engines"] == ["neural"] and out["credits"][0] == fakes.BANK_CREDIT
+    assert out["licence_notes"] and fakes.CALLS[-1] == ("Lead", "draft")
+    err, text = call("render", {"path": str(tmp_path / "m.wav"), "engine": "neural:nope"})
+    assert err and "voicebank 'nope' is not installed" in text
+    state = _state_block(server.session)
+    assert '"engine": "auto"' in state and '"sung_by": "neural"' in state and '"role": ""' in state

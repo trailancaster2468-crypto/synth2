@@ -36,7 +36,20 @@ INSTRUCTIONS = (
     "Synth2 Vocal Studio: an AI-native singing voice synthesizer. Time is in beats (quarter notes, beat 0 = song "
     "start); pitch is MIDI or note names (C4 = 60). Typical workflow: new_project -> write_melody (score notation "
     "'C4 q la  D4 q la  E4 h la') -> set_lyrics -> update_track/apply_expression (voice, style) -> add_harmony -> "
-    "check_project -> render -> analyze_render -> fix and re-render. Every edit is undoable (undo/redo)."
+    "set_backing (a band, optional) -> check_project -> render -> analyze_render -> fix and re-render. Every edit "
+    "is undoable (undo/redo). "
+    "Engines: 'formant' (built in, instant, synthetic) and 'neural' (a natural voicebank, about real time, only "
+    "when its models are installed with `synth2 models install`); call list_engines first to see what is "
+    "available. Set engine on the project (new_project/update_project), a track (add_track/update_track) or one "
+    "render (render engine=..., quality=draft|normal|high); 'auto' picks the neural engine when it is installed. "
+    "Draft with engine='formant' or quality='draft', finish with quality='high'. "
+    "Tracks: one track = one singer doing one kind of thing; give tracks a role (lead, double, harmony, answer, "
+    "adlib, crowd). Ad-libs go on their own track with role 'adlib'. Neural settings are voice_params named "
+    "'neural.<name>' (list_parameters). On the neural engine words faster than about 3.5 syllables per second are "
+    "not understood. Band instruments can play installed sampled sounds (list_sounds; set_backing 'sound'); a "
+    "missing sound falls back to the synth with a warning. "
+    "Render results carry `credits` and `licence_notes`: show both to the user, published audio must carry the "
+    "credits and a non-commercial note limits its use."
 )
 
 PARSE_ERROR = -32700

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -40,14 +41,67 @@ def _filter_to_range(pa: dict, start, end) -> dict:
     return pa
 
 
+def _engine_arg(value: str) -> str:
+    """argparse type of ``--engine``: auto, formant, neural or neural:<voicebank id>."""
+    from .engine.backend import parse_engine
+
+    try:
+        parse_engine(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value.strip()
+
+
+def _add_engine_options(parser, what: str = "this render") -> None:
+    from .engine.backend import QUALITY_CHOICES
+
+    parser.add_argument("--engine", type=_engine_arg, metavar="ENGINE",
+                        help=f"singing engine for {what}: auto, formant, neural or neural:<voicebank id> "
+                             "(see 'synth2 engines'); overrides the project's and the tracks' own")
+    parser.add_argument("--quality", choices=QUALITY_CHOICES,
+                        help="render quality of the neural engine: draft (fast), normal (default), high (final)")
+
+
+def _engine_problem(engine: str | None) -> str | None:
+    """Why ``engine`` cannot be used on this machine (None when it can, or when it is unset or auto)."""
+    from .engine.backend import EngineUnavailable, resolve_engine
+
+    try:
+        resolve_engine(override=engine)
+    except (EngineUnavailable, ValueError) as exc:
+        return str(exc)
+    return None
+
+
+def _set_default_engine(a) -> str | None:
+    """Make ``--engine`` / ``--quality`` the defaults of this process (the studio, the MCP server and the
+    director render through the tool layer, which reads them from the environment). Returns an error
+    message when the engine cannot run here."""
+    from .engine.backend import ENGINE_ENV, QUALITY_ENV
+
+    engine, quality = getattr(a, "engine", None), getattr(a, "quality", None)
+    if engine:
+        problem = _engine_problem(engine)
+        if problem:
+            return problem
+        os.environ[ENGINE_ENV] = engine
+    if quality:
+        os.environ[QUALITY_ENV] = quality
+    return None
+
+
 def cmd_render(a):
-    from .ai.tools import ToolError
+    from .ai.tools import ToolError, render_notes, slim_report, summary_lines
     from .analysis import pitch_accuracy
     from .engine import render_project
+    from .engine.backend import EngineUnavailable, current_quality
 
     if a.start is not None and a.end is not None and a.end <= a.start:
         return _error("--end must be greater than --start")
-    project = _load(a.input)
+    try:
+        project = _load(a.input)
+    except (OSError, ValueError, KeyError) as exc:
+        return _error(f"could not load {a.input}: {exc}")
     try:
         track_ids = _track_ids(project, a.track) if a.track else None
     except ToolError as exc:
@@ -58,19 +112,27 @@ def cmd_render(a):
         if not a.quiet:
             print(f"\r[{int(f * 100):3d}%] {msg:40s}", end="", file=sys.stderr, flush=True)
 
-    res = render_project(project, sample_rate=a.sample_rate, start_beat=a.start, end_beat=a.end,
-                         track_ids=track_ids, progress=progress)
+    try:
+        res = render_project(project, sample_rate=a.sample_rate, start_beat=a.start, end_beat=a.end,
+                             track_ids=track_ids, progress=progress, engine=a.engine, quality=a.quality)
+    except (EngineUnavailable, ValueError) as exc:  # an engine that is not installed, or a misspelt one in the file
+        return _error(str(exc))
     if not a.quiet:
         print(file=sys.stderr)
     res.save(out, bits=a.bits)
     if a.stems:
         res.save_stems(a.stems, bits=a.bits)
-    report = dict(res.report)
-    for t in report.get("tracks", []):
-        t.pop("phonemes", None)
+    report = slim_report(res.report)
+    notes = render_notes(project, report)
+    report.update(warnings=notes["warnings"], credits=notes["credits"], licence_notes=notes["licence_notes"])
     if a.check:
         report["pitch_accuracy"] = _filter_to_range(pitch_accuracy(project, res), a.start, a.end)
-    print(json.dumps({"output": str(out), **report}, indent=2, ensure_ascii=False))
+    print(json.dumps({"output": str(out), "quality": a.quality or current_quality(), **report},
+                     indent=2, ensure_ascii=False))
+    if not a.quiet:
+        print(f"wrote {out}", file=sys.stderr)
+        for line in summary_lines(notes):
+            print(line, file=sys.stderr)
 
 
 def cmd_new(a):
@@ -85,8 +147,16 @@ def cmd_new(a):
 
 
 def cmd_info(a):
+    from .ai.tools import resolved_engines
+
     p = _load(a.input)
-    print(json.dumps(p.summary(), indent=2, ensure_ascii=False))
+    out = p.summary()
+    out["engine"] = p.engine or "auto"
+    out["engines"] = resolved_engines(p)
+    for row, t in zip(out.get("tracks", []), p.tracks):
+        if t.role:
+            row["role"] = t.role
+    print(json.dumps(out, indent=2, ensure_ascii=False))
 
 
 def cmd_score(a):
@@ -103,10 +173,75 @@ def cmd_convert(a):
 
 
 def cmd_voices(a):
-    from .voices import list_voices
+    from .ai.tools import voices_info
 
-    for v in list_voices():
+    voices = voices_info()
+    if a.json:
+        print(json.dumps(voices, indent=2, ensure_ascii=False))
+        return
+    for v in voices:
         print(f"{v['id']:8s} {v['range']:9s} {v['default_style']:9s} {v['description']}")
+        if v.get("neural"):
+            print(f"{'':8s} neural engine: {v['neural']['summary']}")
+    if voices and voices[0].get("neural") and not voices[0]["neural"]["available"]:
+        print("the neural engine is not available on this machine: see 'synth2 engines'")
+
+
+def _print_model(row: dict) -> None:
+    from . import assets
+
+    version = f" {row['version']}" if row.get("version") else ""
+    default = " (default)" if row.get("default") else ""
+    langs = f"; languages: {', '.join(row['languages'])}" if row.get("languages") else ""
+    print(f"  {row['id']:18s} {row['name']}{version}{default}{langs}")
+    print(f"  {'':18s} licence: {row.get('license') or '(not stated)'}; commercial use "
+          f"{assets.commercial_label(row.get('commercial_use'))}")
+    for t in row.get("terms") or []:
+        print(f"  {'':18s} terms: {t}")
+    for c in row.get("credits") or []:
+        print(f"  {'':18s} credit: {c}")
+
+
+def cmd_engines(a):
+    from .ai.tools import engines_info
+
+    info = engines_info()
+    if a.json:
+        print(json.dumps(info, indent=2, ensure_ascii=False))
+        return
+    neural = info["neural"]
+    print("Singing engines")
+    for e in info["engines"]:
+        state = "available" if e["available"] else "not available"
+        print(f"  {e['name']:8s} {state:14s} {e['description']}")
+        if not e["available"]:
+            print(f"  {'':8s} reason: {e.get('reason')}")
+            print(f"  {'':8s} install with: {e.get('install_hint')}")
+    print("  choose with --engine auto | formant | neural | neural:<voicebank id>, 'engine:' in a score, "
+          "or SYNTH2_ENGINE")
+    env = "; ".join(f"{k}={v}" for k, v in info["environment"].items() if v)
+    if info["default_engine"]:
+        print(f"default (auto) on this machine: {info['default_engine']}" + (f"  [{env}]" if env else ""))
+    else:
+        print(f"default engine: unusable: {info.get('default_engine_problem')}")
+    print("quality (--quality, neural engine): " + "; ".join(
+        f"{q}{' (default)' if q == info['default_quality'] else ''}: {info['quality_notes'][q]}"
+        for q in info["qualities"]))
+    print(f"models directory: {neural.get('models_dir')}")
+    print(f"onnxruntime: {neural.get('onnxruntime') or 'not installed'}")
+    for title, key in (("voicebanks", "banks"), ("vocoders", "vocoders")):
+        rows = neural.get(key) or []
+        print(f"{title}:" + ("" if rows else " none installed"))
+        for row in rows:
+            _print_model(row)
+    if info["credits"]:
+        print("credits to show when you publish a render of the neural engine (default voicebank):")
+        for c in info["credits"]:
+            print(f"  - {c}")
+    if info["licence_notes"]:
+        print("licence notes:")
+        for n in info["licence_notes"]:
+            print(f"  - {n}")
 
 
 def cmd_styles(a):
@@ -137,12 +272,18 @@ def cmd_analyze(a):
 def cmd_studio(a):
     from .server.app import run
 
+    problem = _set_default_engine(a)
+    if problem:
+        return _error(problem)
     run(host=a.host, port=a.port, project_path=a.project, open_browser=a.open)
 
 
 def cmd_mcp(a):
     from .ai import mcp_server
 
+    problem = _set_default_engine(a)
+    if problem:
+        return _error(problem)
     return mcp_server.main((["--project", a.project] if a.project else []) + (["--autosave"] if a.autosave else []))
 
 
@@ -150,6 +291,9 @@ def cmd_director(a):
     from .ai.director import Director, DirectorUnavailable
     from .ai.tools import Session, ToolError
 
+    problem = _set_default_engine(a)
+    if problem:
+        return _error(problem)
     try:
         return _director_main(a, Director, Session)
     except (DirectorUnavailable, ToolError) as exc:
@@ -210,10 +354,29 @@ def _director_main(a, Director, Session) -> int:
 
 
 def cmd_demo(a):
-    from .demo import render_demos
+    from .ai.tools import ToolError, call_tool, summary_lines
+    from .demo import DEMOS, build_demo
 
-    for path in render_demos(Path(a.output)):
-        print(path)
+    problem = _engine_problem(a.engine)
+    if problem:
+        return _error(problem)
+    out_dir = Path(a.output)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    args = {k: v for k, v in (("engine", a.engine), ("quality", a.quality)) if v}
+    shown = None
+    for name in DEMOS:
+        session = build_demo(name)
+        try:
+            res = call_tool(session, "render", {"path": str(out_dir / f"{name}.wav"), **args})
+        except ToolError as exc:
+            return _error(str(exc))
+        call_tool(session, "save_project", {"path": str(out_dir / f"{name}.s2p.json")})
+        print(res.get("path") or out_dir / f"{name}.wav")
+        lines = summary_lines({k: res.get(k) for k in ("engines", "voicebanks", "credits", "licence_notes")})
+        if lines != shown:  # the demos share an engine: say it once
+            shown = lines
+            for line in lines:
+                print(line, file=sys.stderr)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -230,7 +393,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--track", action="append", help="render only these tracks (name/id/index)")
     r.add_argument("--stems", help="also write per-track stems into this directory")
     r.add_argument("--check", action="store_true", help="include a pitch-accuracy analysis in the report")
-    r.add_argument("-q", "--quiet", action="store_true")
+    _add_engine_options(r)
+    r.add_argument("-q", "--quiet", action="store_true",
+                   help="no progress and no summary on stderr (the JSON report is still printed)")
     r.set_defaults(func=cmd_render)
 
     n = sub.add_parser("new", help="create an empty project")
@@ -241,7 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--language", default="en")
     n.set_defaults(func=cmd_new)
 
-    i = sub.add_parser("info", help="print a project summary")
+    i = sub.add_parser("info", help="print a project summary (with the engine that sings each track here)")
     i.add_argument("input")
     i.set_defaults(func=cmd_info)
 
@@ -255,7 +420,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--format")
     c.set_defaults(func=cmd_convert)
 
-    sub.add_parser("voices", help="list voices").set_defaults(func=cmd_voices)
+    v = sub.add_parser("voices", help="list voices and what each becomes on the neural engine")
+    v.add_argument("--json", action="store_true", help="print JSON")
+    v.set_defaults(func=cmd_voices)
+    e = sub.add_parser("engines", help="singing engines: which can run here, installed voicebanks, credits")
+    e.add_argument("--json", action="store_true", help="print JSON")
+    e.set_defaults(func=cmd_engines)
     sub.add_parser("styles", help="list expression styles").set_defaults(func=cmd_styles)
 
     ph = sub.add_parser("phonemize", help="show how lyrics will be pronounced")
@@ -272,21 +442,25 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--port", type=int, default=8765)
     st.add_argument("--project")
     st.add_argument("--open", action="store_true", help="open a browser")
+    _add_engine_options(st, "the studio's renders (the default when the project and the page choose none)")
     st.set_defaults(func=cmd_studio)
 
     m = sub.add_parser("mcp", help="run the MCP server on stdio (for Claude and other AI clients)")
     m.add_argument("--project")
     m.add_argument("--autosave", action="store_true", help="save the project after every editing tool call")
+    _add_engine_options(m, "the server's renders (the default when a project or a tool call chooses none)")
     m.set_defaults(func=cmd_mcp)
 
     d = sub.add_parser("director", help="produce vocals from natural language (needs ANTHROPIC_API_KEY)")
     d.add_argument("message", nargs="?")
     d.add_argument("--project", help="project file to load and save")
     d.add_argument("--model")
+    _add_engine_options(d, "the director's renders (the default when the project chooses none)")
     d.set_defaults(func=cmd_director)
 
     dm = sub.add_parser("demo", help="render the built-in demo songs")
     dm.add_argument("-o", "--output", default="out/demo")
+    _add_engine_options(dm, "the demo renders")
     dm.set_defaults(func=cmd_demo)
 
     from .neural import cli as models_cli

@@ -23,6 +23,7 @@ import copy
 import difflib
 import json
 import math
+import os
 import re
 import threading
 from dataclasses import dataclass, fields
@@ -59,6 +60,7 @@ class Session:
         self.last_render = None  # synth2.engine.RenderResult | None
         self.last_render_path: str | None = None
         self.last_render_state: str | None = None  # fingerprint of the project that was rendered
+        self.last_render_options: tuple[str | None, str | None] = (None, None)  # engine override, quality
         self.last_render_range: tuple[float | None, float | None] = (None, None)  # beats
         # history entries: (label, project snapshot, path change). The path change is (old, new) for steps that
         # switched the project file (load_project, new_project) so undo/redo also switch it back; else None.
@@ -145,20 +147,27 @@ class _Tool:
     schema: dict
     handler: Callable[[Session, dict], dict]
     mutating: bool
+    detached: bool = False
 
 
 _REGISTRY: dict[str, _Tool] = {}
 TOOLS: list[dict] = []
 MUTATING_TOOLS: set[str] = set()
+# one render at a time in a process: renders are heavy, and they queue here instead of holding a session's lock
+RENDER_LOCK = threading.Lock()
+# what a detached tool leaves on the session it ran for
+_RENDER_STATE = ("last_render", "last_render_path", "last_render_state", "last_render_options", "last_render_range")
 
 
 def _tool(name: str, description: str, properties: dict | None = None, required: tuple = (),
-          mutating: bool = False):
+          mutating: bool = False, detached: bool = False):
+    """Register a tool. ``detached`` marks a long-running tool that only reads the project: it runs on a
+    snapshot without holding the session's lock, so edits (and a studio sharing the session) go on meanwhile."""
     def deco(fn):
         schema: dict = {"type": "object", "properties": properties or {}, "additionalProperties": False}
         if required:
             schema["required"] = list(required)
-        _REGISTRY[name] = _Tool(name, description.strip(), schema, fn, mutating)
+        _REGISTRY[name] = _Tool(name, description.strip(), schema, fn, mutating, detached)
         TOOLS.append({"name": name, "description": description.strip(), "input_schema": schema})
         if mutating:
             MUTATING_TOOLS.add(name)
@@ -186,6 +195,19 @@ def call_tool(session: Session, name: str, args: dict | None = None) -> dict:
     if not isinstance(args, dict):
         raise ToolError(f"arguments for {name} must be a JSON object, got {type(args).__name__}")
     args = _coerce(dict(args), tool.schema, name, top=True)
+    if tool.detached:
+        with session.lock:
+            shadow = Session(session.snapshot(), session.path)
+        try:
+            result = _jsonable(tool.handler(shadow, args))
+        except ToolError:
+            raise
+        except (ValueError, KeyError, LookupError) as exc:
+            raise ToolError(f"{name}: {_exc_text(exc)}") from exc
+        with session.lock:
+            for attr in _RENDER_STATE:
+                setattr(session, attr, getattr(shadow, attr))
+        return result
     with session.lock:
         if not tool.mutating:
             try:
@@ -527,13 +549,27 @@ def _style_overrides(t: Track) -> dict:
 def _track_info(p: Project, t: Track) -> dict:
     return {
         "index": p.tracks.index(t), "id": t.id, "name": t.name, "voice": t.voice, "style": t.style,
-        "language": t.language, "gain_db": t.gain_db, "pan": t.pan, "mute": t.mute, "solo": t.solo,
+        "language": t.language, "engine": t.engine or "auto", "role": t.role,
+        "gain_db": t.gain_db, "pan": t.pan, "mute": t.mute, "solo": t.solo,
         "reverb_send": t.reverb_send, "seed": t.seed,
         "voice_params": {k: v for k, v in t.voice_params.items() if not k.startswith("style.")},
         "style_overrides": _style_overrides(t), "notes": len(t.notes), "range": _range_text(t.notes),
         "start_beat": round(min((n.onset for n in t.notes), default=0.0), 6), "end_beat": round(t.end, 6),
         "curves": sorted(k for k, c in t.curves.items() if c.points),
     }
+
+
+def _summary(p: Project) -> dict:
+    """``Project.summary()`` plus the project's engine, every track's role and the engine that sings each
+    track on this machine (``sung_by``; None with ``engine_problem`` when the one it asks for cannot run)."""
+    out = p.summary()
+    out["engine"] = p.engine or "auto"
+    for row, t, eng in zip(out.get("tracks", []), p.tracks, resolved_engines(p)):
+        row["role"] = t.role
+        row["sung_by"] = eng["engine"]
+        if eng.get("problem"):
+            row["engine_problem"] = eng["problem"]
+    return out
 
 
 def _select(track: Track, args: dict, default_all: bool = True) -> list[Note]:
@@ -765,16 +801,316 @@ def _write_any(project: Project, path: Path, fmt: str):
     export_any(project, path)
 
 
-def _fingerprint(project: Project) -> str:
-    return json.dumps(project.to_dict(), sort_keys=True, default=str)
+def _fingerprint(project: Project, engine: str | None = None, quality: str | None = None) -> str:
+    """What a render of ``project`` depends on: the project, the engine every track resolves to on this
+    machine (with the ``engine`` override of the render) and the quality preset."""
+    from ..engine.backend import current_quality, engine_signature
+
+    return json.dumps({"project": project.to_dict(), "engines": engine_signature(project, engine),
+                       "quality": quality or current_quality()}, sort_keys=True, default=str)
+
+
+# ============================================================================ engines, roles, credits
+
+ENGINE_DOCS: dict[str, str] = {
+    "auto": "the neural engine when it is installed on this machine, the formant engine otherwise",
+    "formant": "the built-in parametric engine: always available, renders many times faster than real time, "
+               "sings every voice in English and Japanese, sounds clearly synthetic (classic vocaloid)",
+    "neural": "a DiffSinger voicebank with a neural vocoder on onnxruntime: a natural human singing voice, "
+              "renders at about real time, needs the optional models (synth2 models install); "
+              "'neural:<voicebank id>' picks one installed voicebank",
+}
+QUALITY_DOCS: dict[str, str] = {
+    "draft": "fastest: for checking notes, words and timing while writing",
+    "normal": "between the two",
+    "high": "slowest: for the final render",
+}
+ROLE_DOCS: dict[str, str] = {
+    "lead": "the main vocal: the lead's chain, in front of the mix",
+    "double": "a second take of a lead for thickness: write the same notes on a track of the same voice; it is "
+              "made from the lead's take, so the consonants stay together ('double:<track name>' doubles "
+              "that track, e.g. a harmony)",
+    "harmony": "a harmony part: no breaths of its own, darker and behind the lead",
+    "answer": "a response line between the lead's phrases: sung like a lead, set slightly back in a small room",
+    "adlib": "ad-libs (shouts, laughs, 'hey', 'oh', chant syllables): every hit is sung on its own with a flat "
+             "pitch instead of as a melodic line, band-limited and ducked under the lead (also spelt 'ad-lib')",
+    "crowd": "gang or crowd vocals: darker, in a room, ducked under the lead",
+}
+NEURAL_PARAM_DOCS: dict[str, str] = {
+    "neural.dial": "articulation of the consonants: 0 smooth, 1 balanced, 2 crisp (default 2)",
+    "neural.breaths": "breaths between lines: 0 none, 1 as designed (default; 0 for the roles double, harmony, "
+                      "answer), other values scale their level",
+    "neural.gender": "formant shift -1.2..1.2 (higher = brighter, smaller; default per voice)",
+    "neural.tone": "semitones the timbre is shifted while the pitch stays as written (default per voice)",
+    "neural.level_db": "fixed gain of the voice, dB (default per voice)",
+    "neural.breath_db": "dB added to the breathiness (default 0)",
+    "neural.voicing_db": "dB added to the voicing (default 0)",
+    "neural.tension": "offset on the predicted tension, for voicebanks that have one (default 0)",
+    "neural.velocity": "articulation speed of the consonants 0.5..2 (default 1)",
+    "neural.detune": "cents added to the sung pitch",
+    "neural.expr": "how much of the voicebank's learned pitch expression is used, 0.5..1 (0 = Synth2's own "
+                   "pitch curve; default by style)",
+    "neural.adlib": "1 = ad-lib mode (what the role adlib switches on): every hit a take of its own, flat pitch",
+    "neural.adlib.bend": "ad-lib mode: semitones the pitch falls (negative) or rises over the end of each hit",
+    "neural.adlib.vibrato": "ad-lib mode: 1 = the voice's vibrato on the hits",
+    "neural.fx.<preset>": "amount 0..1 of a character effect: double, robot, alien, crush, radio",
+    "neural.mode.<name>": "weight of a voice mode of the voicebank",
+}
+NEURAL_PARAM_PREFIX = "neural."
+# accepted ranges of the neural voice parameters the engine does not clamp itself (name without the prefix)
+NEURAL_PARAM_RANGES: dict[str, tuple[float, float]] = {
+    "dial": (0.0, 2.0), "breaths": (0.0, 4.0), "gender": (-1.2, 1.2), "tone": (-24.0, 24.0),
+    "level_db": (-48.0, 24.0), "breath_db": (-48.0, 24.0), "vowel_breath_db": (-48.0, 24.0),
+    "voicing_db": (-48.0, 24.0), "tension": (-10.0, 10.0), "velocity": (0.5, 2.0), "detune": (-100.0, 100.0),
+    "expr": (0.0, 1.0), "slow": (0.0, 2.0), "adlib": (0.0, 1.0),
+}
+# sung syllables per second above which the words of a neural render are not understood (measured with speech
+# recognisers on the default voicebank)
+FAST_LYRICS_PER_S = 3.5
+_DEFAULT_INSTALL_HINT = 'pip install "synth2[neural]" && synth2 models install'
+
+VOCAL_GUIDE = (
+    "Vocal tracks: one track = one singer doing one kind of thing. Keep the lead on its own track; put doubles, "
+    "harmonies, answer lines, ad-libs and crowd vocals each on a track of their own and give the track that "
+    "role (lead, double, harmony, answer, adlib, crowd), so the neural engine sings it and the mixer places it "
+    "the right way. Ad-libs (shouts, laughs, 'hey', 'oh yeah') never go on the lead's track: they go on their "
+    "own track with role 'adlib'. Do not mix sung lines, rap and shouts, or two voice settings, on one track. "
+    f"Words: lines faster than about {FAST_LYRICS_PER_S:g} syllables per second are not understood on the neural "
+    "engine; give fast passages fewer words or longer notes.")
+
+
+def check_engine(spec, what: str = "engine") -> str:
+    """The canonical spelling of an engine spec as projects store it (``""`` = auto).
+    Raises :class:`ToolError` for a spec that is not auto, formant, neural or neural:<voicebank id>."""
+    from ..engine.backend import normalize_engine
+
+    try:
+        return normalize_engine(spec)
+    except ValueError as exc:
+        raise ToolError(f"{what}: {exc}") from None
+
+
+def check_quality(quality) -> str | None:
+    """``draft`` / ``normal`` / ``high``, or None when unset. Raises :class:`ToolError` otherwise."""
+    from ..engine.backend import parse_quality
+
+    try:
+        return parse_quality(quality)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
+
+
+def check_role(role) -> str:
+    """The canonical spelling of a track role (``""`` = none, ``"adlib"``, ``"double:Lead"``).
+    Raises :class:`ToolError` for an unknown role."""
+    from ..engine.vocal_chain import ROLES, parse_role
+
+    text = str(role or "").strip()
+    if not text or text.lower() == "none":
+        return ""
+    name, source = parse_role(text)
+    if not name:
+        raise ToolError(f"unknown role {role!r}; roles: {', '.join(ROLES)} ('ad-lib' = adlib; "
+                        "'double:<track name>' doubles that track; '' = no role)")
+    if source and name != "double":
+        raise ToolError(f"role {role!r}: only a double names a track ('double:<track name>')")
+    return f"{name}:{source}" if source else name
+
+
+def _neural_status() -> dict:
+    """``synth2.neural.status()``, or a stand-in that says why when the package cannot be imported."""
+    try:
+        from .. import neural
+
+        return neural.status()
+    except Exception as exc:  # a broken optional package must not break the surfaces
+        return {"available": False, "reason": f"the neural engine failed to load ({exc})",
+                "install_hint": _DEFAULT_INSTALL_HINT, "onnxruntime": None, "models_dir": None,
+                "default_bank": None, "banks": [], "vocoders": [], "commercial_use": None, "credits": []}
+
+
+def licence_note(row: dict) -> str | None:
+    """One line about an installed model or sound set (its ``summary()``) whose licence limits what may be
+    done with a render; None when the publisher allows commercial use without further conditions."""
+    name = row.get("name") or row.get("id") or "?"
+    kind = f" ({row['kind']})" if row.get("kind") else ""
+    lic = row.get("license") or "no licence stated"
+    use = row.get("commercial_use")
+    if use is False:
+        return f"{name}{kind}: {lic} - commercial use is not allowed"
+    if use is None:
+        return f"{name}{kind}: {lic} - commercial use is not stated; read the licence before you publish"
+    if row.get("share_alike"):
+        said = str(row.get("commercial_use_statement") or "").strip()
+        return f"{name}{kind}: {lic} - share-alike" + (f' (the publisher says: "{said}")' if said else "")
+    return None
+
+
+def engines_info() -> dict:
+    """Which singing engines exist and can run on this machine, the quality presets and what the neural
+    engine has installed (voicebanks and vocoders with licence, terms and credits). Never raises."""
+    from ..engine import backend
+
+    status = _neural_status()
+    ok = bool(status.get("available"))
+    hint = status.get("install_hint") or ("" if ok else _DEFAULT_INSTALL_HINT)
+    engines = [
+        {"name": "formant", "available": True, "description": ENGINE_DOCS["formant"]},
+        {"name": "neural", "available": ok, "description": ENGINE_DOCS["neural"],
+         **({} if ok else {"reason": status.get("reason") or "not installed", "install_hint": hint}),
+         "voicebanks": [b.get("id") for b in status.get("banks") or []],
+         "default_voicebank": status.get("default_bank")},
+    ]
+    try:
+        name, bank = backend.resolve_engine()
+        default, problem = (f"{name}:{bank}" if bank else name), ""
+    except Exception as exc:  # SYNTH2_ENGINE names an engine that cannot run, or is misspelt
+        default, problem = None, str(exc)
+    try:
+        from ..neural.engine import QUALITY_STEPS
+
+        steps = dict(QUALITY_STEPS)
+    except Exception:
+        steps = {}
+    in_use = list(status.get("banks") or []) + list(status.get("vocoders") or [])
+    out = {
+        "engines": engines,
+        "choices": list(backend.ENGINE_CHOICES) + ["neural:<voicebank id>"],
+        "choice_notes": dict(ENGINE_DOCS),
+        "default_engine": default,
+        "qualities": list(backend.QUALITY_CHOICES),
+        "quality_notes": {q: QUALITY_DOCS.get(q, "") + (f" ({steps[q]} diffusion steps on the neural engine)"
+                                                         if q in steps else "")
+                          for q in backend.QUALITY_CHOICES},
+        "default_quality": backend.current_quality(),
+        "environment": {backend.ENGINE_ENV: os.environ.get(backend.ENGINE_ENV) or None,
+                        backend.QUALITY_ENV: os.environ.get(backend.QUALITY_ENV) or None},
+        "neural": status,
+        "install_hint": hint,
+        "credits": list(status.get("credits") or []),
+        "licence_notes": [n for n in map(licence_note, in_use) if n],
+    }
+    if problem:
+        out["default_engine_problem"] = problem
+    return out
+
+
+def resolved_engines(project: Project, override: str | None = None) -> list[dict]:
+    """Per track: the engine it asks for and the one that sings it on this machine (``engine`` is None and
+    ``problem`` says why when the engine it asks for cannot run here)."""
+    from ..engine.backend import resolve_engine
+
+    rows = []
+    for t in project.tracks:
+        row = {"track": t.name, "id": t.id, "asks_for": override or t.engine or project.engine or "auto"}
+        try:
+            name, bank = resolve_engine(project, t, override)
+            row["engine"] = f"{name}:{bank}" if bank else name
+        except Exception as exc:  # EngineUnavailable, or a misspelt spec in a hand-written file
+            row["engine"] = None
+            row["problem"] = str(exc)
+        rows.append(row)
+    return rows
+
+
+def voices_info() -> list[dict]:
+    """The singer voices (``synth2.voices.list_voices``), each with a ``neural`` entry: what the voice
+    becomes on the neural engine (voicebank, formant shift, timbre shift, level)."""
+    status = _neural_status()
+    try:
+        from ..neural.presets import preset_for
+    except Exception:
+        preset_for = None
+    out = []
+    for v in _list_voices():
+        v = dict(v)
+        if preset_for is not None:
+            pre = preset_for(v["id"])
+            bank = pre.bank or status.get("default_bank")
+            parts = [f"formant shift {pre.gender:+g}" if pre.gender else "formant shift 0"]
+            if pre.tone:
+                parts.append(f"tone {pre.tone:+g} (the model sings {abs(pre.tone):g} semitones "
+                             f"{'above' if pre.tone > 0 else 'below'} the pitch you hear)")
+            parts.append(f"level {pre.level_db:+g} dB" if pre.level_db else "level 0 dB")
+            v["neural"] = {"available": bool(status.get("available")), "voicebank": bank, "gender": pre.gender,
+                           "tone": pre.tone, "level_db": pre.level_db, "dial": pre.dial,
+                           "summary": (f"voicebank {bank}" if bank else "no voicebank installed") + ", "
+                                      + ", ".join(parts)}
+        out.append(v)
+    return out
+
+
+def render_notes(project: Project, report: dict) -> dict:
+    """What has to be seen next to a render: ``{"engines", "voicebanks", "credits", "licence_notes",
+    "warnings"}``.
+
+    ``credits`` are the lines to show when the audio is published: those of the neural models that sang
+    (from the report) and of the sampled sound sets the backing band played. ``licence_notes`` name every
+    model or sound set in use whose licence limits what may be done with the audio. ``warnings`` are the
+    report's plus one for every sampled sound that could not be loaded and was replaced by the synth.
+    """
+    credits = [str(c) for c in report.get("credits") or []]
+    warnings = [str(w) for w in report.get("warnings") or []]
+    banks = {t.get("bank") for t in report.get("tracks") or [] if t.get("bank")}
+    rows: list[dict] = []
+    if banks or credits:
+        try:
+            from ..neural import models
+
+            rows += [m.summary() for m in models.installed()
+                     if m.id in banks or any(c in credits for c in m.credits)]
+        except Exception:
+            pass
+    if report.get("backing"):  # the band was rendered: its sampled sounds have credits and fallbacks of their own
+        try:
+            from .. import arranger, sounds
+
+            sound = arranger.sound_report(project)
+            used = [c for c in sound.get("credits") or []]
+            credits += [c for c in used if c not in credits]
+            warnings += [w for w in sound.get("warnings") or [] if w not in warnings]
+            rows += [s.summary() for s in sounds.installed() if any(c in used for c in s.credits)]
+        except Exception:
+            pass
+    return {"engines": list(report.get("engines") or []), "voicebanks": sorted(banks), "credits": credits,
+            "licence_notes": [n for n in map(licence_note, rows) if n], "warnings": warnings}
+
+
+def slim_report(report: dict, phonemes: bool = False) -> dict:
+    """A copy of a render report without its bulk (unless ``phonemes``): the per-note phonemes and the
+    neural engine's per-phrase alignment and per-hit tables."""
+    out = copy.deepcopy(report)
+    for tr in out.get("tracks") or []:
+        if phonemes:
+            continue
+        tr.pop("phonemes", None)
+        if isinstance(tr.get("neural"), dict):
+            for k in ("alignment", "hits"):
+                tr["neural"].pop(k, None)
+    return out
+
+
+def summary_lines(notes: dict) -> list[str]:
+    """``render_notes`` as text lines (the command line prints them after a render)."""
+    banks = notes.get("voicebanks") or []
+    lines = ["engines: " + (", ".join(notes.get("engines") or []) or "none")
+             + (f" (voicebank {', '.join(banks)})" if banks else "")]
+    for title, key in (("credits (show these when you publish)", "credits"), ("licence notes", "licence_notes"),
+                       ("warnings", "warnings")):
+        items = notes.get(key) or []
+        if items:
+            lines.append(f"{title}:")
+            lines += [f"  - {x}" for x in items]
+    return lines
 
 
 # ============================================================================ tools: read
 
 @_tool("get_project", """
 Read the current project. Times are in beats (quarter notes, beat 0 = song start).
-detail='summary' (default): title, tempo map, key, time signature, length in beats and seconds, and one entry per
-track (index, id, name, voice, style, note count, pitch range, curves, lyrics preview).
+detail='summary' (default): title, tempo map, key, time signature, length in beats and seconds, the project's
+engine, and one entry per track (index, id, name, voice, style, role, the engine that sings it on this machine
+as `sung_by`, note count, pitch range, curves, lyrics preview).
 detail='full': everything, including every note (id, onset, duration, pitch + note name, lyric, phonemes, attrs) and
 curve points; optionally only one `track` and only notes with onset in [start_beat, end_beat).
 detail='score': the project (or one `track`) as score-notation text - the compact language write_melody accepts and
@@ -795,7 +1131,7 @@ def _get_project(s: Session, a: dict) -> dict:
             return {"track": t.name, "score": "\n".join(lines), "notes": len(notes)}
         tracks = [_track(s, a["track"])] if a.get("track") is not None else None
         return {"score": score_mod.project_to_score(p, tracks)}
-    out = p.summary()
+    out = _summary(p)
     out.update({
         "tempo": p.tempo.to_list(), "beats_per_bar": p.beats_per_bar(), "master": p.master.to_dict(),
         "sample_rate": p.sample_rate, "path": s.path, "last_render": s.last_render_path,
@@ -843,9 +1179,35 @@ def _get_notes(s: Session, a: dict) -> dict:
 @_tool("list_voices", """
 List the available singer voices: id, name, description, gender, comfortable range (note names) and the expression
 style each voice defaults to. Keep melodies inside a voice's range (a few semitones beyond is possible but strained).
+Each voice also has a `neural` entry: what it becomes on the neural engine (which voicebank sings it, the formant
+shift, timbre shift and level that turn the voicebank into this character). On the neural engine every voice is the
+installed voicebank with a different formant shift, so voices differ less than on the formant engine.
 """)
 def _list_voices_tool(s: Session, a: dict) -> dict:
-    return {"voices": _list_voices()}
+    return {"voices": voices_info()}
+
+
+@_tool("list_engines", """
+List the singing engines and what can run on this machine. Two engines exist: 'formant' (built in, always
+available, very fast, clearly synthetic) and 'neural' (a DiffSinger voicebank with a neural vocoder: a natural
+voice, renders at about real time, needs models installed with the command `synth2 models install`). Returns
+which are available (with the reason and the install command when the neural engine is not), `default_engine` (what
+'auto' means here), the quality presets (draft | normal | high: neural engine only), the installed voicebanks and
+vocoders with licence, terms and credits, and `licence_notes` for anything that limits use (e.g. a non-commercial
+vocoder). Choose the engine per project (new_project / update_project engine=...), per track (add_track /
+update_track engine=...) or for one render (render engine=...): 'auto' (default), 'formant', 'neural',
+'neural:<voicebank id>'. Use the neural engine for anything a listener should take for a singer, the formant
+engine for quick drafts, robotic or chiptune characters, or when the neural engine is not installed. Also
+returns `track_roles` and `guide`: how to lay vocals out on tracks.
+""")
+def _list_engines_tool(s: Session, a: dict) -> dict:
+    out = engines_info()
+    out["track_roles"] = dict(ROLE_DOCS)
+    out["guide"] = VOCAL_GUIDE
+    out["project"] = {"engine": s.project.engine or "auto",
+                      "tracks": [{k: r[k] for k in ("track", "asks_for", "engine", "problem") if k in r}
+                                 for r in resolved_engines(s.project)]}
+    return out
 
 
 @_tool("list_styles", """
@@ -898,8 +1260,9 @@ def _list_phonemes_tool(s: Session, a: dict) -> dict:
 @_tool("list_parameters", """
 The studio's parameter reference: automation curves (name, default, min, max, unit, meaning) for set_curve; note
 attributes for add_notes/edit_notes/apply_expression; voice parameters for update_track/apply_expression
-voice_params; style override parameters; lyric conventions and duration tokens. Read this once before detailed
-expression work.
+voice_params (`voice_params` for the formant engine, `neural_voice_params` - names starting with 'neural.' - for
+the neural engine); track roles; style override parameters; lyric conventions and duration tokens. Read this once
+before detailed expression work.
 """)
 def _list_parameters_tool(s: Session, a: dict) -> dict:
     curves = {k: {"default": v[0], "min": v[1], "max": v[2], "unit": v[3], "description": v[4]}
@@ -914,6 +1277,10 @@ def _list_parameters_tool(s: Session, a: dict) -> dict:
                     for k in VOICE_PARAM_FIELDS}
     return {
         "curves": curves, "note_attributes": attrs, "voice_params": voice_params,
+        "neural_voice_params": dict(NEURAL_PARAM_DOCS, note="voice_params whose names start with 'neural.' are "
+                                    "read by the neural engine only; any numeric neural.<name> is accepted "
+                                    "(the full list is in docs/NEURAL.md)"),
+        "track_roles": dict(ROLE_DOCS), "vocal_guide": VOCAL_GUIDE,
         "style_overrides": STYLE_FIELD_DOCS, "lyrics": LYRIC_CONVENTIONS,
         "durations": "beats as numbers (1 = quarter) or tokens: w=4 h=2 q=1 e=0.5 s=0.25 t=0.125; dot 'q.'=1.5; "
                      "triplet 'e3'=1/3; tie 'h+q'=3",
@@ -961,12 +1328,18 @@ def _phonemize_tool(s: Session, a: dict) -> dict:
 Start a new project (undoable), replacing the current one. Either give `score` (full score-notation text with
 title/tempo/key/track lines - see write_melody for the note syntax) or the basic settings: title, bpm, key
 ('C major', 'A minor', 'F# dorian'...), time_signature ('4/4'), voice and language for the first track 'Lead'.
+engine sets the singing engine of the whole project: 'auto' (default: the neural engine when it is installed,
+else the formant engine), 'formant', 'neural' or 'neural:<voicebank id>' (see list_engines; in a score it is the
+header line 'engine: neural'). In a score a track line takes engine=..., role=... and voice.neural.<name>=...
+too, e.g. 'track: Adlibs voice=aurora role=adlib'.
 """, {
     "title": {"type": "string"}, "bpm": {"type": "number", "minimum": 20, "maximum": 400},
     "key": {"type": "string", "description": "e.g. 'C major', 'A minor', 'Bb major', 'D dorian'."},
     "time_signature": {"type": "string", "description": "e.g. '4/4', '3/4', '6/8'."},
     "voice": {"type": "string", "description": "Voice id for the first track (see list_voices)."},
     "language": {"type": "string", "enum": list(LANGUAGES)},
+    "engine": {"type": "string", "description": "Singing engine of the project: auto | formant | neural | "
+               "neural:<voicebank id>. With a score it replaces the score's own engine line."},
     "score": {"type": "string", "description": "Complete score-notation text; overrides the other settings."},
 }, mutating=True)
 def _new_project(s: Session, a: dict) -> dict:
@@ -985,11 +1358,14 @@ def _new_project(s: Session, a: dict) -> dict:
             p.key = _check_key(a["key"])
         if a.get("time_signature"):
             p.time_signature = _parse_ts(a["time_signature"])
+    if "engine" in a:
+        p.engine = check_engine(a["engine"])
     s.project = p
     s.path = None
     s.last_render = None
     s.last_render_path = None
-    out = p.summary()
+    out = _summary(p)
+    warnings = warnings + _engine_warnings(p)
     if warnings:
         out["warnings"] = warnings
     return out
@@ -997,7 +1373,8 @@ def _new_project(s: Session, a: dict) -> dict:
 
 @_tool("update_project", """
 Change project settings: title, key (used by add_harmony and diatonic transpose; e.g. 'A minor', 'Eb major'),
-time_signature ('3/4'), sample_rate (Hz) and master settings {gain_db, reverb_room 0..1 (room size), reverb_wet
+time_signature ('3/4'), sample_rate (Hz), engine (the singing engine of every track that does not set its own:
+'auto' | 'formant' | 'neural' | 'neural:<voicebank id>', see list_engines) and master settings {gain_db, reverb_room 0..1 (room size), reverb_wet
 0..2 (scales all reverb sends), normalize (peak-normalise to -1 dBFS), limiter}. Tempo is set with set_tempo.
 Mixing / mastering (songs with a backing band, see docs/PLAN.md): loudness_target (integrated LUFS, null = auto
 -11), ceiling_db (true-peak ceiling), glue (master glue 0..1), master_eq (EQ band list, null = preset),
@@ -1013,6 +1390,7 @@ key, mix_overrides=null clears them all).
     "key": {"type": "string"},
     "time_signature": {"type": "string"},
     "sample_rate": {"type": "integer", "minimum": 8000, "maximum": 192000},
+    "engine": {"type": "string", "description": "auto | formant | neural | neural:<voicebank id>."},
     "master": {"type": "object", "additionalProperties": False, "properties": {
         "gain_db": {"type": "number", "minimum": -48, "maximum": 24},
         "reverb_room": {"type": "number", "minimum": 0, "maximum": 1},
@@ -1049,6 +1427,8 @@ def _update_project(s: Session, a: dict) -> dict:
         p.time_signature = _parse_ts(a["time_signature"])
     if "sample_rate" in a:
         p.sample_rate = int(a["sample_rate"])
+    if "engine" in a:
+        p.engine = check_engine(a["engine"])
     for k, v in (a.get("master") or {}).items():
         if k == "mix_overrides" and v is not None:  # merged per key; a null entry removes it
             mo = dict(p.master.mix_overrides or {})
@@ -1067,9 +1447,13 @@ def _update_project(s: Session, a: dict) -> dict:
         scale = composer.scale_degrees(p.key)
     except ValueError:
         scale = None
-    return {"title": p.title, "key": p.key, "scale": scale,
-            "time_signature": f"{p.time_signature[0]}/{p.time_signature[1]}", "sample_rate": p.sample_rate,
-            "master": p.master.to_dict()}
+    out = {"title": p.title, "key": p.key, "scale": scale,
+           "time_signature": f"{p.time_signature[0]}/{p.time_signature[1]}", "sample_rate": p.sample_rate,
+           "engine": p.engine or "auto", "master": p.master.to_dict()}
+    warnings = _engine_warnings(p) if "engine" in a else []
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 @_tool("set_tempo", """
@@ -1114,17 +1498,51 @@ _TRACK_SETTINGS = {
     "pan": {"type": "number", "minimum": -1, "maximum": 1, "description": "-1 = left, 0 = centre, 1 = right."},
     "reverb_send": {"type": "number", "minimum": 0, "maximum": 1, "description": "Reverb send 0..1 (default 0.25)."},
     "mute": {"type": "boolean"}, "solo": {"type": "boolean"},
+    "engine": {"type": "string", "description": "Singing engine of this track: 'auto' (default: the project's "
+               "engine), 'formant', 'neural' or 'neural:<voicebank id>' (see list_engines)."},
+    "role": {"type": "string", "description": "The track's role in the mix: lead, double, harmony, answer, adlib "
+             "(ad-libs: shouts, laughs, 'hey'), crowd, or '' for none; 'double:<track name>' doubles that track. "
+             "One role per track: an ad-lib goes on its own track with role adlib, never on the lead's track."},
     "voice_params": {"type": "object", "description": "Voice tweaks merged into the track, e.g. {\"breathiness\": 0.3, "
-                     "\"tension\": -0.2}; null removes a key. See list_parameters for names and valid ranges."},
+                     "\"tension\": -0.2}; null removes a key. Names starting with 'neural.' tune the neural "
+                     "engine, e.g. {\"neural.dial\": 1, \"neural.breaths\": 0, \"neural.gender\": 0.2, "
+                     "\"neural.fx.robot\": 0.5}. See list_parameters for names and valid ranges."},
 }
+
+
+def _neural_param_error(k: str, v) -> str | None:
+    """Why ``v`` is not a valid value for the neural voice parameter ``k`` (None when it is)."""
+    name = k[len(NEURAL_PARAM_PREFIX):]
+    if not re.fullmatch(r"[A-Za-z0-9_]+(\.[^\s.=]+)*", name):
+        return (f"voice parameter {k!r} is not a neural parameter name; examples: "
+                + ", ".join(list(NEURAL_PARAM_DOCS)[:6]) + " (see list_parameters)")
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return f"voice parameter {k!r} must be a number, got {v!r}"
+    lo, hi = NEURAL_PARAM_RANGES.get(name, (-math.inf, math.inf))
+    if name.startswith("fx."):
+        lo, hi = 0.0, 1.0
+    if not lo <= v <= hi:
+        return f"voice parameter {k!r}={v:g} is out of range {lo:g}..{hi:g}" + (
+            f" ({NEURAL_PARAM_DOCS[k]})" if k in NEURAL_PARAM_DOCS else "")
+    return None
 
 
 def _apply_voice_params(t: Track, vp: dict):
     for k, v in vp.items():
+        if isinstance(k, str) and k.startswith(NEURAL_PARAM_PREFIX):
+            if v is None:
+                t.voice_params.pop(k, None)
+                continue
+            err = _neural_param_error(k, v)
+            if err:
+                raise ToolError(err)
+            t.voice_params[k] = float(v)
+            continue
         if k not in VOICE_PARAM_FIELDS:
             close = difflib.get_close_matches(k, VOICE_PARAM_FIELDS, n=1)
             raise ToolError(f"unknown voice parameter {k!r}" + (f" (did you mean {close[0]!r}?)" if close else "")
-                            + f"; valid: {', '.join(VOICE_PARAM_FIELDS)}")
+                            + f"; valid: {', '.join(VOICE_PARAM_FIELDS)}, and neural.<name> for the neural "
+                              f"engine (see list_parameters)")
         if v is None:
             t.voice_params.pop(k, None)
             continue
@@ -1170,14 +1588,52 @@ def _apply_track_settings(t: Track, a: dict):
             setattr(t, k, bool(a[k]))
     if "seed" in a:
         t.seed = int(a["seed"])
+    if "engine" in a:
+        t.engine = check_engine(a["engine"])
+    if "role" in a:
+        t.role = check_role(a["role"])
     if a.get("voice_params"):
         _apply_voice_params(t, a["voice_params"])
 
 
+def _engine_warnings(p: Project, tracks=None) -> list[str]:
+    """One line per track (default: every track) whose engine cannot run on this machine."""
+    ids = None if tracks is None else {t.id for t in tracks}
+    return [f"track {r['track']!r}: {r['problem']}" for r in resolved_engines(p)
+            if r.get("problem") and (ids is None or r["id"] in ids)]
+
+
+def _role_warnings(p: Project, t: Track) -> list[str]:
+    """What will not work as the track's role asks (a double with nothing to double)."""
+    from ..engine.vocal_chain import parse_role
+
+    role, source = parse_role(t.role)
+    if role != "double":
+        return []
+    if source:
+        try:
+            found = p.track(source) is not t
+        except LookupError:
+            found = False
+        return [] if found else [f"role 'double:{source}': there is no other track named {source!r} to double; "
+                                 f"{_tracks_text(p)}"]
+    leads = [x for x in p.tracks if x is not t and parse_role(x.role)[0] == "lead" and x.voice == t.voice]
+    if leads:
+        return []
+    return [f"role 'double': no track with role 'lead' and voice {t.voice!r} to double, so this track sings its "
+            f"own take; give the lead role=lead, or name the track: role='double:<track name>'"]
+
+
 @_tool("add_track", """
 Add a new empty vocal track (one monophonic singer). Defaults: voice 'aurora', the voice's own style, language
-'en', gain 0 dB, centre pan, reverb send 0.25. Returns the track's index and id; then fill it with write_melody or
-add_notes. For a harmony part derived from an existing melody use add_harmony instead.
+'en', gain 0 dB, centre pan, reverb send 0.25, the project's engine, no role. Returns the track's index and id;
+then fill it with write_melody or add_notes. For a harmony part derived from an existing melody use add_harmony
+instead; for a double of a lead use duplicate_track(role='double').
+""" + VOCAL_GUIDE + """
+engine: this track's singing engine when it should differ from the project's ('formant', 'neural',
+'neural:<voicebank id>'; see list_engines). voice_params with names starting 'neural.' tune the neural engine
+(list_parameters): neural.dial 0 smooth | 1 balanced | 2 crisp (consonant articulation, default crisp),
+neural.breaths 0 = no breaths between lines.
 """, dict(_TRACK_SETTINGS), mutating=True)
 def _add_track(s: Session, a: dict) -> dict:
     p = s.project
@@ -1186,17 +1642,29 @@ def _add_track(s: Session, a: dict) -> dict:
     t = p.add_track(name, voice=voice, language=_check_language(a.get("language", "en")))
     t.style = VOICES[voice].default_style
     _apply_track_settings(t, {k: v for k, v in a.items() if k not in ("voice", "language", "name")})
-    return {"track": _track_info(p, t)}
+    out = {"track": _track_info(p, t)}
+    warnings = _engine_warnings(p, [t]) + _role_warnings(p, t)
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 @_tool("update_track", """
 Change a track's settings (only the given fields): name, voice, style, language, gain_db, pan, reverb_send, mute,
-solo, seed (random seed for the humanising variations), voice_params (merged; null removes a key).
+solo, seed (random seed for the humanising variations; on the neural engine another seed is another take),
+engine ('auto' = the project's, 'formant', 'neural', 'neural:<voicebank id>'), role (lead, double, harmony,
+answer, adlib, crowd, '' = none: how the neural engine sings the track and where the mixer puts it; see
+add_track), voice_params (merged; null removes a key; 'neural.<name>' keys tune the neural engine).
 """, {"track": _TRACK_REF, **_TRACK_SETTINGS, "seed": {"type": "integer"}}, required=("track",), mutating=True)
 def _update_track(s: Session, a: dict) -> dict:
     t = _track(s, a["track"])
     _apply_track_settings(t, a)
-    return {"track": _track_info(s.project, t)}
+    out = {"track": _track_info(s.project, t)}
+    warnings = (_engine_warnings(s.project, [t]) if "engine" in a else []) + (
+        _role_warnings(s.project, t) if "role" in a else [])
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 @_tool("remove_track", "Delete a track and all its notes and curves (undoable).",
@@ -1211,8 +1679,14 @@ def _remove_track(s: Session, a: dict) -> dict:
 @_tool("duplicate_track", """
 Copy a track (notes, lyrics, curves, settings) into a new track - e.g. for a double-tracked lead or a unison/octave
 part. Options: name, voice, transpose (semitones, e.g. -12 for an octave below), detune_cents (adds a small static
-detune to every note for a natural doubling, e.g. 6), delay_beats (tiny timing offset, e.g. 0.02), gain_db, pan.
+detune to every note for a natural doubling, e.g. 6), delay_beats (tiny timing offset, e.g. 0.02), gain_db, pan,
+role. For a double of the lead pass role='double' (or 'double:<track name>') and leave detune_cents and
+delay_beats out: the neural engine then makes the double from the lead's own take, late and detuned by the
+mixer, so the consonants of the two do not blur (give the source track role='lead'). The copy keeps the source's
+engine and gets no role unless you pass one.
 """, {"track": _TRACK_REF, "name": {"type": "string"}, "voice": {"type": "string"},
+      "role": {"type": "string", "description": "Role of the copy: double, 'double:<track name>', harmony, "
+               "answer, adlib, crowd, lead or '' (default)."},
       "transpose": {"type": "integer", "minimum": -48, "maximum": 48},
       "detune_cents": {"type": "number", "minimum": -100, "maximum": 100},
       "delay_beats": {"type": "number", "minimum": -1, "maximum": 1},
@@ -1227,6 +1701,7 @@ def _duplicate_track(s: Session, a: dict) -> dict:
     t.name = a.get("name") or f"{src.name} (copy)"
     t.seed = len(p.tracks) * 7919 + 17
     t.solo = False
+    t.role = check_role(a.get("role"))
     if a.get("voice"):
         t.voice = _check_voice(a["voice"])
     delay = float(a.get("delay_beats", 0.0))
@@ -1248,7 +1723,7 @@ def _duplicate_track(s: Session, a: dict) -> dict:
         if k in a:
             setattr(t, k, float(a[k]))
     p.tracks.append(t)
-    return {"track": _track_info(p, t), "warnings": _voice_range_warnings(t, t.notes)}
+    return {"track": _track_info(p, t), "warnings": _voice_range_warnings(t, t.notes) + _role_warnings(p, t)}
 
 
 # ============================================================================ tools: notes
@@ -1732,8 +2207,11 @@ keeps the exact chromatic interval, 'snap' forces scale tones). Lyrics are copie
 words. By default the new track uses the source's voice and style (choose `voice` for contrast, e.g. atlas or
 ember below a female lead), sits 4 dB lower and slightly panned, and phrases are octave-shifted into the voice's
 range (fit_range=false to disable, or give range_low/range_high). start_beat/end_beat harmonize only part of the
-song. into_track writes into an existing track instead (its notes in that span are replaced).
+song. into_track writes into an existing track instead (its notes in that span are replaced). A new harmony track
+gets the role 'harmony' (sung without breaths of its own, mixed darker and behind the lead on the neural engine)
+and the source's engine; pass role to choose another ('' = none).
 """, {"source_track": _TRACK_REF, "steps": {"type": "integer", "minimum": -14, "maximum": 14},
+      "role": {"type": "string", "description": "Role of the new track (default 'harmony')."},
       "key": {"type": "string"}, "name": {"type": "string"}, "voice": {"type": "string"}, "style": {"type": "string"},
       "chromatic": {"type": "string", "enum": ["smart", "parallel", "snap"]},
       "fit_range": {"type": "boolean"}, "range_low": _PITCH, "range_high": _PITCH,
@@ -1794,8 +2272,12 @@ def _add_harmony(s: Session, a: dict) -> dict:
         t.gain_db = src.gain_db - 4.0
         t.pan = max(-1.0, min(1.0, src.pan + (0.25 if steps > 0 else -0.25)))
         t.reverb_send = src.reverb_send
+        t.engine = src.engine
+        t.role = check_role(a.get("role", "harmony"))
     if a.get("style"):
         t.style = _check_style(a["style"])
+    if target is not None and "role" in a:
+        t.role = check_role(a["role"])
     for k in ("gain_db", "pan"):
         if k in a:
             setattr(t, k, float(a[k]))
@@ -1954,7 +2436,15 @@ def _get_backing(s: Session, a: dict) -> dict:
 
 @_tool("list_sounds", """
 List the sampled sound sets installed on this machine and what each can play, to choose instruments for the
-backing band's "sound" (see set_backing). Without arguments: every set with its kind (soundfont, sfz, drumkit,
+backing band's "sound" (see set_backing). How to pick: sampled instruments sound like real ones, the built-in
+synth presets like synthesisers, so use samples for acoustic and electric instruments (piano, bass, guitar,
+strings, brass, drum kits) and keep the synth for synth sounds. A set with the tag gm has every General MIDI
+instrument and a drum kit and is the safe default for a whole band; a set made for one instrument (a piano, a
+bass, a drum kit) usually sounds better than the gm set's preset for it. Name the preset when the default is
+not what you want. Sets are installed by the user with the command `synth2 sounds install <id>`; a sound that
+is not installed is never an error: the synth preset plays and the render result carries a warning. Every set
+in use adds its line to the render's `credits`.
+Without arguments: every set with its kind (soundfont, sfz, drumkit,
 samples), tags (gm = a complete General MIDI set), licence and credits, the number of presets and the names of its
 drum kits. set='<id>': that set's presets as {preset: 'bank:program' or file name, name}, filtered by `search`
 (part of a name, e.g. 'bass', 'string'). program=<0..127> or a General MIDI name ('slap bass', 'flute') with a
@@ -2013,8 +2503,11 @@ def _clear_backing(s: Session, a: dict) -> dict:
 Lint the project for problems a singer/producer would catch before rendering: overlapping notes, notes outside the
 voice's range, notes too short to sing, the first note too close to beat 0 (its consonants get cut), multi-syllable
 words squeezed onto one note, orphan '+'/'-' lyrics, long phrases with no rest to breathe, words missing from the
-pronunciation dictionary, out-of-key notes, unknown voices/styles. Returns issues with severity
-(error/warning/info) and note ids. Run it after writing and before render.
+pronunciation dictionary, out-of-key notes, unknown voices/styles; a track whose engine cannot run on this machine
+(error: render would fail), lines sung faster than the neural engine can pronounce clearly, roles that do not
+work (a double with nothing to double) and sampled sounds of the backing band that are not installed (the synth
+plays instead). Returns issues with severity (error/warning/info) and note ids, and `engines`: which engine sings
+each track here. Run it after writing and before render.
 """, {"track": _TRACK_REF})
 def _check_project(s: Session, a: dict) -> dict:
     p = s.project
@@ -2039,8 +2532,28 @@ def _check_project(s: Session, a: dict) -> dict:
     b2s = p.tempo.beat_to_sec
     if p.tracks and all(t.mute for t in p.tracks):
         add("warning", "every track is muted; nothing will be heard")
+    sung_by = {r["id"]: r for r in resolved_engines(p)}
+    if p.backing:
+        try:
+            from .. import arranger
+
+            for w in arranger.sound_report(p)["warnings"]:
+                add("warning", f"backing band: {w}")
+        except Exception as exc:  # an invalid arrangement is reported by get_backing
+            add("warning", f"backing band: {_exc_text(exc)}")
     for t in tracks:
         notes = sorted(t.notes, key=lambda n: n.onset)
+        eng = sung_by.get(t.id, {})
+        if eng.get("problem"):
+            add("error", f"{eng['problem']} Until then render fails: set engine='formant' or 'auto' on the track "
+                         f"(update_track) or the project (update_project).", t)
+        if t.role:
+            from ..engine.vocal_chain import ROLES, parse_role
+
+            if not parse_role(t.role)[0]:
+                add("warning", f"unknown role {t.role!r} is ignored; roles: {', '.join(ROLES)}", t)
+            for w in _role_warnings(p, t):
+                add("warning", w, t)
         if t.voice not in VOICES:
             add("error", f"unknown voice {t.voice!r}; valid: {', '.join(VOICES)}", t)
         if t.style not in STYLES:
@@ -2120,6 +2633,13 @@ def _check_project(s: Session, a: dict) -> dict:
                 add("info", "pronunciation guessed for words not in the dictionary: " + ", ".join(unknown[:20])
                     + " - check with phonemize; split words across notes with '+' (not fragments), or set phonemes",
                     t)
+        fast = _fast_passages(t, notes, b2s)
+        if fast and (eng.get("engine") or "").startswith("neural"):
+            rate, first = max(r for r, _ in fast), min((n for _, n in fast), key=lambda n: n.onset)
+            add("warning", f"{len(fast)} passage(s) are sung faster than {FAST_LYRICS_PER_S:g} syllables per second "
+                           f"(up to {rate:.1f}/s; the first starts at beat {first.onset:g}): the neural engine will "
+                           f"not pronounce them clearly. Use fewer words, longer notes or a slower tempo there",
+                t, [x[1].id for x in fast])
         if key is not None:
             out_key = [n for n in notes if n.pitch % 12 not in key.scale]
             if out_key and len(out_key) > 0.25 * len(notes):
@@ -2127,7 +2647,52 @@ def _check_project(s: Session, a: dict) -> dict:
                             f"right? (add_harmony uses it)", t, [n.id for n in out_key])
     n_err = sum(i["severity"] == "error" for i in issues)
     return {"ok": n_err == 0, "errors": n_err, "warnings": sum(i["severity"] == "warning" for i in issues),
+            "engines": [{"track": r["track"], "engine": r["engine"]} for r in sung_by.values()
+                        if any(t.id == r["id"] for t in tracks)],
             "issues": issues[:100]}
+
+
+FAST_WINDOW = 6  # syllables a passage must have to be judged
+
+
+def _syllables(track: Track, notes: list[Note]) -> list[tuple[Note, int]]:
+    """``(note, syllables sung on it)`` for every note that starts a syllable (no melismas, no breaths)."""
+    out = []
+    for i, n in enumerate(notes):
+        lyr = (n.lyric or "").strip()
+        if lyr in ("", "-", "~") or lyr.lower() in ("br", "breath"):
+            continue
+        k = 1
+        nxt = (notes[i + 1].lyric or "").strip() if i + 1 < len(notes) else ""
+        if (track.language == "en" and n.attrs.get("language", "en") == "en" and not n.phonemes
+                and re.fullmatch(r"[A-Za-z']+", lyr) and nxt != "+"):
+            k = max(1, english.count_syllables(lyr))  # a whole word squeezed onto one note
+        out.append((n, k))
+    return out
+
+
+def _fast_passages(track: Track, notes: list[Note], b2s) -> list[tuple[float, Note]]:
+    """Passages of at least ``FAST_WINDOW`` syllables sung faster than ``FAST_LYRICS_PER_S`` a second:
+    ``(syllables per second, first note)`` per passage, passages not overlapping."""
+    syl = _syllables(track, notes)
+    out: list[tuple[float, Note]] = []
+    i = 0
+    while i < len(syl):
+        j, count = i, 0
+        while j < len(syl) and count < FAST_WINDOW:
+            if j > i and syl[j][0].onset - syl[j - 1][0].end >= 0.5:  # a rest ends the passage
+                break
+            count += syl[j][1]
+            j += 1
+        if count >= FAST_WINDOW:
+            seconds = b2s(syl[j - 1][0].end) - b2s(syl[i][0].onset)
+            rate = count / seconds if seconds > 0 else math.inf
+            if rate > FAST_LYRICS_PER_S:
+                out.append((rate, syl[i][0]))
+                i = j
+                continue
+        i += 1
+    return out
 
 
 # ============================================================================ tools: render
@@ -2139,19 +2704,36 @@ def _default_render_path(s: Session) -> Path:
     return Path("out") / f"{_safe_name(s.project.title)}.wav"
 
 
+_ENGINE_ARG = {"type": "string", "description": "Singing engine for this render only, overriding the project's and "
+               "the tracks' own: 'auto', 'formant', 'neural' or 'neural:<voicebank id>' (see list_engines)."}
+_QUALITY_ARG = {"type": "string", "enum": ["draft", "normal", "high"],
+                "description": "Render quality of the neural engine: draft (fast, for checking), normal "
+                               "(default), high (final render). The formant engine ignores it."}
+
+
 @_tool("render", """
-Synthesize the vocals to a WAV file and return the render report (duration, peak/RMS dB, render speed, per-track
+Synthesize the song to a WAV file and return the render report (duration, peak/RMS dB, render speed, per-track
 warnings such as range problems or guessed pronunciations). Optional: path (default: next to the project file, or
 ./out/<title>.wav), start_beat/end_beat to render only a section (fast previews), tracks (list of track
 indexes/ids/names; default all unmuted tracks, respecting solo), stems=true to also write one WAV per track,
-bits 16/24/32, sample_rate. Afterwards call analyze_render to check pitch accuracy and levels.
+bits 16/24/32, sample_rate.
+engine picks the singing engine for this render only ('formant' is quick for checking notes; 'neural' is the
+natural voice and takes about as long as the song; default: each track's engine, else the project's, else the best
+installed one). quality: draft | normal | high (neural engine only; use draft while writing, high for the final).
+The result names the `engines` that sang, the `credits` that must be shown when the audio is published (voicebank,
+vocoder, sampled sound sets), `licence_notes` where a licence limits use (e.g. non-commercial) and `warnings`
+(e.g. a sampled sound that is not installed and fell back to the synth). Pass credits and licence notes on to the
+user with the file. Afterwards call analyze_render to check pitch accuracy and levels.
 """, {"path": {"type": "string"}, "start_beat": {"type": "number", "minimum": 0}, "end_beat": {"type": "number"},
       "tracks": {"type": "array", "items": {"type": ["integer", "string"]}},
       "stems": {"type": "boolean"}, "bits": {"type": "integer", "enum": [16, 24, 32]},
       "sample_rate": {"type": "integer", "enum": [16000, 22050, 24000, 32000, 44100, 48000, 96000]},
-      "include_phonemes": {"type": "boolean", "description": "Include the per-note phonemes the engine sang."}})
+      "engine": _ENGINE_ARG, "quality": _QUALITY_ARG,
+      "include_phonemes": {"type": "boolean", "description": "Include the per-note phonemes the engine sang."}},
+    detached=True)
 def _render(s: Session, a: dict) -> dict:
     from ..engine import render_project
+    from ..engine.backend import EngineUnavailable, current_quality
 
     p = s.project
     if not any(t.notes for t in p.tracks):
@@ -2167,8 +2749,14 @@ def _render(s: Session, a: dict) -> dict:
             if err:
                 raise ToolError(f"track {t.name!r}: {err}; fix it with update_track(voice_params={{{k!r}: ...}}) "
                                 f"or remove it with null")
+    engine = check_engine(a.get("engine")) or None
+    quality = check_quality(a.get("quality"))
     try:
-        res = render_project(p, sample_rate=a.get("sample_rate"), track_ids=track_ids, start_beat=sb, end_beat=eb)
+        with RENDER_LOCK:
+            res = render_project(p, sample_rate=a.get("sample_rate"), track_ids=track_ids, start_beat=sb,
+                                 end_beat=eb, engine=engine, quality=quality)
+    except EngineUnavailable as exc:
+        raise ToolError(f"{exc}. list_engines shows what is installed.") from None
     except (OverflowError, FloatingPointError, ZeroDivisionError) as exc:
         raise ToolError(f"render failed with a numeric error ({exc}); check extreme voice_params, "
                         f"style_overrides or curve values") from None
@@ -2184,14 +2772,15 @@ def _render(s: Session, a: dict) -> dict:
     saved = res.save(path, bits=bits)
     s.last_render = res
     s.last_render_path = str(saved)
-    s.last_render_state = _fingerprint(p)
+    s.last_render_state = _fingerprint(p, engine, quality)
+    s.last_render_options = (engine, quality)
     s.last_render_range = (sb, eb)
-    report = copy.deepcopy(res.report)
-    for tr in report.get("tracks", []):
-        ph = tr.pop("phonemes", None)
-        if a.get("include_phonemes") and ph is not None:
-            tr["phonemes"] = ph
-    out = {"path": str(saved), "report": report}
+    report = slim_report(res.report, phonemes=bool(a.get("include_phonemes")))
+    notes = render_notes(p, report)
+    report["warnings"] = notes["warnings"]
+    out = {"path": str(saved), "engines": notes["engines"], "voicebanks": notes["voicebanks"],
+           "quality": quality or current_quality(), "credits": notes["credits"],
+           "licence_notes": notes["licence_notes"], "report": report}
     if a.get("stems"):
         out["stems"] = [str(x) for x in res.save_stems(path.with_name(path.stem + "_stems"), bits=bits)]
     return out
@@ -2244,8 +2833,9 @@ def _analyze_render(s: Session, a: dict) -> dict:
                               f"check the lyric and note length")
     for w in (res.report or {}).get("warnings", [])[:10]:
         issues.append(f"render warning: {w}")
-    if s.last_render_state is not None and s.last_render_state != _fingerprint(s.project):
-        issues.append("the project changed since this render; render again to analyse the current version")
+    if s.last_render_state is not None and s.last_render_state != _fingerprint(s.project, *s.last_render_options):
+        issues.append("the project (or the engine that sings it) changed since this render; render again to "
+                      "analyse the current version")
     out["issues"] = issues
     out["ok"] = not issues
     return out
