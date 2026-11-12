@@ -7,6 +7,7 @@ keeps a file open between reads.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import struct
@@ -63,7 +64,12 @@ def from_array(data: np.ndarray, rate: int, name: str = "array", loop: tuple[int
             out[:m] = arr[a:a + m]
         return out
 
-    return Sample(key=key or f"mem:{name}:{id(arr)}", rate=int(rate), frames=n, channels=arr.shape[1], read=read,
+    if key is None:
+        # the key names the content: an object id can be reused once the array is freed, and the
+        # prepared-sample cache would then serve another sample's data
+        digest = hashlib.blake2b(arr.tobytes(), digest_size=8).hexdigest()
+        key = f"mem:{name}:{int(rate)}:{arr.shape[0]}x{arr.shape[1]}:{digest}"
+    return Sample(key=key, rate=int(rate), frames=n, channels=arr.shape[1], read=read,
                   name=name, loop=loop, root=root)
 
 

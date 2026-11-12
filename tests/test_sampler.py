@@ -1204,3 +1204,11 @@ def test_any_window_of_a_sampled_part_is_the_same_audio(font):
     for name in full:  # a kit's EQ runs over the rendered buffer: the same but for its last milliseconds
         m = n - int(0.05 * SR)
         assert np.allclose(part[name][:m], full[name][a:a + m], atol=2e-5), name
+
+
+def test_in_memory_sample_keys_follow_the_content_not_the_object():
+    a = samples.from_array(sine(PERIOD * 40), SR)
+    b = samples.from_array(sine(PERIOD * 40), SR)
+    c = samples.from_array(0.5 * sine(PERIOD * 40), SR)
+    assert a.key == b.key
+    assert a.key != c.key
