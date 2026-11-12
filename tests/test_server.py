@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import surface_fakes as fakes
 from synth2.project import CURVE_SPECS, NOTE_ATTRIBUTES, Project
 from synth2.server.app import StudioState, make_server
 
@@ -705,3 +706,256 @@ def test_undo_of_new_project_or_import_restores_the_save_path():
     assert s.path == "song.s2p.json"
     s.redo()
     assert s.path is None
+
+
+# --------------------------------------------------------------------------- engines, quality, credits, sounds
+@pytest.fixture
+def auto_engine(monkeypatch):
+    """No engine or quality pinned by the environment (the suite pins the formant engine)."""
+    monkeypatch.delenv("SYNTH2_ENGINE", raising=False)
+    monkeypatch.delenv("SYNTH2_QUALITY", raising=False)
+
+
+def test_engines_endpoint_without_models(srv, auto_engine, monkeypatch, tmp_path):
+    base = fakes.empty_models(monkeypatch, tmp_path)
+    status, out = jcall(srv, "GET", "/api/engines")
+    assert status == 200
+    assert [(e["name"], e["available"]) for e in out["engines"]] == [("formant", True), ("neural", False)]
+    assert "synth2 models install" in out["install_hint"] and str(base) in out["neural"]["reason"]
+    assert out["default_engine"] == "formant" and out["qualities"] == ["draft", "normal", "high"]
+    assert out["neural"]["available"] is False and out["neural"]["banks"] == []
+    assert [r["id"] for r in out["roles"]] == ["lead", "double", "harmony", "answer", "adlib", "crowd"]
+    assert out["project"]["engine"] == "auto" and out["project"]["tracks"][0]["engine"] == "formant"
+
+
+def test_engines_endpoint_with_a_voicebank(srv, auto_engine, monkeypatch, tmp_path):
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    status, out = jcall(srv, "GET", "/api/engines")
+    assert status == 200 and out["neural"]["available"] is True and out["default_engine"] == "neural"
+    assert out["install_hint"] == "" and out["credits"] == [fakes.BANK_CREDIT, fakes.VOCODER_CREDIT]
+    assert out["licence_notes"] == ["Fakevoc (vocoder): CC BY-NC 4.0 - commercial use is not allowed"]
+    assert out["neural"]["commercial_use"] is False and out["neural"]["default_bank"] == "fakebank"
+    assert out["project"]["tracks"][0]["engine"] == "neural"
+
+
+def test_render_takes_engine_and_quality_and_returns_credits(srv, auto_engine, monkeypatch, tmp_path):
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    assert jcall(srv, "PUT", "/api/project", _short_project("Sing"))[0] == 200
+    status, headers, data = call(srv, "POST", "/api/render", {"quality": "draft"})
+    assert status == 200 and data[:4] == b"RIFF", data[:300]
+    report = json.loads(headers["X-Render-Report"])
+    assert report["engines"] == ["neural"] and report["quality"] == "draft" and report["voicebanks"] == ["fakebank"]
+    assert report["credits"] == [fakes.BANK_CREDIT, fakes.VOCODER_CREDIT]
+    assert report["licence_notes"] == ["Fakevoc (vocoder): CC BY-NC 4.0 - commercial use is not allowed"]
+    assert fakes.CALLS[-1][1] == "draft"
+    status, full = jcall(srv, "GET", "/api/render/report")
+    assert status == 200 and full["credits"] == report["credits"] and full["tracks"][0]["engine"] == "neural"
+    assert json.loads(call(srv, "GET", "/api/render/last")[1]["X-Render-Report"])["credits"] == report["credits"]
+    session = srv.state.session
+    assert session.last_render_options == (None, "draft")
+    # the engine of one request overrides the project's; the formant engine has no credits
+    status, headers, data = call(srv, "POST", "/api/render", {"engine": "formant", "quality": "high"})
+    report = json.loads(headers["X-Render-Report"])
+    assert status == 200 and report["engines"] == ["formant"] and report["credits"] == []
+    assert report["licence_notes"] == [] and session.last_render_options == ("formant", "high")
+    status, headers, data = call(srv, "POST", "/api/render", {"engine": "neural:fakebank", "end_beat": 2})
+    assert status == 200 and json.loads(headers["X-Render-Report"])["engines"] == ["neural"]
+    # the WAV export is a full render with the same choices
+    status, headers, data = call(srv, "GET", "/api/export?format=wav&engine=neural&quality=draft")
+    assert status == 200 and data[:4] == b"RIFF" and 'filename="Sing.wav"' in headers["Content-Disposition"]
+    assert json.loads(headers["X-Render-Report"])["credits"] == [fakes.BANK_CREDIT, fakes.VOCODER_CREDIT]
+    status, headers, data = call(srv, "GET", "/api/export?format=wav&engine=formant")
+    assert status == 200 and json.loads(headers["X-Render-Report"])["engines"] == ["formant"]
+
+
+def test_render_with_a_bad_or_unavailable_engine_is_a_4xx_with_the_reason(srv, auto_engine, monkeypatch, tmp_path):
+    fakes.empty_models(monkeypatch, tmp_path)
+    assert jcall(srv, "PUT", "/api/project", _short_project())[0] == 200
+    for body, text in (({"engine": "nueral"}, "unknown engine 'nueral'"), ({"engine": 7}, "engine must be a string"),
+                       ({"engine": "formant:x"}, "unknown engine"), ({"quality": "best"}, "unknown quality 'best'"),
+                       ({"quality": ["draft"]}, "quality must be a string")):
+        status, out = jcall(srv, "POST", "/api/render", body)
+        assert status == 400 and text in out["error"], (body, out)
+    for path in ("/api/export?format=wav&engine=nueral", "/api/export?format=wav&quality=best"):
+        assert jcall(srv, "GET", path)[0] == 400
+    for body in ({"engine": "neural"}, {"engine": "neural:nobank", "quality": "draft"}):
+        status, out = jcall(srv, "POST", "/api/render", body)
+        assert status == 409 and out["engine_unavailable"] is True, out
+        assert "not available" in out["error"] and "synth2 models install" in out["install_hint"]
+    status, out = jcall(srv, "GET", "/api/export?format=wav&engine=neural")
+    assert status == 409 and "synth2 models install" in out["install_hint"]
+    # a project that asks for the neural engine itself: the same answer, and the formant engine still renders
+    project = _short_project()
+    project["engine"] = "neural"
+    assert jcall(srv, "PUT", "/api/project", project)[0] == 200
+    status, out = jcall(srv, "POST", "/api/render", {})
+    assert status == 409 and "synth2 models install" in out["error"]
+    assert jcall(srv, "GET", "/api/render/last")[0] == 404          # nothing was rendered by the failures
+    assert jcall(srv, "GET", "/api/render/report")[0] == 404
+    status, headers, data = call(srv, "POST", "/api/render", {"engine": "formant"})
+    assert status == 200 and json.loads(headers["X-Render-Report"])["engines"] == ["formant"]
+    assert jcall(srv, "GET", "/api/render/status")[1]["active"] is False
+    # through the tool endpoint the same failure is a tool error (400), not a 500
+    status, out = jcall(srv, "POST", "/api/tool", {"name": "render", "args": {"path": str(tmp_path / "t.wav")}})
+    assert status == 400 and "synth2 models install" in out["error"]
+
+
+def test_project_engine_and_role_fields_roundtrip(srv, tmp_path):
+    project = _short_project("Roles")
+    project["engine"] = "formant"
+    project["tracks"][0].update(engine="neural:fakebank", role="lead",
+                                voice_params={"neural.dial": 1.0, "breathiness": 0.2})
+    assert jcall(srv, "PUT", "/api/project", project)[0] == 200
+    status, got = jcall(srv, "GET", "/api/project")
+    assert got["engine"] == "formant" and got["tracks"][0]["engine"] == "neural:fakebank"
+    assert got["tracks"][0]["role"] == "lead" and got["tracks"][0]["voice_params"]["neural.dial"] == 1.0
+    path = tmp_path / "roles.s2p.json"
+    assert jcall(srv, "POST", "/api/save", {"path": str(path)})[0] == 200
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["engine"] == "formant" and saved["tracks"][0]["role"] == "lead"
+    status, headers, data = call(srv, "GET", "/api/export?format=s2s")
+    text = data.decode("utf-8")
+    assert "engine: formant" in text and "role=lead" in text and "engine=neural:fakebank" in text
+    bad = _short_project()
+    bad["tracks"][0]["engine"] = "vocaloid"                     # a misspelt engine in a project is a 400 at render
+    assert jcall(srv, "PUT", "/api/project", bad)[0] == 200
+    status, out = jcall(srv, "POST", "/api/render", {})
+    assert status == 400 and "unknown engine 'vocaloid'" in out["error"]
+
+
+def test_sounds_endpoint_and_sound_credits_in_the_render_report(srv, monkeypatch, tmp_path):
+    base = fakes.install_fake_sound(monkeypatch, tmp_path)
+    status, out = jcall(srv, "GET", "/api/sounds")
+    assert status == 200 and [x["id"] for x in out["sets"]] == ["tiny-bass"]
+    assert out["sets"][0]["credits"] == [fakes.SOUND_CREDIT] and out["sounds_dir"] == str(base)
+    assert "synth2 sounds install" in out["install_hint"] and "backing" not in out
+    status, one = jcall(srv, "GET", "/api/sounds?set=tiny-bass&search=bass")
+    assert status == 200 and one["set"]["id"] == "tiny-bass" and one["set"]["presets"]
+    assert jcall(srv, "GET", "/api/sounds?set=nope")[0] == 404
+    assert jcall(srv, "GET", "/api/sounds?limit=many")[0] == 400
+    project = _short_project("Band")
+    project["backing"] = fakes.backing()
+    assert jcall(srv, "PUT", "/api/project", project)[0] == 200
+    status, out = jcall(srv, "GET", "/api/sounds")
+    assert out["backing"]["instruments"]["bass"]["plays"] == "sampled" and out["backing"]["credits"] == [fakes.SOUND_CREDIT]
+    status, headers, data = call(srv, "POST", "/api/render", {})
+    report = json.loads(headers["X-Render-Report"])
+    assert status == 200 and report["credits"] == [fakes.SOUND_CREDIT]
+    project["backing"] = fakes.backing("not-installed")
+    assert jcall(srv, "PUT", "/api/project", project)[0] == 200
+    status, out = jcall(srv, "GET", "/api/sounds")
+    assert out["backing"]["instruments"]["bass"]["plays"] == "synth" and len(out["backing"]["warnings"]) == 1
+    status, headers, data = call(srv, "POST", "/api/render", {})
+    report = json.loads(headers["X-Render-Report"])
+    assert status == 200 and report["credits"] == []
+    assert [w for w in report["warnings"] if "plays instead" in w and "synth2 sounds install not-installed" in w]
+    monkeypatch.setenv("SYNTH2_SOUNDS", str(tmp_path / "none"))
+    status, out = jcall(srv, "GET", "/api/sounds")
+    assert status == 200 and out["sets"] == [] and "synth2 sounds install" in out["hint"]
+
+
+def test_report_header_keeps_the_credits_when_it_is_trimmed():
+    from synth2.server.app import report_header
+
+    report = {"duration_s": 1.0, "engines": ["neural"], "credits": ["Vocals: 绮萱 (Qixuan)."],
+              "licence_notes": ["no commercial use"], "warnings": ["w" * 400] * 30,
+              "stem_levels": [{"key": "k" * 50, "peak_db": -3.0}] * 400,
+              "tracks": [{"id": "t", "name": "Lead", "warnings": ["x" * 300] * 9, "neural": {"big": ["y"] * 3000}}]}
+    text = report_header(report)
+    out = json.loads(text)
+    assert len(text) <= 7000 and text.isascii() and out["truncated"] is True
+    assert out["credits"] == ["Vocals: 绮萱 (Qixuan)."] and out["licence_notes"] == ["no commercial use"]
+    assert out["engines"] == ["neural"] and len(out["warnings"]) == 8
+
+
+def test_a_long_render_does_not_block_the_server(srv, auto_engine, monkeypatch, tmp_path):
+    """While a render is under way (also one started through the tool endpoint), the studio answers every other
+    request, the status endpoint shows the render, and a second render waits its turn."""
+    import synth2.neural as neural
+
+    fakes.install_fake_neural(monkeypatch, tmp_path)
+    entered, release = threading.Event(), threading.Event()
+
+    class Slow(fakes.FakeNeuralBackend):
+        def render_track(self, *a, **kw):
+            entered.set()
+            assert release.wait(30), "the test never released the render"
+            return super().render_track(*a, **kw)
+
+    monkeypatch.setattr(neural, "backend", lambda bank=None: Slow(bank))
+    assert jcall(srv, "PUT", "/api/project", _short_project("Slow"))[0] == 200
+    results = {}
+
+    def run(key, method, path, body):
+        results[key] = call(srv, method, path, body)
+
+    first = threading.Thread(target=run, args=("render", "POST", "/api/render", {"quality": "draft"}))
+    first.start()
+    try:
+        assert entered.wait(20)
+        status, st = jcall(srv, "GET", "/api/render/status")
+        assert status == 200 and st["active"] is True and st["quality"] == "draft" and st["engine"] == "auto"
+        assert st["waiting"] == 0 and st["elapsed_s"] >= 0
+        # reads, edits and saves go through while the render holds the engine
+        assert jcall(srv, "GET", "/api/project")[0] == 200
+        assert jcall(srv, "GET", "/api/engines")[0] == 200
+        edited = _short_project("Edited meanwhile")
+        assert jcall(srv, "PUT", "/api/project", edited)[0] == 200
+        assert jcall(srv, "POST", "/api/tool", {"name": "get_project", "args": {}})[1]["title"] == "Edited meanwhile"
+        # a second render (through the tool endpoint) queues without holding the project lock either
+        second = threading.Thread(target=run, args=("tool", "POST", "/api/tool", {
+            "name": "render", "args": {"path": str(tmp_path / "tool.wav"), "engine": "formant"}}))
+        second.start()
+        second.join(0.5)
+        assert second.is_alive() and "tool" not in results
+        assert jcall(srv, "GET", "/api/project")[0] == 200
+        assert jcall(srv, "POST", "/api/undo", {})[0] == 200
+        # and a third one through the render endpoint is counted as waiting
+        third = threading.Thread(target=run, args=("third", "POST", "/api/render", {"engine": "formant"}))
+        third.start()
+        for _ in range(100):
+            if jcall(srv, "GET", "/api/render/status")[1]["waiting"] == 1:
+                break
+            third.join(0.05)
+        assert jcall(srv, "GET", "/api/render/status")[1]["waiting"] == 1
+    finally:
+        release.set()
+        first.join(30)
+    second.join(30)
+    third.join(30)
+    status, headers, data = results["render"]
+    assert status == 200 and json.loads(headers["X-Render-Report"])["engines"] == ["neural"]
+    assert results["tool"][0] == 200 and json.loads(results["tool"][2])["engines"] == ["formant"]
+    assert results["third"][0] == 200
+    st = jcall(srv, "GET", "/api/render/status")[1]
+    assert st["active"] is False and st["waiting"] == 0
+
+
+# ================================================================== with installed models
+# Real renders: skipped unless onnxruntime and a voicebank are installed (SYNTH2_MODELS names the folder).
+
+def _neural_installed() -> tuple[bool, str]:
+    from synth2 import neural
+
+    return neural.available()
+
+
+needs_models = pytest.mark.skipif(not _neural_installed()[0],
+                                  reason=f"neural engine unavailable: {_neural_installed()[1]}")
+REAL_SCORE = "tempo: 120\ntrack: Lead voice=aurora style=pop lang=en\nr q  C4 q hello  E4 q world  r q\n"
+
+
+@needs_models
+def test_real_neural_render_over_http(srv, auto_engine, monkeypatch):
+    from synth2.score import parse_score
+
+    monkeypatch.setenv("SYNTH2_NEURAL_CACHE", "0")
+    assert jcall(srv, "PUT", "/api/project", parse_score(REAL_SCORE).to_dict())[0] == 200
+    status, info = jcall(srv, "GET", "/api/engines")
+    assert status == 200 and info["neural"]["available"] and info["credits"]
+    status, headers, data = call(srv, "POST", "/api/render", {"engine": "neural", "quality": "draft"})
+    assert status == 200 and data[:4] == b"RIFF" and len(data) > 10000, data[:300]
+    report = json.loads(headers["X-Render-Report"])
+    assert report["engines"] == ["neural"] and report["quality"] == "draft" and report["credits"] == info["credits"]
+    assert report["licence_notes"] == info["licence_notes"]
+    assert jcall(srv, "GET", "/api/render/report")[1]["tracks"][0]["bank"] == info["neural"]["default_bank"]

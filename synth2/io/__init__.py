@@ -82,10 +82,17 @@ def _looks_like_svp(data: bytes) -> bool:
 
 
 def load_any(path: str | Path) -> "Project":
-    """Load a project from any supported file format (chosen by extension, then by content)."""
+    """Load a project from any supported file format (chosen by extension, then by content).
+    The project remembers the file (``project.path``)."""
+    path = Path(path)
+    project = _load(path)
+    project.path = str(path.resolve())
+    return project
+
+
+def _load(path: Path) -> "Project":
     from ..project import Project
 
-    path = Path(path)
     data = path.read_bytes()
     fmt = detect_format(path, data)
     if fmt == "svp":

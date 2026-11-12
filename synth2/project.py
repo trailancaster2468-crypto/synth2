@@ -313,6 +313,9 @@ class Project:
     backing: dict | None = None
     # default engine spec of the tracks ("" = auto): auto, formant, neural or neural:<voicebank>
     engine: str = ""
+    # the file the project was loaded from or last saved to (not stored in it): relative sound paths
+    # of the backing are looked up next to it
+    path: str | None = field(default=None, compare=False, repr=False)
 
     # ---- convenience -----------------------------------------------------
     @classmethod
@@ -366,7 +369,9 @@ class Project:
         return self.tempo.beat_to_sec(self.duration_beats()) + tail
 
     def copy(self) -> "Project":
-        return Project.from_dict(copy.deepcopy(self.to_dict()))
+        p = Project.from_dict(copy.deepcopy(self.to_dict()))
+        p.path = self.path
+        return p
 
     # ---- serialisation ---------------------------------------------------
     def to_dict(self):
@@ -413,13 +418,16 @@ class Project:
 
     def save(self, path: str | Path):
         Path(path).write_text(self.to_json(), encoding="utf-8")
+        self.path = str(Path(path).resolve())
 
     @classmethod
     def load(cls, path: str | Path) -> "Project":
         """Load any supported format: .json/.s2p, .s2s score, .svp, .mid, .musicxml/.mxl, .ust."""
         from .io import load_any
 
-        return load_any(path)
+        project = load_any(path)
+        project.path = str(Path(path).resolve())
+        return project
 
     def summary(self) -> dict:
         """Compact description of the project, useful for AI agents."""

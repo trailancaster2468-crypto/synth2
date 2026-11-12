@@ -262,6 +262,9 @@ class FakeStem:
     gain_db: float = 0.0
     pan: float = 0.0
     sidechain: bool = False
+    warnings: tuple = ()
+    credits: tuple = ()
+    sound: str = ""
 
 
 BEAT = 0.5  # s at 120 bpm
@@ -489,3 +492,201 @@ def test_vocal_transient_limiter_is_opt_in():
     # the body of the voice is (nearly) untouched
     q = slice(SR // 2 + SR // 8 - 900, SR // 2 + SR // 8 + 900)  # between two strong pulses
     assert np.sqrt(np.mean(y1[q] ** 2)) == pytest.approx(np.sqrt(np.mean(y0[q] ** 2)), rel=0.08)
+
+
+# --------------------------------------------------------------------------------------- memory
+def test_sparse_audio_keeps_what_sounds_and_gives_the_array_back():
+    B = M.SPARSE_BLOCK
+    rng = np.random.default_rng(0)
+    x = np.zeros(20 * B + 300, np.float32)
+    x[3 * B + 10:5 * B - 7] = rng.standard_normal(2 * B - 17).astype(np.float32)
+    x[9 * B:9 * B + 5] = 1e-9
+    x[-200:] = 0.25
+    sp = M.Sparse.from_dense(x)
+    assert len(sp) == len(x) and sp.channels == 0 and [a for a, _ in sp.segments] == [3 * B, 9 * B, 20 * B]
+    assert sp.nbytes == (2 * B + B + 300) * 4 and np.array_equal(sp.dense(), x)  # exact zeros only: lossless
+    assert sp.dense(np.float64).dtype == np.float64 and len(sp.dense(length=4 * B)) == 4 * B
+    loud = M.Sparse.from_dense(x, M.SILENCE)  # blocks under the floor are silence
+    assert [a for a, _ in loud.segments] == [3 * B, 20 * B] and np.abs(loud.dense() - x).max() <= 1e-9
+    longer = M.Sparse.from_dense(x[: 6 * B], length=len(x))
+    assert len(longer) == len(x) and np.array_equal(longer.dense()[: 6 * B], x[: 6 * B]) and not longer.dense()[6 * B:].any()
+    assert M.Sparse.from_dense(np.zeros(0, np.float32)).segments == [] and M.Sparse(5, 2).dense().shape == (5, 2)
+    out = np.ones(len(x), np.float32)
+    sp.add_to(out, 0.5)
+    assert np.allclose(out, 1 + 0.5 * x)
+    assert sp.peak() == pytest.approx(float(np.abs(x).max())) and sp.sum_squares() == pytest.approx(float(np.sum(x.astype(np.float64) ** 2)))
+    st = np.stack([x, -0.5 * x], 1)
+    sp2 = M.Sparse.from_dense(st)
+    assert sp2.channels == 2 and np.array_equal(sp2.dense(), st)
+    curve = np.linspace(0.0, 1.0, len(x)).astype(np.float32)
+    sp2.scale(curve)
+    assert np.array_equal(sp2.dense(), st * curve[:, None])
+    sp2.scale(2.0)
+    sp2.crop(4 * B, 20 * B + 100)
+    assert len(sp2) == 16 * B + 100 and np.array_equal(sp2.dense(), (st * curve[:, None] * np.float32(2.0))[4 * B:20 * B + 100])
+
+
+def test_the_stem_store_is_a_mapping_of_full_length_arrays():
+    B = M.SPARSE_BLOCK
+    n = 12 * B
+    a = np.zeros((n, 2), np.float32)
+    a[2 * B:3 * B] = 0.5
+    b = np.full((n, 2), 1e-9, np.float32)
+    b[8 * B:] = -0.25
+    store = M.StemStore(n)
+    store.put("a", a)
+    store.put("b", b)
+    assert len(store) == 2 and list(store) == ["a", "b"] and "a" in store and "c" not in store and store.get("c") is None
+    assert np.array_equal(store["a"], a) and store["a"] is not store["a"] and store["a"].dtype == np.float32
+    assert np.abs(store["b"] - b).max() <= 1e-9 and not store["b"][: 8 * B].any()  # under the floor: silence
+    assert store.nbytes == (B + 4 * B) * 2 * 4 and store.sparse("a").segments[0][0] == 2 * B
+    assert {k: v.shape for k, v in store.items()} == {"a": (n, 2), "b": (n, 2)}
+    assert store.peak() == 0.5 and store.peak("b") == 0.25 and store.rms("a") == pytest.approx(np.sqrt(np.mean(a ** 2)))
+    store.scale(0.5, ["b"])
+    store.scale(np.full(n, 2.0, np.float32))
+    assert store.peak("a") == 1.0 and store.peak("b") == 0.25
+    store.crop(2 * B + 5, 9 * B)
+    assert store.length == 7 * B - 5 and store["a"].shape == (7 * B - 5, 2)
+    assert np.array_equal(store["a"], 2 * a[2 * B + 5:9 * B]) and np.array_equal(store["b"][-B:], np.full((B, 2), -0.25, np.float32))
+    with pytest.raises(KeyError):
+        store["c"]
+
+
+def test_jobs_keep_their_order_and_do_not_pile_up_behind_a_slow_one():
+    import threading
+    import time
+
+    lock = threading.Lock()
+    state = {"waiting": 0, "most": 0}
+
+    def job(i):
+        time.sleep(0.25 if i == 0 else 0.0)
+        with lock:
+            state["waiting"] += 1
+            state["most"] = max(state["most"], state["waiting"])
+        return i
+
+    out = []
+    for r in M._run_jobs(job, list(range(40)), 3):
+        with lock:
+            state["waiting"] -= 1
+        out.append(r)
+    assert out == list(range(40)) and state["most"] <= 3  # (all at once: 39 results would wait for job 0)
+    assert list(M._run_jobs(job, [5, 6], 1)) == [5, 6] and list(M._run_jobs(job, [], 4)) == []
+
+
+def test_mixing_sparse_sources_equals_mixing_their_arrays():
+    sr = 16000
+    n = sr * 4
+    rng = np.random.default_rng(4)
+    t = np.arange(n) / sr
+    v = np.zeros(n, np.float32)
+    v[sr:2 * sr] = (0.2 * np.sin(2 * np.pi * 330 * t[:sr]) * np.hanning(sr)).astype(np.float32)
+    band = np.zeros((n, 2), np.float32)
+    band[sr // 2:3 * sr] = (0.1 * rng.standard_normal((5 * sr // 2, 2))).astype(np.float32)
+
+    def srcs(wrap):
+        return [M.Source("v", "Lead", "vocal", wrap(v), reverb_send=0.3, delay_send=1.0),
+                M.Source("b", "keys", "backing", wrap(band), role="keys")]
+
+    ms = MasterSettings(vocal_delay=0.2)
+    dense = M.mix_sources(srcs(lambda x: x), sr, band_mode=True, settings=ms, threads=1)
+    kept = srcs(M.Sparse.from_dense)
+    sparse = M.mix_sources(kept, sr, band_mode=True, settings=ms, threads=2, consume=True)
+    assert isinstance(sparse.stems, M.StemStore) and set(sparse.stems) == {"v", "b"}
+    assert all(np.array_equal(sparse.stems[k], dense.stems[k]) for k in dense.stems)
+    assert np.array_equal(sparse.dry, dense.dry) and np.array_equal(sparse.wet, dense.wet)
+    assert np.allclose(sum(sparse.stems.values()), sparse.dry, atol=1e-6) and sparse.stems.nbytes < 2 * band.nbytes
+    assert all(s.audio is None for s in kept)  # consumed: the mixer let go of what it had mixed
+
+
+def test_a_long_mix_of_many_sparse_tracks_holds_what_sounds_not_every_track_at_full_length(monkeypatch):
+    """47 vocal channels and 30 band stems of a whole song used to be held at full length three times over (the
+    sources in float64, the stems, the results waiting behind a slow job): 13.5 GB for 3 minutes. Here 52 tracks
+    of a minute that each sound for a second or two: the peak must not grow with the number of tracks."""
+    import tracemalloc
+
+    from synth2.engine import renderer as R
+
+    sr, secs, n_vocals, n_band = 16000, 60.0, 36, 16
+
+    class Bursts:
+        name = "neural"
+
+        def render_track(self, project, track, sample_rate, t0, t1, note_range=None):
+            out = np.zeros(int(round((t1 - t0) * sample_rate)), np.float32)
+            for nt in track.notes:
+                a = int((project.tempo.beat_to_sec(nt.onset) - t0) * sample_rate)
+                m = min(int(0.8 * sample_rate), len(out) - a)
+                if a >= 0 and m > 0:
+                    out[a:a + m] = 0.2 * np.sin(2 * np.pi * 220.0 * np.arange(m) / sample_rate) * np.hanning(m)
+            return out, {"id": track.id, "name": track.name, "voice": track.voice, "style": "", "engine": "neural",
+                         "notes": len(track.notes), "warnings": [], "phonemes": {}, "peak_db": 0.0,
+                         "role": track.role, "neural": {"dial": "crisp"}}
+
+    mod = types.ModuleType("synth2.arranger")
+    mod.kick_times = lambda project: np.arange(0.0, secs, 0.5)
+    mod.song_length_seconds = lambda project: secs
+
+    def render_backing(project, sr_, t0, t1):
+        n = int(round((t1 - t0) * sr_))
+        rng = np.random.default_rng(1)
+        out = []
+        for i in range(n_band):
+            x = np.zeros((n, 2), np.float32)
+            a = int((2.0 + 6.0 * (i % 9)) * sr_)
+            x[a:a + 2 * sr_] = 0.05 * rng.standard_normal((2 * sr_, 2))
+            out.append(FakeStem(f"part{i}", "keys", x))
+        return out
+
+    mod.render_backing = render_backing
+    monkeypatch.setitem(sys.modules, "synth2.arranger", mod)
+    monkeypatch.setattr(R, "backend_for_track", lambda project, track, engine=None: Bursts())
+    monkeypatch.setenv("SYNTH2_MIX_THREADS", "2")
+    p = Project(title="long")
+    p.tempo.set(0.0, 120.0)
+    p.sample_rate = sr
+    for i in range(n_vocals):
+        tr = p.add_track(f"v{i}", voice="aurora", role=("lead", "adlib", "crowd", "harmony")[i] if i < 4 else "",
+                         reverb_send=0.2)
+        tr.add_note(4.0 + 6.0 * (i % 18), 1.0, 60, "la")
+    p.backing = {"fake": True}
+    p.master.vocal_delay = 0.2
+    tracemalloc.start()
+    try:
+        res = render_project(p)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    n = len(res.audio)
+    assert n >= secs * sr and len(res.stems) == n_vocals + n_band and res.report["mix"]["mode"] == "song"
+    full = n * 2 * 4  # one stem at full length (float32, stereo)
+    assert res.stems.nbytes < 6 * full  # 52 stems that sound for a second or two each
+    # held at full length (sources in float64, stems in float32) this mix peaked at 144 full-length stems; with
+    # what sounds held as segments it is 35, most of it the master chain and the two channels being processed
+    assert peak < 60 * full, f"peak {peak / 1e6:.0f} MB = {peak / full:.1f} full-length stems"
+    assert np.allclose(sum(v.astype(np.float64) for v in res.stems.values()).max(), np.abs(res.audio).max(), atol=0.2)
+
+
+def test_backing_warnings_credits_and_sounds_reach_the_render_report(monkeypatch):
+    mod = _fake_arranger(4.0)
+    inner = mod.render_backing
+
+    def render_backing(project, sr, t0, t1):
+        stems = inner(project, sr, t0, t1)
+        stems[0].warnings = stems[1].warnings = ("drums: sound 'big-kit' is not installed; the synthesised kit plays",)
+        stems[2].sound, stems[2].credits = "Finger Bass (some-set)", ("Some Set by Somebody (CC0)",)
+        stems[3].sound, stems[3].credits = "Piano (some-set)", ("Some Set by Somebody (CC0)", "Piano samples: A. Player")
+        return stems
+
+    mod.render_backing = render_backing
+    monkeypatch.setitem(sys.modules, "synth2.arranger", mod)
+    rep = render_project(_song()).report
+    assert rep["warnings"].count("drums: sound 'big-kit' is not installed; the synthesised kit plays") == 1
+    assert rep["credits"] == ["Some Set by Somebody (CC0)", "Piano samples: A. Player"]
+    by = {b["name"]: b for b in rep["backing"]}
+    assert by["bass"]["sound"] == "Finger Bass (some-set)" and by["keys"]["sound"] == "Piano (some-set)"
+    assert "sound" not in by["drums kick"]
+    # a track subset has no band: none of its notes either
+    solo = render_project(_song(), track_ids=[0]).report
+    assert "credits" not in solo and not solo["warnings"] and solo["backing"] == []

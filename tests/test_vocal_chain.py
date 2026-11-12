@@ -221,31 +221,41 @@ def test_a_double_made_from_the_take():
     assert echo.shape == x.shape and not np.array_equal(echo, x)
 
 
-def test_a_noted_role_is_used_only_for_the_audio_it_was_noted_for():
+def test_a_source_gets_its_roles_chain_only_from_an_engine_that_sings_roles():
+    src = lambda **kw: mixing.Source(key="t", name="t", kind="vocal", audio=np.zeros(8), **kw)
+    assert vc.source_role(src(engine="neural", vocal_role="lead", dial="balanced")) == {
+        "role": "lead", "dial": "balanced", "copy_of": None}
+    assert vc.source_role(src(engine="neural", vocal_role="double:Lead", copy_of="harmony")) == {
+        "role": "double", "dial": "crisp", "copy_of": "harmony"}  # no dial given: the default
+    assert vc.source_role(src(engine="neural", vocal_role="Ad-lib", dial="loud"))["dial"] == "crisp"
+    assert vc.source_role(src(engine="formant", vocal_role="lead")) is None  # another engine keeps the strip
+    assert vc.source_role(src(engine="neural", vocal_role="juggler")) is None
+    assert vc.source_role(src(engine="neural")) is None and vc.source_role(src()) is None
+
+
+def test_in_channel_effects_and_their_overrides():
     x, _ = voice()
-    vc.note_role("t1", x, "lead", "balanced")
-    hit = vc.noted_role("t1", x)
-    assert hit["role"] == "lead" and hit["dial"] == "balanced" and hit["copy_of"] is None
-    padded = np.zeros(len(x) + 5000)
-    padded[: len(x)] = x  # what the mixer is handed: float64, longer
-    assert vc.noted_role("t1", padded)["role"] == "lead"
-    faded = padded.copy()
-    faded[len(x) - 2000:len(x)] *= np.linspace(1, 0, 2000)  # a region's fade at the end leaves it valid
-    assert vc.noted_role("t1", faded) is not None
-    assert vc.noted_role("t1", padded * 0.999) is None and vc.noted_role("t1", padded[: len(x) // 4]) is None
-    other, _ = voice(seed=5)
-    assert vc.noted_role("t1", other) is None and vc.noted_role("t2", x) is None
-    vc.note_role("t1", x, "")  # no role: forgotten
-    assert vc.noted_role("t1", x) is None
-    vc.note_role("t1", x, "juggler")
-    assert vc.noted_role("t1", x) is None
-    vc.note_role("t3", np.zeros(1000, np.float32), "lead")
-    assert vc.noted_role("t3", np.zeros(1000)) is None  # silence proves nothing
-    late = np.concatenate([np.zeros(3 * len(x), np.float32), x])  # a track that only sings at the end
-    vc.note_role("t4", late, "crowd")
-    assert vc.noted_role("t4", np.concatenate([late, np.zeros(100)]))["role"] == "crowd"
-    assert vc.noted_role("t4", np.concatenate([np.zeros(3 * len(x)), other])) is None
-    assert set(vc.noted_role("t4", late)) == {"role", "dial", "copy_of"}
+    env = np.ones(len(x), np.float32)
+    same, info = vc.apply_fx(x, SR, None)
+    assert np.array_equal(same, x) and info == {}
+    assert vc.apply_fx(np.zeros(100, np.float32), SR, {"duck_db": 3.0}, env[:100])[1] == {}
+    down, info = vc.apply_fx(x, SR, {"duck_db": 6.0}, env)
+    assert info == {"duck_db": 6.0} and np.allclose(down, x * 10 ** (-6 / 20), atol=1e-6)
+    assert np.array_equal(vc.apply_fx(x, SR, {"duck_db": 6.0})[0], x)  # no lead: no duck
+    # the role's effects are what apply_fx gives after the chain; an override replaces one entry
+    plain, _ = vc.apply_role(x, SR, "adlib", lead_env=env)
+    dry, info = vc.apply_role(x, SR, "adlib", lead_env=env, fx={"slap": None, "duck_db": 0})
+    assert "duck_db" not in info and not np.array_equal(dry, plain)
+    chained = mixing.eq(x.astype(np.float64), vc.LEAD["eq"], SR)
+    want, _ = vc.apply_fx(vc.process(x, SR, {"eq": vc.LEAD["eq"]})[0], SR, {"eq": vc.ROLE_FX["adlib"]["eq"]})
+    assert np.allclose(dry, want, atol=1e-6) and chained.shape == x.shape
+    roomy, _ = vc.apply_role(x, SR, "lead", fx={"room": {"decay": 0.3, "predelay": 0.02, "level_db": -10.0}})
+    assert not np.array_equal(roomy, vc.apply_role(x, SR, "lead")[0])
+    # where the leads sing: the sum of the lead takes at their faders
+    quiet = np.zeros(len(x), np.float32)
+    assert vc.leads_env([], SR, len(x)) is None
+    e = vc.leads_env([(x, 0.0), (quiet, -6.0)], SR, len(x) + 100)
+    assert e.shape == (len(x) + 100,) and np.array_equal(e[: len(x)], vc.sing_env(x.astype(np.float64), SR))
 
 
 def _mix(sources, **master):
@@ -259,12 +269,10 @@ def test_the_mixer_gives_a_track_with_a_role_its_chain_and_leaves_the_others_alo
     y, _ = voice(levels=(0.1, 0.2, 0.05, 0.25), seed=3)
     src = lambda key, audio, **kw: mixing.Source(key=key, name=key, kind="vocal", audio=np.asarray(audio, np.float64),
                                                  reverb_send=0.25, **kw)
-    for key in ("a", "b"):
-        vc.note_role(key, x, "")
+    lead = lambda dial="crisp", **kw: src("a", x, engine="neural", vocal_role="lead", dial=dial, **kw)
     before = _mix([src("a", x), src("b", y)])
     assert "role" not in before.info["vocal_strips"]["a"]
-    vc.note_role("a", x, "lead", "crisp")
-    after = _mix([src("a", x), src("b", y)])
+    after = _mix([lead(), src("b", y)])
     strips = after.info["vocal_strips"]
     assert strips["a"]["role"] == "lead" and strips["a"]["dial"] == "crisp" and "rider" in strips["a"]["chain"]
     assert np.array_equal(after.stems["b"], before.stems["b"])  # a track without a role is mixed as before
@@ -272,26 +280,32 @@ def test_the_mixer_gives_a_track_with_a_role_its_chain_and_leaves_the_others_alo
     want, _ = vc.apply_role(x, SR, "lead", "crisp")
     assert np.allclose(after.stems["a"][:, 0], want * mixing.pan_gains(0.0)[0], atol=1e-6)
     # the lead's send follows the dial: twice the track's send at smooth, 0.6 of it at crisp
-    solo = lambda dial: (vc.note_role("a", x, "lead", dial), _mix([src("a", x)]))[1]
+    solo = lambda dial: _mix([lead(dial)])
     wet = lambda m: float(np.sqrt(np.mean(m.wet ** 2)))
     assert wet(solo("smooth")) / wet(solo("balanced")) == pytest.approx(2.0, rel=0.15)
     assert wet(solo("crisp")) / wet(solo("balanced")) == pytest.approx(0.6, rel=0.15)
     # switched off like the strip: per track, or for the whole mix
-    vc.note_role("a", x, "lead", "crisp")
-    off = _mix([src("a", x, overrides={"chain": False}), src("b", y)])
+    off = _mix([lead(overrides={"chain": False}), src("b", y)])
     assert "a" not in off.info.get("vocal_strips", {}) and np.allclose(off.stems["a"][:, 0], x * mixing.pan_gains(0.0)[0])
-    assert "vocal_strips" not in _mix([src("a", x)], vocal_chain=False).info
-    # other audio under the same track id (another engine sang it): the note is not used
-    assert "role" not in _mix([src("a", y)]).info["vocal_strips"]["a"]
+    assert "vocal_strips" not in _mix([lead()], vocal_chain=False).info
+    # the same track sung by another engine keeps the strip, whatever its role
+    assert "role" not in _mix([src("a", x, engine="formant", vocal_role="lead")]).info["vocal_strips"]["a"]
+    assert np.array_equal(_mix([src("a", x, engine="formant", vocal_role="lead"), src("b", y)]).stems["a"],
+                          before.stems["a"])
     # an ad-lib ducks under the lead of the same mix
-    vc.note_role("a", x, "lead", "crisp")
-    vc.note_role("b", y, "adlib")
-    both = _mix([src("a", x), src("b", y)])
+    adlib = src("b", y, engine="neural", vocal_role="adlib")
+    both = _mix([lead(), adlib])
     assert both.info["vocal_strips"]["b"]["duck_db"] == 2.0
-    vc.note_role("a", x, "")
-    assert "duck_db" not in _mix([src("a", x), src("b", y)]).info["vocal_strips"]["b"]
-    for key in ("a", "b"):
-        vc.note_role(key, x, "")
+    assert "duck_db" not in _mix([src("a", x), adlib]).info["vocal_strips"]["b"]
+    # mix_overrides "fx": single entries of the role's effects replaced for one track
+    dry = _mix([lead(), src("b", y, engine="neural", vocal_role="adlib", overrides={"fx": {"slap": None, "duck_db": 0}})])
+    assert "duck_db" not in dry.info["vocal_strips"]["b"] and not np.array_equal(dry.stems["b"], both.stems["b"])
+    # ... and the same effects on a track that keeps the strip, whatever engine sang it
+    plain = _mix([src("a", x, vocal_role="lead"), src("b", y)])
+    ducked = _mix([src("a", x, vocal_role="lead"), src("b", y, overrides={"fx": {"duck_db": 4.0}})])
+    assert ducked.info["vocal_strips"]["b"]["duck_db"] == 4.0 and np.array_equal(ducked.stems["a"], plain.stems["a"])
+    pb, db = (float(np.sqrt(np.mean(m.stems["b"].astype(np.float64) ** 2))) for m in (plain, ducked))
+    assert 0.5 < 20 * np.log10(pb / db) <= 4.0
 
 
 def test_projects_and_scores_carry_the_role():

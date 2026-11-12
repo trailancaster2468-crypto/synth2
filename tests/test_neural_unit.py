@@ -1313,10 +1313,21 @@ def test_a_double_is_the_leads_take_over_its_own_notes(fake):
     assert np.array_equal(copy[a:b], take[a:b]) and np.abs(copy[a:b]).max() > 0.05
     assert not copy[: a - int(0.1 * SR)].any() and not copy[b + int(0.16 * SR):].any()
     assert 0 < np.abs(copy[a - int(0.07 * SR)]) < np.abs(take[a - int(0.07 * SR)]) or not take[a - int(0.07 * SR)]
-    # the mixer is told: the double gets the copy's delay and detune, the lead its chain
-    assert vocal_chain.noted_role(double.id, copy) == {**vocal_chain.noted_role(double.id, copy), "role": "double",
-                                                       "copy_of": "lead"}
-    assert vocal_chain.noted_role(lead.id, take)["role"] == "lead"
+    # the render hands role, dial and what was copied to the mixer: the double gets the copy's delay and detune
+    from synth2.engine import mixing
+    from synth2.engine import renderer as engine_renderer
+
+    seen = []
+    mix = mixing.mix_sources
+    mixing.mix_sources = lambda sources, *a, **kw: (seen.extend(sources), mix(sources, *a, **kw))[1]
+    try:
+        res = engine_renderer.render_project(p, engine="neural")
+    finally:
+        mixing.mix_sources = mix
+    got = {s.name: (s.engine, s.vocal_role, s.dial, s.copy_of) for s in seen}
+    assert got == {"Lead": ("neural", "lead", "crisp", None), "Double": ("neural", "double", "crisp", "lead")}
+    strips = res.report["mix"]["vocal_strips"]
+    assert strips["Lead"]["role"] == "lead" and strips["Double"]["adt"]["delay"] == vocal_chain.DOUBLE["delay"]
     # a part of the copy equals the same span of the whole
     part, _ = sing(p, double, t0=1.7, t1=2.6)
     assert np.array_equal(part, copy[int(round(1.7 * SR)):int(round(1.7 * SR)) + len(part)])
@@ -1329,7 +1340,7 @@ def test_a_double_is_the_leads_take_over_its_own_notes(fake):
     lead.role = ""
     alone, rep = sing(p, double, t1=t1)
     assert rep["neural"]["pitch"] == "bank" and rep["neural"]["phrases"] == 1
-    assert vocal_chain.noted_role(double.id, alone)["copy_of"] is None
+    assert rep["role"] == "double" and "copy_of" not in rep["neural"]
     double.role = "double:Lead"
     assert sing(p, double, t1=t1)[1]["neural"]["copy"] == ["Lead"]
     double.role = "double:Nobody"

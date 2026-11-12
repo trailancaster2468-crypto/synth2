@@ -111,6 +111,16 @@ kbd { font: 10.5px var(--mono); padding: 1px 5px; border: 1px solid var(--border
 #in-tempo { width: 66px; font-family: var(--mono); }
 #in-timesig { width: 64px; }
 #in-key { width: 104px; }
+#in-engine { width: 112px; }
+#in-quality { width: 78px; }
+.engine-badge { height: 24px; display: inline-flex; align-items: center; gap: 6px; padding: 0 9px; border: 1px solid var(--border-2); border-radius: 12px;
+  background: var(--panel-2); color: var(--text-2); font-size: 11px; cursor: pointer; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.engine-badge:hover { border-color: var(--accent); color: var(--text); }
+.engine-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); flex: none; }
+.engine-badge.on .dot { background: var(--ok); box-shadow: 0 0 6px rgba(74,222,128,.6); }
+.engine-badge.off .dot { background: var(--amber); }
+.engine-badge .nc { color: var(--amber); }
+.engine-badge .nc.short { display: none; }
 
 .title-box { flex: 1 1 auto; min-width: 80px; display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
 .title-input { width: 100%; max-width: 280px; min-width: 60px; height: 28px; background: transparent; border: 1px solid transparent; border-radius: 5px;
@@ -296,6 +306,9 @@ body.busy .song-props, body.busy .menu-group, body.busy .title-box { pointer-eve
 .sb-report { max-width: 40%; cursor: pointer; }
 .sb-report:hover { color: var(--text); }
 .sb-report .warn { color: var(--amber); }
+.sb-credits { cursor: pointer; max-width: 30%; }
+.sb-credits:hover { color: var(--text); }
+.sb-credits .warn { color: var(--amber); }
 .sb-flex { flex: 1; }
 .mono { font-family: var(--mono); }
 .sb-conn { display: inline-flex; align-items: center; gap: 5px; }
@@ -323,6 +336,23 @@ body.busy .song-props, body.busy .menu-group, body.busy .title-box { pointer-eve
 .help-grid { display: grid; grid-template-columns: 210px 1fr; gap: 8px 16px; padding: 16px; font-size: 12px; color: var(--text-2); }
 .help-grid > div:nth-child(odd) { color: var(--text); }
 .report-pre { margin: 0; padding: 14px 16px; font: 11px/1.5 var(--mono); color: var(--text-2); white-space: pre-wrap; }
+.info-body { padding: 12px 16px 16px; font-size: 12px; color: var(--text-2); line-height: 1.45; }
+.info-body h4 { margin: 14px 0 6px; font-size: 10.5px; letter-spacing: 1.1px; text-transform: uppercase; color: var(--dim); font-weight: 600; }
+.info-body h4:first-child { margin-top: 0; }
+.info-body ul { margin: 0; padding-left: 18px; }
+.info-body li { margin: 2px 0; }
+.info-body .row { display: flex; align-items: baseline; gap: 8px; margin: 3px 0; }
+.info-body .row b { color: var(--text); font-weight: 600; }
+.info-body .state { font-size: 11px; padding: 0 7px; border-radius: 9px; border: 1px solid var(--border-2); white-space: nowrap; }
+.info-body .state.ok { color: var(--ok); border-color: rgba(74,222,128,.4); }
+.info-body .state.no { color: var(--amber); border-color: rgba(245,197,66,.4); }
+.info-body code { font: 11.5px var(--mono); background: #0f1216; border: 1px solid var(--border-2); border-radius: 5px; padding: 2px 6px; color: var(--text); user-select: all; }
+.info-body .licence { color: var(--amber); }
+.info-body .dim { color: var(--dim); }
+.info-body .btn-row { margin-top: 12px; display: flex; gap: 8px; }
+.tc-eng { font-size: 9.5px; letter-spacing: .8px; text-transform: uppercase; color: var(--dim); border: 1px solid var(--border-2); border-radius: 4px; padding: 0 4px; line-height: 16px; flex: none; }
+.tc-eng.neural { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.tc-eng.missing { color: var(--amber); border-color: rgba(245,197,66,.4); }
 
 .drop-hint { position: fixed; inset: 10px; z-index: 300; border: 2px dashed var(--accent); border-radius: 14px; background: rgba(20,184,166,.08); display: grid; place-items: center; font-size: 18px; color: var(--accent); pointer-events: none; }
 
@@ -332,4 +362,16 @@ body.busy .song-props, body.busy .menu-group, body.busy .title-box { pointer-eve
   .brand-text { display: none; }
   .hint { display: none; }
   .tb-btn.menu-btn span { display: none; }
+  #in-engine { width: 88px; }
+  #in-quality { width: 62px; }
+}
+
+/* the engine badge gives way first: the licence tag, then the voicebank's name */
+@media (max-width: 1500px) {
+  .engine-badge .nc.long { display: none; }
+  .engine-badge .nc.short { display: inline; }
+}
+@media (max-width: 1420px) {
+  .engine-badge .bank { display: none; }
+  .title-box { min-width: 44px; }
 }

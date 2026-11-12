@@ -45,11 +45,11 @@ through a chain that pushes the consonants back and darkens the top; ``double`` 
 chain and :func:`adt` (the track's audio is then a copy of the lead's take, see
 ``synth2/neural/renderer.py``); ``adlib`` is band-limited, ducked under the lead and gets one
 repeat; ``crowd`` is darkened, ducked and put in a room.
+
+The mixer applies a role to the vocal sources that carry one and were sung by an engine of
+:data:`ROLE_ENGINES` (:func:`source_role`); every other source keeps the channel strip.
 """
 from __future__ import annotations
-
-import threading
-from collections import OrderedDict
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -545,12 +545,37 @@ def sing_env(x, sr):
     return np.interp(np.arange(n), np.arange(nb) * hop + hop / 2, g).astype(np.float32)
 
 
+def apply_fx(y, sr, fx, lead_env=None) -> tuple[np.ndarray, dict]:
+    """``(y, info)``: mono ``y`` with the in-channel effects ``fx``, in this order: ``eq`` (tone),
+    ``duck_db`` (gain reduction where ``lead_env`` says the lead sings; no duck without it),
+    ``slap`` (one repeat, settings of :func:`slap`), ``room`` (a small mono room, settings of
+    :func:`room`). An entry that is missing or None is skipped."""
+    info: dict = {}
+    y = np.asarray(y, np.float32)
+    if not fx or not np.any(y):
+        return y, info
+    if fx.get("eq"):
+        y = mx.eq(y.astype(np.float64), fx["eq"], sr).astype(np.float32)
+    if fx.get("duck_db") and lead_env is not None and len(lead_env):
+        env = np.zeros(len(y), np.float32)
+        m = min(len(y), len(lead_env))
+        env[:m] = lead_env[:m]
+        y = y * (10 ** (-fx["duck_db"] * env / 20)).astype(np.float32)
+        info["duck_db"] = fx["duck_db"]
+    if fx.get("slap"):
+        y = slap(y, sr, **fx["slap"])
+    if fx.get("room"):
+        y = y + room(y, sr, **fx["room"])
+    return np.asarray(y, np.float32), info
+
+
 def apply_role(x, sr, role, dial: str = DEFAULT_DIAL, lead_env=None, copy_of: str | None = None,
-               pan: float = 0.0) -> tuple[np.ndarray, dict]:
+               pan: float = 0.0, fx: dict | None = None) -> tuple[np.ndarray, dict]:
     """``(y, info)``: mono ``x`` with what its role gets (:func:`role_preset`): the chain, the
-    double's delay and detune, tone, the duck under the lead (``lead_env``: :func:`sing_env`
-    of the lead's takes; no duck without it), a repeat, a room. ``info["reverb_scale"]`` is the
-    factor the role puts on the track's reverb send."""
+    double's delay and detune, then the in-channel effects (:func:`apply_fx`: tone, the duck
+    under the lead, a repeat, a room). ``fx`` replaces single entries of the role's effects for
+    this track (``{"slap": None}``: no repeat). ``lead_env`` is :func:`sing_env` of the lead's
+    takes. ``info["reverb_scale"]`` is the factor the role puts on the track's reverb send."""
     pre = role_preset(role, dial, copy_of, pan)
     y = np.asarray(x, np.float32)
     info: dict = {"role": pre["role"], "reverb_scale": pre["reverb_scale"]}
@@ -563,74 +588,36 @@ def apply_role(x, sr, role, dial: str = DEFAULT_DIAL, lead_env=None, copy_of: st
     if pre["adt"]:
         y = adt(y, sr, **pre["adt"])
         info["adt"] = {k: v for k, v in pre["adt"].items() if k != "dark"}
-    if pre.get("eq"):
-        y = mx.eq(y.astype(np.float64), pre["eq"], sr).astype(np.float32)
-    if pre.get("duck_db") and lead_env is not None and len(lead_env):
-        env = np.zeros(len(y), np.float32)
-        m = min(len(y), len(lead_env))
-        env[:m] = lead_env[:m]
-        y = y * (10 ** (-pre["duck_db"] * env / 20)).astype(np.float32)
-        info["duck_db"] = pre["duck_db"]
-    if pre.get("slap"):
-        y = slap(y, sr, **pre["slap"])
-    if pre.get("room"):
-        y = y + room(y, sr, **pre["room"])
-    return np.asarray(y, np.float32), info
+    y, fx_info = apply_fx(y, sr, {**pre, **(fx or {})}, lead_env)
+    info.update(fx_info)
+    return y, info
 
 
-# ---- which tracks of a mix have a role ------------------------------------------------------------
-# A voice engine that sings a track with a role says so here; the mixer asks for it by the
-# track's id and checks that the audio it was handed is the audio the engine returned, so a
-# note left by an earlier render of the track (with another engine, say) is never used.
-_NOTED: "OrderedDict[str, dict]" = OrderedDict()
-_NOTED_MAX = 512
-_lock = threading.Lock()
+# ---- which sources of a mix have a role -----------------------------------------------------------
+ROLE_ENGINES = ("neural",)  # engines whose takes get a role's chain; any other engine keeps the channel strip
 
 
-def _probes(audio, ends=None) -> list[tuple[int, float]]:
-    """``(end, sum of |audio[:end]|)`` at ends that close in on the length of ``audio`` (a
-    half, three quarters, ..., all of it), or at the ``ends`` given."""
-    n = len(audio)
-    if ends is None:
-        ends = sorted({n - (n >> k) for k in range(1, 9)} | {n})
-    return [(m, float(np.abs(np.asarray(audio[:m], np.float64)).sum())) for m in ends if 0 < m <= n]
-
-
-def note_role(key: str, audio, role: str, dial: str = DEFAULT_DIAL, copy_of: str | None = None) -> None:
-    """Remember that ``audio``, just rendered for the track with id ``key``, is a track with
-    this role (``role=""`` forgets the track)."""
-    with _lock:
-        _NOTED.pop(key, None)
-        if parse_role(role)[0]:
-            _NOTED[key] = {"role": parse_role(role)[0], "dial": dial, "copy_of": copy_of, "probes": _probes(audio)}
-            while len(_NOTED) > _NOTED_MAX:
-                _NOTED.popitem(last=False)
-
-
-def noted_role(key: str, audio) -> dict | None:
-    """The note left for track ``key`` when ``audio`` starts with the samples it was left for:
-    some stretch from the start that is not silent has the same sum. (The mixer's copy may be
-    longer, and faded over its last moments in a region render.)"""
-    with _lock:
-        hit = _NOTED.get(key)
-    if hit is None:
+def source_role(source) -> dict | None:
+    """``{"role", "dial", "copy_of"}`` of a vocal source of the mix that gets its role's chain:
+    one with a role (``vocal_role``) that an engine of :data:`ROLE_ENGINES` sang. None for any
+    other source."""
+    role = parse_role(getattr(source, "vocal_role", ""))[0]
+    if not role or getattr(source, "engine", "") not in ROLE_ENGINES:
         return None
-    mine = dict(_probes(audio, [m for m, _ in hit["probes"]]))
-    if not any(total > 0 and mine.get(m) == total for m, total in hit["probes"]):
-        return None
-    return {k: v for k, v in hit.items() if k != "probes"}
+    dial = getattr(source, "dial", "")
+    return {"role": role, "dial": dial if dial in DIAL_CHAINS else DEFAULT_DIAL,
+            "copy_of": getattr(source, "copy_of", None) or None}
 
 
-def mix_roles(sources, sr: int) -> dict[str, dict]:
-    """``{source key: note}`` for the vocal sources of a mix that have a role. Where a role
-    ducks under the lead, the notes carry ``lead_env``: where the lead sources sing."""
-    notes = {s.key: n for s in sources if (n := noted_role(s.key, s.audio)) is not None}
-    leads = [s for s in sources if notes.get(s.key, {}).get("role") == "lead"]
-    if leads and any(ROLE_FX.get(n["role"], {}).get("duck_db") for n in notes.values()):
-        total = np.zeros(max(len(s.audio) for s in leads))
-        for s in leads:
-            total[: len(s.audio)] += np.asarray(s.audio, np.float64) * 10 ** (s.gain_db / 20.0)
-        env = sing_env(total, sr)
-        for n in notes.values():
-            n["lead_env"] = env
-    return notes
+def leads_env(leads, sr: int, n: int) -> np.ndarray | None:
+    """Where the lead sings over ``n`` samples: :func:`sing_env` of the sum of ``leads``, an
+    iterable of ``(mono audio, gain_db)``. None without a lead. What the roles and tracks with
+    a ``duck_db`` duck under."""
+    total = None
+    for audio, gain_db in leads:
+        if total is None:
+            total = np.zeros(n)
+        audio = np.asarray(audio)
+        m = min(n, len(audio))
+        total[:m] += audio[:m].astype(np.float64) * 10 ** (gain_db / 20.0)
+    return None if total is None else sing_env(total, sr)

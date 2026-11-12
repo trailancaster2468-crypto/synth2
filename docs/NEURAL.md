@@ -333,10 +333,18 @@ gaps is not lifted), `crest`; also `bursts` and `expand`. Its output has the inp
 active level. `lift` finds its frames with the spectral-tilt detector; `cons` and `bursts`
 use the periodicity detector unless a stage sets `"detector": "tilt"`.
 
-The backend tells the mixer about a role with `vocal_chain.note_role(track id, audio,
-...)`; the mixer uses the note only for the audio it was left for, so a track sung by the
-formant engine, or with `mix_overrides` `chain: false`, or in a project with
-`master.vocal_chain` off, goes the way it always did.
+The renderer hands every vocal track to the mixer with its role, the engine that sang it,
+the dial it was sung at and, for a double, the role of the track it copies
+(`mixing.Source.vocal_role`, `.engine`, `.dial`, `.copy_of`). The mixer applies a role's
+chain to what an engine of `vocal_chain.ROLE_ENGINES` (the neural engine) sang
+(`vocal_chain.source_role`). A track sung by the formant engine, or with `mix_overrides`
+`chain: false`, or in a project with `master.vocal_chain` off, goes the way it always did.
+
+A track's entry in `master.mix_overrides` may carry `fx`: the in-channel effects
+(`vocal_chain.apply_fx`) `eq` (band specs), `duck_db` (dB down while the tracks with the
+role `lead` sing), `slap` (`{time, level_db, lp}`) and `room` (`{decay, predelay,
+level_db}`). On a track with a role each entry replaces the role's own (`null`: none); on a
+track without one they follow the channel strip, whatever engine sang it.
 
 ### Determinism and the cache
 

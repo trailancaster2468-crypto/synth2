@@ -18,8 +18,8 @@ the full render.
 
 A track in ad-lib mode is sung hit by hit instead of phrase by phrase (``adlib.py``). A
 track with the role ``double`` is not sung when the project has a track for it to double:
-its audio is that track's take over the double's own notes. Every track with a role is
-noted for the mixer (``engine/vocal_chain.py``), which gives it the role's chain.
+its audio is that track's take over the double's own notes. The report names the track's
+role; the mixer (``engine/vocal_chain.py``) gives it the role's chain.
 """
 from __future__ import annotations
 
@@ -175,15 +175,11 @@ class NeuralBackend:
         """Render ``track`` dry over ``[t0, t1)`` seconds: ``int(round((t1 - t0) * sample_rate))``
         samples, the first one at absolute project sample ``int(round(t0 * sample_rate))``.
 
-        A track with a role (``Track.role``) is noted for the mixer, which then gives it the
-        role's chain (``engine/vocal_chain.py``). A ``double`` whose project has a track to
-        double is not sung: its audio is that track's take over the double's notes."""
-        from ..engine import vocal_chain
-
-        audio, report = self._render(project, track, int(sample_rate), t0, t1, note_range)
-        vocal_chain.note_role(track.id, audio, report["role"], report["neural"].get("dial") or vocal_chain.DEFAULT_DIAL,
-                              report["neural"].get("copy_of"))
-        return audio, report
+        The report carries the track's ``role`` (and, for a double, ``neural.copy_of``); the
+        mixer gives a track with a role that role's chain (``engine/vocal_chain.py``). A
+        ``double`` whose project has a track to double is not sung: its audio is that track's
+        take over the double's notes."""
+        return self._render(project, track, int(sample_rate), t0, t1, note_range)
 
     def _render(self, project, track, sr: int, t0: float, t1: float, note_range=None, doubling=()):
         from ..engine import vocal_chain

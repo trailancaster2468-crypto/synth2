@@ -398,3 +398,36 @@ def test_studio_mcp_and_director_take_a_default_engine(auto_engine, monkeypatch,
     assert _run(["studio", "--engine", "formant", "--quality", "draft"]) == 0
     assert _run(["mcp", "--engine", "formant"]) == 0
     assert seen == {"studio": ("formant", "draft"), "mcp": "formant"}
+
+
+# ================================================================== with installed models
+# Real renders: skipped unless onnxruntime and a voicebank are installed (SYNTH2_MODELS names the folder).
+
+def _neural_installed() -> tuple[bool, str]:
+    from synth2 import neural
+
+    return neural.available()
+
+
+needs_models = pytest.mark.skipif(not _neural_installed()[0],
+                                  reason=f"neural engine unavailable: {_neural_installed()[1]}")
+REAL_SCORE = "tempo: 120\ntrack: Lead voice=aurora style=pop lang=en\nr q  C4 q hello  E4 q world  r q\n"
+
+
+@needs_models
+def test_real_neural_render_from_the_command_line(auto_engine, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("SYNTH2_NEURAL_CACHE", "0")
+    score = tmp_path / "real.s2s"
+    score.write_text(REAL_SCORE, encoding="utf-8")
+    out = tmp_path / "real.wav"
+    assert _run(["engines", "--json"]) == 0
+    info = json.loads(capsys.readouterr().out)
+    assert info["neural"]["available"] and info["neural"]["banks"] and info["credits"]
+    assert _run(["render", str(score), "-o", str(out), "--engine", "neural", "--quality", "draft"]) == 0
+    cap = capsys.readouterr()
+    report = json.loads(cap.out)
+    assert report["engines"] == ["neural"] and report["quality"] == "draft" and out.stat().st_size > 10000
+    assert report["credits"] == info["credits"] and report["tracks"][0]["bank"] == info["neural"]["default_bank"]
+    assert "credits (show these when you publish):" in cap.err
+    for line in report["credits"]:
+        assert f"  - {line}" in cap.err

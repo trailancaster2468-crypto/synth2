@@ -34,6 +34,9 @@ SCENARIOS = {
     "color_pick": "a dismissed color picker does not recolor that track on a later pick",
     "noop_commands": "Q / ArrowLeft / Shift+ArrowLeft / reset that change nothing keep the redo stack",
     "merge3_unit": "three-way project merge keeps both sides' edits; the local edit wins conflicts",
+    "engine_controls": "engine, track engine, role and neural voice selectors edit the project (undoable)",
+    "render_credits": "the chosen quality goes with the render; engines, credits and licence notes are shown",
+    "engine_unavailable": "a missing neural engine shows the reason and the install command, also after a 409",
 }
 
 E2E_JS = r"""
@@ -383,6 +386,139 @@ S.merge3_unit = async (page) => {
   const want = { title: 'Mine', tracks: [{ id: 't1', gain_db: -3, notes: [
     { id: 'a', pitch: 61, lyric: 'agent' }, { id: 'c', pitch: 65, lyric: 'c' }, { id: 't', pitch: 72, lyric: 'theirs' }, { id: 'm', pitch: 70, lyric: 'mine' }] }] };
   return { ok: eq(out, want), detail: { out } };
+};
+
+const BANK_CREDIT = 'Vocals: Test Bank (a test voicebank).';
+const VOC_CREDIT = 'Vocoder: Test Vocoder, CC BY-NC 4.0.';
+const NC_NOTE = 'Test Vocoder (vocoder): CC BY-NC 4.0 - commercial use is not allowed';
+const INSTALL = 'pip install "synth2[neural]" && synth2 models install';
+/** What GET /api/engines answers, with the neural engine installed or not. */
+function enginesInfo(available) {
+  const roles = ['lead', 'double', 'harmony', 'answer', 'adlib', 'crowd'].map((id) => ({ id, description: `the ${id} role` }));
+  const banks = available ? [{ id: 'testbank', kind: 'voicebank', name: 'Test Bank', version: '1', license: 'Test terms', commercial_use: true, terms: ['Credit the bank.'], credits: [BANK_CREDIT] }] : [];
+  const vocoders = available ? [{ id: 'testvoc', kind: 'vocoder', name: 'Test Vocoder', version: '1', license: 'CC BY-NC 4.0', commercial_use: false, terms: [], credits: [VOC_CREDIT] }] : [];
+  return {
+    engines: [{ name: 'formant', available: true, description: 'built in' },
+      { name: 'neural', available, description: 'a voicebank', ...(available ? {} : { reason: 'no voicebank is installed in /models', install_hint: INSTALL }) }],
+    choices: ['auto', 'formant', 'neural'], default_engine: available ? 'neural' : 'formant',
+    qualities: ['draft', 'normal', 'high'], quality_notes: { draft: 'fastest', normal: 'between', high: 'slowest' }, default_quality: 'normal',
+    neural: { available, reason: available ? '' : 'no voicebank is installed in /models', install_hint: available ? '' : INSTALL,
+      default_bank: available ? 'testbank' : null, banks, vocoders, commercial_use: available ? false : null, credits: available ? [BANK_CREDIT, VOC_CREDIT] : [] },
+    install_hint: available ? '' : INSTALL, credits: available ? [BANK_CREDIT, VOC_CREDIT] : [], licence_notes: available ? [NC_NOTE] : [], roles,
+  };
+}
+async function stubEngines(page, available) {
+  await page.route('**/api/engines', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(enginesInfo(available)) }));
+}
+const enginesLoaded = (page) => page.waitForFunction(() => window.Synth2App.store.engines);
+
+S.engine_controls = async (page) => {
+  await stubEngines(page, true);
+  await setup(page, TWO_TRACKS());
+  await enginesLoaded(page);
+  await frames(page, 2);
+  const badge = await page.evaluate(() => { const b = document.getElementById('engine-badge'); return { on: b.classList.contains('on'), text: b.textContent, title: b.title }; });
+  const options = await page.evaluate(() => [...document.getElementById('in-engine').options].map((o) => [o.value, o.textContent]));
+  await page.selectOption('#in-engine', 'formant');
+  await settle(page, 400);
+  const p1 = await api('GET', '/api/project');
+  await page.locator('.track-card[data-id="trk2"] select[data-key="role-trk2"]').selectOption('adlib');
+  await settle(page, 400);
+  await page.locator('.track-card[data-id="trk1"] .tc-lbl').first().click();
+  await page.evaluate(() => window.Synth2App.inspector.setTab('track'));
+  await frames(page, 2);
+  await page.selectOption('#insp-body select[data-key="t-engine"]', 'neural');
+  await settle(page, 400);
+  await page.selectOption('#insp-body select[data-key="t-role"]', 'lead');
+  await settle(page, 400);
+  await page.selectOption('#insp-body select[data-key="nv-neural.dial"]', '1');
+  await settle(page, 400);
+  await page.selectOption('#insp-body select[data-key="nv-neural.breaths"]', '0');
+  await settle(page, 400);
+  const p2 = await api('GET', '/api/project');
+  const tags = await page.evaluate(() => [...document.querySelectorAll('.track-card .tc-eng')].map((e) => e.textContent));
+  // one undo takes back the last edit only; the engine choice is an ordinary project edit
+  await page.evaluate(() => window.Synth2App.store.undo());
+  await settle(page, 400);
+  const p3 = await api('GET', '/api/project');
+  await page.selectOption('#in-engine', '');
+  await settle(page, 400);
+  const p4 = await api('GET', '/api/project');
+  const t1 = p2.tracks[0], t2 = p2.tracks[1];
+  const ok = badge.on && /Neural/.test(badge.text) && /testbank/.test(badge.text) && badge.title.includes(NC_NOTE)
+    && eq(options, [['', 'Auto (neural)'], ['formant', 'Formant'], ['neural', 'Neural']])
+    && p1.engine === 'formant'
+    && t2.role === 'adlib' && t1.engine === 'neural' && t1.role === 'lead'
+    && t1.voice_params['neural.dial'] === 1 && t1.voice_params['neural.breaths'] === 0
+    && eq(tags, ['N', 'F'])
+    && !('neural.breaths' in p3.tracks[0].voice_params) && p3.tracks[0].voice_params['neural.dial'] === 1
+    && !('engine' in p4) && p4.tracks[0].engine === 'neural';
+  return { ok, detail: { badge, options, e1: p1.engine, t1: [t1.engine, t1.role, t1.voice_params], t2: t2.role, tags, p3: p3.tracks[0].voice_params, e4: p4.engine } };
+};
+
+S.render_credits = async (page) => {
+  await stubEngines(page, true);
+  await setup(page, [{ name: 'Lead', notes: [note(0, 2, 60, 'la')] }]);
+  await enginesLoaded(page);
+  const bodies = [];
+  await page.route('**/api/render', async (route) => {
+    const body = JSON.parse(route.request().postData() || '{}');
+    bodies.push(body);
+    const report = { start_seconds: 0, duration_s: 1, engines: ['neural'], voicebanks: ['testbank'], quality: body.quality || 'normal',
+      credits: [BANK_CREDIT, VOC_CREDIT], licence_notes: [NC_NOTE], warnings: ["bass: sound set 'x' is not installed; the synthesised preset 'bass_pick' plays instead"], tracks: [] };
+    await route.fulfill({ status: 200, body: wav(1), headers: { 'Content-Type': 'audio/wav', 'X-Render-Report': JSON.stringify(report) } });
+  });
+  const play = () => page.evaluate(async () => { const T = window.Synth2App.transport; await T.play(); T.stop(); });
+  await play();
+  await page.selectOption('#in-quality', 'draft');
+  await play(); // the cached render was made at another quality: it is rendered again
+  await frames(page, 2);
+  const bar = await page.evaluate(() => ({ report: document.getElementById('sb-report').textContent, credits: document.getElementById('sb-credits').textContent, title: document.getElementById('sb-credits').title }));
+  const toasts = await page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent));
+  await page.click('#sb-credits');
+  const modal = await page.evaluate(() => { const m = document.getElementById('credits-modal'); return { open: m && !m.hidden, text: m ? m.textContent : '' }; });
+  const stored = await page.evaluate(() => localStorage.getItem('synth2.quality'));
+  const ok = bodies.length === 2 && !('quality' in bodies[0]) && bodies[1].quality === 'draft' && stored === 'draft'
+    && bar.report.includes('neural (draft)') && bar.report.includes('1 warning(s)')
+    && bar.credits.includes('Credits (2)') && bar.credits.includes('licence limits use') && bar.title.includes(VOC_CREDIT)
+    && toasts.some((t) => t.includes(NC_NOTE)) && toasts.some((t) => t.includes('plays instead'))
+    && modal.open && modal.text.includes(BANK_CREDIT) && modal.text.includes(VOC_CREDIT) && modal.text.includes(NC_NOTE)
+    && modal.text.includes('voicebank testbank') && modal.text.includes('Copy credits');
+  await page.evaluate(() => localStorage.removeItem('synth2.quality'));
+  return { ok, detail: { bodies, bar, toasts, modal, stored } };
+};
+
+S.engine_unavailable = async (page) => {
+  await stubEngines(page, false);
+  await setup(page, [{ name: 'Lead', notes: [note(0, 2, 60, 'la')] }]);
+  await enginesLoaded(page);
+  await frames(page, 2);
+  const badge = await page.evaluate(() => { const b = document.getElementById('engine-badge'); return { off: b.classList.contains('off'), text: b.textContent, title: b.title }; });
+  const options = await page.evaluate(() => [...document.getElementById('in-engine').options].map((o) => o.textContent));
+  await page.selectOption('#in-engine', 'neural'); // allowed: the project may be rendered elsewhere
+  await settle(page, 400);
+  await frames(page, 2);
+  const tag = await page.evaluate(() => { const e = document.querySelector('.track-card .tc-eng'); return [e.textContent, e.classList.contains('missing')]; });
+  await page.route('**/api/render', (route) => route.fulfill({
+    status: 409, contentType: 'application/json',
+    body: JSON.stringify({ error: `the neural engine was requested but is not available: no voicebank is installed. Install it with: ${INSTALL} (or use engine=formant)`, install_hint: INSTALL, engine_unavailable: true }),
+  }));
+  await page.evaluate(async () => { await window.Synth2App.transport.play(); });
+  await frames(page, 2);
+  const after = await page.evaluate(() => ({
+    toasts: [...document.querySelectorAll('#toasts .toast.err')].map((t) => t.textContent),
+    status: document.getElementById('sb-msg').textContent, err: document.getElementById('sb-msg').classList.contains('err'),
+    rendering: window.Synth2App.transport.rendering,
+  }));
+  await page.click('#engine-badge');
+  await page.waitForSelector('#engines-modal #engine-install');
+  const modal = await page.evaluate(() => ({ install: document.getElementById('engine-install').textContent, text: document.getElementById('engines-modal').textContent }));
+  const ok = badge.off && badge.text.includes('not installed') && badge.title.includes(INSTALL)
+    && eq(options, ['Auto (formant)', 'Formant', 'Neural (not installed)'])
+    && eq(tag, ['N', true])
+    && after.toasts.some((t) => t.includes('not available') && t.includes(INSTALL)) && after.err && !after.rendering
+    && modal.install === INSTALL && modal.text.includes('no voicebank is installed') && modal.text.includes('synth2 sounds install');
+  return { ok, detail: { badge, options, tag, after, modal } };
 };
 
 (async () => {

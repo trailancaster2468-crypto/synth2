@@ -214,3 +214,48 @@ def test_pitch_accuracy_folds_octave_errors_per_frame():
     finally:
         analysis.estimate_f0 = orig
     assert out["max_abs_cents"] < 5
+
+
+def test_a_project_remembers_its_file(tmp_path):
+    from synth2.io import load_any
+
+    p = Project.new("x", bpm=100)
+    assert p.path is None and "path" not in p.to_dict()
+    f = tmp_path / "song.s2p.json"
+    p.save(f)
+    assert p.path == str(f.resolve()) and "path" not in f.read_text()
+    for q in (Project.load(f), load_any(f), load_any(str(f))):
+        assert q.path == str(f.resolve()) and q.to_dict() == p.to_dict()
+    assert p.copy().path == p.path and Project.from_dict(p.to_dict()).path is None
+    other = Project.new("x", bpm=100)
+    other.tracks[0].id = p.tracks[0].id
+    assert other.to_dict() == p.to_dict() and other == p  # where a project lives is not part of what it is
+    score = tmp_path / "tune.s2s"
+    score.write_text("tempo: 120\ntrack: A\nC4 q la\n", encoding="utf-8")
+    assert Project.load(score).path == str(score.resolve())
+
+
+def test_relative_sound_paths_resolve_next_to_the_project_file(tmp_path, monkeypatch):
+    from synth2.arranger import soundbank
+    from synth2.io.wav import write_wav
+
+    (tmp_path / "song" / "samples").mkdir(parents=True)
+    t = np.arange(4000) / 22050
+    write_wav(tmp_path / "song" / "samples" / "ping_C4.wav", 0.5 * np.sin(2 * np.pi * 262 * t) * np.exp(-t * 20), 22050)
+    p = Project.new("x", bpm=120)
+    p.backing = {"instruments": {"keys": {"preset": "piano", "sound": "samples/ping_C4.wav"}},
+                 "patterns": {"hold": {"kind": "chords", "rhythm": "x---------------"}},
+                 "sections": [{"name": "A", "bars": 1, "chords": ["C"], "parts": {"keys": "hold"}}]}
+    f = tmp_path / "song" / "song.s2p.json"
+    p.save(f)
+    monkeypatch.chdir(tmp_path)  # not the project's folder
+    loaded = Project.load(f)
+    dirs = soundbank.project_dirs(loaded, loaded.backing)
+    assert dirs[0] == str((tmp_path / "song").resolve())
+    assert soundbank.find_path("samples/ping_C4.wav", dirs) is not None
+    from synth2 import arranger
+
+    assert arranger.sound_report(loaded)["instruments"]["keys"]["plays"] == "sampled"
+    assert arranger.sound_report(Project.from_dict(loaded.to_dict()))["instruments"]["keys"]["plays"] == "synth"
+    fresh = Project.from_dict(loaded.to_dict())  # no file: only the working directory is searched
+    assert soundbank.find_path("samples/ping_C4.wav", soundbank.project_dirs(fresh, fresh.backing)) is None

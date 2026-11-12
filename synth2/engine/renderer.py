@@ -8,7 +8,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 import numpy as np
 
@@ -42,8 +42,10 @@ class RenderResult:
     audio: np.ndarray
     sample_rate: int
     # per track: post-fader and pre-reverb, with the master's normalisation and gain (so they sum to
-    # the dry master), turned down together by report["stems_gain_db"] if one would clip
-    stems: dict[str, np.ndarray] = field(default_factory=dict)
+    # the dry master), turned down together by report["stems_gain_db"] if one would clip. A mapping
+    # key -> (n, 2) float32; a render returns a mixing.StemStore, which builds a stem's array when
+    # it is read
+    stems: Mapping[str, np.ndarray] = field(default_factory=dict)
     report: dict = field(default_factory=dict)
     start_seconds: float = 0.0
 
@@ -269,11 +271,6 @@ def _backing_api(project: Project) -> tuple[Callable | None, Callable | None, Ca
     return render_backing, kick_times, song_length_seconds, None
 
 
-def _peak(x: np.ndarray) -> float:
-    """max |x| without a temporary array."""
-    return float(max(x.max(), -x.min())) if x.size else 0.0
-
-
 def _rms(x: np.ndarray) -> float:
     if not x.size:
         return 0.0
@@ -454,18 +451,20 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
         for c in rep.get("credits") or []:
             if c not in credits:
                 credits.append(c)
-        mono = np.asarray(mono, dtype=np.float64)[: n_pre + n_voice]
+        mono = np.asarray(mono, dtype=np.float32)[: n_pre + n_voice]
         if end_beat is not None and n_fade:
             a = n_pre + n_voice - n_fade
             mono = mono.copy()
-            mono[a:a + n_fade] *= fade_out[: max(0, len(mono) - a)]
-        buf = np.zeros(n_all)
-        buf[: len(mono)] = mono
+            mono[a:a + n_fade] = mono[a:a + n_fade] * fade_out[: max(0, len(mono) - a)]
         low = min(n.pitch + float(n.attrs.get("detune", 0) or 0) / 100 for n in tr.notes)
+        neural = rep.get("neural") if isinstance(rep.get("neural"), dict) else {}
         sources.append(mixing.Source(
-            key=tr.id, name=tr.name, kind="vocal", audio=buf, gain_db=tr.gain_db, pan=tr.pan,
-            reverb_send=tr.reverb_send, delay_send=1.0, lowest_hz=440.0 * 2 ** ((low - 69) / 12.0),
-            overrides=_overrides(mo, tr.id, tr.name)))
+            key=tr.id, name=tr.name, kind="vocal", audio=mixing.Sparse.from_dense(mono, length=n_all),
+            gain_db=tr.gain_db, pan=tr.pan, reverb_send=tr.reverb_send, delay_send=1.0,
+            lowest_hz=440.0 * 2 ** ((low - 69) / 12.0), overrides=_overrides(mo, tr.id, tr.name),
+            engine=str(rep["engine"]), vocal_role=str(getattr(tr, "role", "") or ""),
+            dial=str(neural.get("dial") or ""), copy_of=neural.get("copy_of") or None))
+        del mono
         rep.update({"gain_db": tr.gain_db, "pan": tr.pan})
         track_reports.append(rep)
         ends = [n.end for n in tr.notes if n.onset < end_b]
@@ -478,18 +477,21 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
             progress(0.8, "rendering backing")
         t1 = render0 + n_all / sr
         used = {s.key for s in sources}
-        for st in render_backing(project, sr, render0, t1) or []:
-            audio = np.asarray(getattr(st, "audio"), dtype=np.float64)
+        band = list(render_backing(project, sr, render0, t1) or [])
+        band.reverse()
+        while band:  # each stem is let go once the mixer's copy is made
+            st = band.pop()
+            audio = np.asarray(getattr(st, "audio"), dtype=np.float32)
             if audio.ndim == 1:
                 audio = np.stack([audio, audio], axis=1)
-            buf = np.zeros((n_all, 2))
-            m = min(n_all, len(audio))
-            buf[:m] = audio[:m, :2] if audio.shape[1] >= 2 else audio[:m, :1]
+            elif audio.shape[1] != 2:
+                audio = audio[:, :2] if audio.shape[1] > 2 else np.repeat(audio[:, :1], 2, axis=1)
+            audio = audio[:n_all]
             if end_beat is not None:  # the band stops with the region, like the vocals
                 a = n_pre + n_voice - n_fade
+                audio = audio[: n_pre + n_voice].copy()
                 if n_fade:
-                    buf[a:a + n_fade] *= fade_out[:, None][: max(0, n_all - a)]
-                buf[n_pre + n_voice:] = 0.0
+                    audio[a:a + n_fade] = audio[a:a + n_fade] * fade_out[:, None][: max(0, len(audio) - a)]
             name = str(getattr(st, "name", "") or "backing")
             role = str(getattr(st, "role", "keys") or "keys")
             key, j = name, 2
@@ -497,12 +499,21 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
                 key, j = f"{name}_{j}", j + 1
             used.add(key)
             src = mixing.Source(
-                key=key, name=name, kind="backing", audio=buf, role=role,
+                key=key, name=name, kind="backing", audio=mixing.Sparse.from_dense(audio, length=n_all), role=role,
                 gain_db=float(getattr(st, "gain_db", 0.0) or 0.0), pan=float(getattr(st, "pan", 0.0) or 0.0),
                 sidechain=bool(getattr(st, "sidechain", False)), overrides=_overrides(mo, role, name))
             sources.append(src)
-            backing_reports.append({"name": key, "role": role, "gain_db": src.gain_db, "pan": src.pan,
-                                    "sidechain": src.sidechain})
+            entry = {"name": key, "role": role, "gain_db": src.gain_db, "pan": src.pan, "sidechain": src.sidechain}
+            if getattr(st, "sound", ""):
+                entry["sound"] = str(st.sound)
+            backing_reports.append(entry)
+            for w in getattr(st, "warnings", None) or ():
+                if w not in warnings_extra:
+                    warnings_extra.append(str(w))
+            for c in getattr(st, "credits", None) or ():
+                if c not in credits:
+                    credits.append(str(c))
+            del st, audio
         if backing_end_b is not None and end_beat is None:
             last_end = max(last_end, b2s(backing_end_b))
     band_mode = any(s.kind == "backing" for s in sources)
@@ -515,17 +526,17 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
     level_key = _level_key(project, sr, engine) if mastered else None
     fixed = _LEVEL_CACHE.get(level_key) if (mastered and partial) else None
     mix = mixing.mix_sources(sources, sr, band_mode=band_mode, settings=ms, kicks=kicks_abs - render0, bpm=bpm,
-                             reverb_room=room, reverb_wet=ms.reverb_wet if reverb_tail > 0 else 0.0, fixed=fixed)
+                             reverb_room=room, reverb_wet=ms.reverb_wet if reverb_tail > 0 else 0.0, fixed=fixed,
+                             consume=True)
     stems = mix.stems
     master = (mix.dry + mix.wet)[n_pre:]
-    stems = {k: v[n_pre:] for k, v in stems.items()}
+    stems.crop(n_pre)
     del sources
     if start_beat is not None and start_sec > 0:  # the region may start inside a note: no click
         n_in = min(int(round(REGION_FADE_IN * sr)), len(master))
         ramp = np.linspace(0.0, 1.0, n_in, endpoint=False)[:, None]
         master[:n_in] *= ramp
-        for k in stems:  # (views of this render's own buffers)
-            stems[k][:n_in] *= ramp.astype(np.float32)
+        stems.scale(np.concatenate([ramp[:, 0], np.ones(len(master) - n_in)]).astype(np.float32))
 
     if progress:
         progress(0.92, "mastering")
@@ -546,10 +557,7 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
         mix_info["levels_from_full_render"] = fixed is not None
         for k in _LEVEL_KEYS:
             mix_info[k] = mixing._r(mix_info.get(k))
-        sg = stem_gain.astype(np.float32)[:, None]
-        for k in stems:  # the stems are this render's own float32 buffers: scale in place
-            stems[k] = np.multiply(stems[k], sg, out=stems[k] if stems[k].dtype == np.float32 else None)
-        del sg
+        stems.scale(stem_gain.astype(np.float32))
         norm_db = minfo.get("master_gain_db") or 0.0
     else:
         # normalisation sets the reference level (full renders only, with a gain limit), then the master
@@ -561,16 +569,14 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
         norm_db = 20 * np.log10(gain)
         gain *= 10 ** (ms.gain_db / 20.0)
         master = master * gain
-        for v in stems.values():
-            v *= np.float32(gain)
+        stems.scale(gain)
         if ms.limiter:
             master = mixing.limit(master, sr, LEGACY_CEILING_DB)
     # stems are not limited: if one would clip, all of them are turned down by the same amount
-    stem_peak = max((_peak(v) for v in stems.values()), default=0.0)
+    stem_peak = stems.peak()
     stem_gain = 1.0 / stem_peak if stem_peak > 1.0 else 1.0
     if stem_gain != 1.0:
-        for v in stems.values():
-            v *= np.float32(stem_gain)
+        stems.scale(stem_gain)
     # trim the silent tail (relative to the peak, so a quiet mix keeps its reverb), but never before
     # the release of the last note
     if master.size:
@@ -581,8 +587,7 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
         floor = int(round((min(last_end + 0.1, voice_end) - start_sec) * sr))
         keep = min(len(master), max(keep, floor))
         master = master[:keep]
-        stems = {k: v[:keep] for k, v in stems.items()}
-    stems = {k: np.ascontiguousarray(v, dtype=np.float32) for k, v in stems.items()}
+        stems.crop(0, keep)
     master = master.astype(np.float32)
 
     # ---- metering
@@ -592,9 +597,9 @@ def _render_project(project: Project, sample_rate, track_ids, start_beat, end_be
         tp = mixing.true_peak(master) if master.size else 0.0
     names = {r["id"]: r["name"] for r in track_reports}
     stem_levels = []
-    for k, v in stems.items():
+    for k in stems:
         stem_levels.append({"key": k, "name": names.get(k, k), "group": mix.groups.get(k, "vocal"),
-                            "peak_db": _db(_peak(v)), "rms_db": _db(_rms(v))})
+                            "peak_db": _db(stems.peak(k)), "rms_db": _db(stems.rms(k))})
     elapsed = time.perf_counter() - t_start
     dur = len(master) / sr
     report = {

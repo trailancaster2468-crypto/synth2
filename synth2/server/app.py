@@ -51,6 +51,7 @@ Run it with ``python -m synth2.server.app --port 8765 --project song.s2p.json``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import ipaddress
 import json
@@ -76,6 +77,7 @@ STATIC_DIR = Path(__file__).resolve().with_name("static")
 MAX_BODY = 64 * 1024 * 1024  # imports can be large MusicXML/MIDI files
 HISTORY_LIMIT = 200
 RENDER_MARGIN_BEATS = 32.0  # render ranges are clamped to the song length plus this much
+UNLOCKED_TOOLS = ("render",)  # tools that run on a snapshot of the project and change nothing in it
 MIN_BPM, MAX_BPM = 20.0, 400.0  # same range as the new_project tool and the studio's tempo field
 
 SAFE_METHODS = ("GET", "HEAD")
@@ -523,11 +525,12 @@ def engine_args(engine=None, quality=None) -> tuple[str | None, str | None]:
 
 
 def render_wav(project: Project, start_beat=None, end_beat=None, track_ids=None, engine=None, quality=None,
-               progress=None) -> tuple[bytes, dict, Any]:
+               progress=None, started=None) -> tuple[bytes, dict, Any]:
     """Render ``project`` and return ``(wav bytes, report, RenderResult)``.
 
     ``engine`` and ``quality`` are those of :func:`synth2.engine.render_project`; ``progress`` is called
-    with ``(fraction, message)`` while the render runs. One render runs at a time in the process."""
+    with ``(fraction, message)`` while the render runs. One render runs at a time in the process:
+    ``started`` is called when this one's turn has come."""
     from ..engine import render_project
 
     kwargs = {}
@@ -546,6 +549,8 @@ def render_wav(project: Project, start_beat=None, end_beat=None, track_ids=None,
     if progress is not None:
         kwargs["progress"] = progress
     with _render_lock():
+        if started is not None:
+            started()
         res = render_project(project, **kwargs)
     fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="synth2-render-")
     os.close(fd)
@@ -696,7 +701,7 @@ def export_project(project: Project, fmt: str) -> tuple[bytes, str, str]:
     """Export ``project`` to ``fmt``; returns ``(data, filename, mime)``."""
     fmt = (fmt or "json").lower().lstrip(".")
     if fmt not in EXPORT_FORMATS:
-        raise ValueError(f"unknown export format {fmt!r}; use one of: svp, mid, musicxml, ust, s2s, json")
+        raise ValueError(f"unknown export format {fmt!r}; use one of: svp, mid, musicxml, ust, s2s, json, wav")
     ext, mime = EXPORT_FORMATS[fmt]
     base = re.sub(r"[^A-Za-z0-9 _.-]+", "", project.title or "").strip() or "untitled"
     filename = base.replace(" ", "_") + ext
@@ -780,7 +785,8 @@ def save_project(project: Project, path: str) -> str:
 # HTTP handler
 # --------------------------------------------------------------------------
 class HttpError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, **extra):
+        self.extra = extra
         super().__init__(message)
         self.status = status
         self.message = message
@@ -955,7 +961,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             else:
                 raise HttpError(404, f"not found: {route}")
         except HttpError as exc:
-            self.send_error_json(exc.status, exc.message)
+            self.send_error_json(exc.status, exc.message, **getattr(exc, "extra", {}))
         except BrokenPipeError:  # client went away
             pass
         except Exception as exc:  # pragma: no cover - unexpected server error
@@ -1093,7 +1099,10 @@ class StudioHandler(BaseHTTPRequestHandler):
             raise HttpError(400, "'args' must be an object")
         st = self.state
         errors = _tool_error_types()
-        with st.lock:
+        # a render works on a snapshot (the tool layer takes the session lock only to copy the project), so a
+        # long one does not hold up the other requests; every other tool runs under the project lock
+        lock = contextlib.nullcontext() if name in UNLOCKED_TOOLS else st.lock
+        with lock:
             try:
                 result = call_session_tool(st.session, name, args)
             except ToolUnavailable as exc:
@@ -1104,7 +1113,8 @@ class StudioHandler(BaseHTTPRequestHandler):
             except (ValueError, KeyError, LookupError, TypeError, OSError) as exc:  # OSError: save/export paths
                 self.send_error_json(400, f"{exc.__class__.__name__}: {exc}", tool=name)
                 return
-            st.touch()
+            if name not in UNLOCKED_TOOLS:
+                st.touch()
         self.send_json(result)
 
     # ---- API: meta / phonemes / lyrics --------------------------------
@@ -1129,6 +1139,69 @@ class StudioHandler(BaseHTTPRequestHandler):
         self.send_json({"tokens": tokens})
 
     # ---- API: render ---------------------------------------------------
+    def _render(self, project: Project, start, end, track_ids, engine, quality) -> tuple[bytes, dict]:
+        """Render ``project`` for a request: ``(wav bytes, report)``, recorded as the last render.
+
+        Runs outside the project lock, so the studio keeps answering while a long (neural) render is under
+        way; renders themselves run one at a time and ``/api/render/status`` shows the one that runs. An
+        engine that cannot run here is a 409 whose body carries the ``install_hint``."""
+        st = self.state
+        try:
+            import importlib
+
+            importlib.import_module("synth2.engine.renderer")
+            from ..engine.backend import EngineUnavailable
+        except ImportError as exc:
+            raise HttpError(503, f"render engine unavailable: {exc}")
+
+        def progress(fraction, message):
+            st.set_render_status(fraction=round(float(fraction), 3), message=str(message))
+
+        t0 = time.perf_counter()
+        st.render_waiting(+1)
+        claimed = False
+        try:
+            def started():  # this render's turn has come
+                nonlocal claimed
+                claimed = True
+                st.render_waiting(-1)
+                st.set_render_status(active=True, started=time.time(), fraction=0.0, message="starting",
+                                     engine=engine or "auto", quality=quality, start_beat=start, end_beat=end)
+
+            try:
+                data, report, res = render_wav(project, start, end, track_ids, engine, quality,
+                                               progress=progress, started=started)
+            except EngineUnavailable as exc:
+                raise HttpError(409, str(exc), install_hint=engines_payload().get("install_hint") or "",
+                                engine_unavailable=True)
+            except (ValueError, KeyError, LookupError) as exc:
+                raise HttpError(400, f"render failed: {exc}")
+        finally:
+            if not claimed:
+                st.render_waiting(-1)
+            else:
+                st.set_render_status(active=False, fraction=None, message="")
+        report.setdefault("render_time_s", round(time.perf_counter() - t0, 3))
+        report["start_beat"] = start
+        report["end_beat"] = end
+        add_render_notes(project, report, quality)
+        with st.lock:
+            st.last_wav = data
+            st.last_report = report
+            _record_render(st.session, project, res, start, end, engine, quality)
+        return data, report
+
+    @staticmethod
+    def _header_report(report: dict) -> str:
+        slim = copy.deepcopy(report)
+        for tr in slim.get("tracks", []) or []:
+            if isinstance(tr, dict):
+                tr.pop("phonemes", None)  # large; the studio gets phonemes from /api/phonemes
+                if isinstance(tr.get("neural"), dict):
+                    for k in ("alignment", "hits", "preset", "seconds"):
+                        tr["neural"].pop(k, None)
+        return report_header(slim)
+
     def api_render(self):
         body = self.read_json()
         st = self.state
@@ -1136,34 +1209,73 @@ class StudioHandler(BaseHTTPRequestHandler):
             project = st.project.copy()
         try:
             start, end, track_ids = render_args(project, body.get("start_beat"), body.get("end_beat"), body.get("track_ids"))
+            engine, quality = engine_args(body.get("engine"), body.get("quality"))
         except ValueError as exc:
             raise HttpError(400, str(exc))
-        try:
-            import importlib
-
-            importlib.import_module("synth2.engine.renderer")
-        except ImportError as exc:
-            raise HttpError(503, f"render engine unavailable: {exc}")
-        t0 = time.perf_counter()
-        try:
-            data, report, res = render_wav(project, start, end, track_ids)
-        except (ValueError, KeyError, LookupError) as exc:
-            raise HttpError(400, f"render failed: {exc}")
-        report.setdefault("render_time_s", round(time.perf_counter() - t0, 3))
-        report["start_beat"] = start
-        report["end_beat"] = end
-        header_report = copy.deepcopy(report)
-        for tr in header_report.get("tracks", []) or []:
-            if isinstance(tr, dict):
-                tr.pop("phonemes", None)  # large; the studio gets phonemes from /api/phonemes
-        with st.lock:
-            st.last_wav = data
-            st.last_report = report
-            _record_render(st.session, project, res, start, end)
+        data, report = self._render(project, start, end, track_ids, engine, quality)
         self._send(200, data, "audio/wav", {
-            "X-Render-Report": report_header(header_report),
+            "X-Render-Report": self._header_report(report),
             "Content-Disposition": 'inline; filename="render.wav"',
         })
+
+    def api_render_status(self):
+        self.send_json(self.state.get_render_status())
+
+    def api_render_report(self):
+        with self.state.lock:
+            report = self.state.last_report
+        if report is None:
+            raise HttpError(404, "nothing rendered yet")
+        slim = copy.deepcopy(report)
+        for tr in slim.get("tracks", []) or []:
+            if isinstance(tr, dict):
+                tr.pop("phonemes", None)
+        self.send_json(slim)
+
+    # ---- API: engines and sounds ---------------------------------------
+    def api_engines(self):
+        try:
+            out = engines_payload()
+        except ImportError as exc:
+            raise HttpError(501, f"tool layer unavailable: {exc}")
+        with self.state.lock:
+            project = self.state.project.copy()
+        try:
+            from ..ai.tools import resolved_engines
+
+            out["project"] = {"engine": project.engine or "auto", "tracks": resolved_engines(project)}
+        except Exception:  # pragma: no cover - never fail the status call over the project
+            pass
+        self.send_json(out)
+
+    def api_sounds(self):
+        """Installed sound sets (``?set=<id>`` lists one set's presets, filtered by ``search``), where they
+        live, how to install more, and which sounds the project's backing band plays."""
+        args: dict = {}
+        if self.query.get("set"):
+            args["set"] = self.query["set"]
+        if self.query.get("search"):
+            args["search"] = self.query["search"]
+        if self.query.get("limit"):
+            try:
+                args["limit"] = max(1, min(500, int(self.query["limit"])))
+            except ValueError:
+                raise HttpError(400, "limit must be a number") from None
+        try:
+            from .. import sounds
+            from ..ai.tools import Session, call_tool
+        except ImportError as exc:
+            raise HttpError(501, f"sound sets unavailable: {exc}")
+        with self.state.lock:
+            project = self.state.project.copy()
+        errors = _tool_error_types()
+        try:
+            out = call_tool(Session(project, getattr(self.state.session, "path", None)), "list_sounds", args)
+        except errors as exc:  # type: ignore[misc]
+            raise HttpError(404 if "set" in args else 400, str(exc))
+        out["sounds_dir"] = str(sounds.sounds_dir())
+        out["install_hint"] = "synth2 sounds list   (what is offered)   synth2 sounds install <id>"
+        self.send_json(out)
 
     def api_render_last(self):
         with self.state.lock:
@@ -1172,7 +1284,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         if not data:
             raise HttpError(404, "nothing rendered yet")
         self._send(200, data, "audio/wav", {
-            "X-Render-Report": report_header(report or {}),
+            "X-Render-Report": self._header_report(report or {}),
             "Content-Disposition": 'attachment; filename="render.wav"',
         })
 
@@ -1260,6 +1372,17 @@ class StudioHandler(BaseHTTPRequestHandler):
         fmt = self.query.get("format") or "json"
         with self.state.lock:
             project = self.state.project.copy()
+        if fmt.lower().lstrip(".") == "wav":  # the audio itself: a full render with the chosen engine and quality
+            try:
+                engine, quality = engine_args(self.query.get("engine"), self.query.get("quality"))
+            except ValueError as exc:
+                raise HttpError(400, str(exc))
+            data, report = self._render(project, None, None, None, engine, quality)
+            base = re.sub(r"[^A-Za-z0-9 _.-]+", "", project.title or "").strip() or "untitled"
+            self._send(200, data, "audio/wav", {
+                "X-Render-Report": self._header_report(report),
+                "Content-Disposition": f'attachment; filename="{_ascii(base.replace(" ", "_"))}.wav"'})
+            return
         try:
             data, filename, mime = export_project(project, fmt)
         except ValueError as exc:
@@ -1427,6 +1550,10 @@ ROUTES = {
     ("POST", "/api/split_lyrics"): StudioHandler.api_split_lyrics,
     ("POST", "/api/render"): StudioHandler.api_render,
     ("GET", "/api/render/last"): StudioHandler.api_render_last,
+    ("GET", "/api/render/status"): StudioHandler.api_render_status,
+    ("GET", "/api/render/report"): StudioHandler.api_render_report,
+    ("GET", "/api/engines"): StudioHandler.api_engines,
+    ("GET", "/api/sounds"): StudioHandler.api_sounds,
     ("POST", "/api/ai"): StudioHandler.api_ai,
     ("POST", "/api/import"): StudioHandler.api_import,
     ("GET", "/api/export"): StudioHandler.api_export,

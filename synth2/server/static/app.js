@@ -250,6 +250,10 @@ const Api = {
   splitLyrics: (text, language) => Api.request('POST', '/api/split_lyrics', { text, language }),
   ai: (message, reset = false) => Api.request('POST', '/api/ai', { message, reset }),
   importFile: (name, buf) => Api.request('POST', '/api/import?filename=' + encodeURIComponent(name), buf),
+  engines: () => Api.request('GET', '/api/engines'),
+  sounds: () => Api.request('GET', '/api/sounds'),
+  renderStatus: () => Api.request('GET', '/api/render/status'),
+  renderReport: () => Api.request('GET', '/api/render/report'),
   async render(opts) {
     const res = await Api.request('POST', '/api/render', opts, { raw: true });
     let report = {};
@@ -265,6 +269,35 @@ const Api = {
   },
 };
 
+/* ================================================================ engines */
+const ROLE_LABELS = { lead: 'Lead', double: 'Double', harmony: 'Harmony', answer: 'Answer', adlib: 'Ad-lib', crowd: 'Crowd' };
+const QUALITIES = ['draft', 'normal', 'high'];
+/** The role name of a track's role text ('double:Lead' -> 'double', 'ad-lib' -> 'adlib'). */
+function roleName(role) {
+  return String(role || '').split(':')[0].trim().toLowerCase().replace(/[-_ ]/g, '');
+}
+function engineLabel(spec) {
+  if (!spec || spec === 'auto') return 'Auto';
+  if (spec === 'formant') return 'Formant';
+  if (spec === 'neural') return 'Neural';
+  return spec.startsWith('neural:') ? `Neural (${spec.slice(7)})` : spec;
+}
+/** Options of an engine selector: [value, label] with '' = the inherited choice, labelled `autoLabel`. */
+function engineOptions(info, current, autoLabel) {
+  const neural = info && info.neural;
+  const missing = neural && !neural.available ? ' (not installed)' : '';
+  const opts = [['', autoLabel], ['formant', 'Formant'], ['neural', 'Neural' + missing]];
+  const banks = (neural && neural.banks) || [];
+  if (banks.length > 1) for (const b of banks) opts.push([`neural:${b.id}`, `Neural (${b.id})`]);
+  if (current && !opts.some(([v]) => v === current)) opts.push([current, engineLabel(current)]);
+  return opts;
+}
+/** What `spec` ('' = auto) resolves to on the server, as a short word for labels. */
+function resolvedEngine(info, spec) {
+  if (spec && spec !== 'auto') return spec.split(':')[0];
+  return (info && info.default_engine ? info.default_engine : 'formant').split(':')[0];
+}
+
 /* ================================================================== Store */
 function normalizeProject(p) {
   p = p || {};
@@ -275,8 +308,11 @@ function normalizeProject(p) {
   p.master = p.master || {};
   p.metadata = p.metadata || {};
   p.key = p.key || 'C major';
+  p.engine = p.engine || '';
   for (const t of p.tracks) {
     t.id = t.id || newId();
+    t.engine = t.engine || '';
+    t.role = t.role || '';
     t.notes = Array.isArray(t.notes) ? t.notes : [];
     t.curves = t.curves || {};
     for (const [k, c] of Object.entries(t.curves)) {
@@ -356,6 +392,9 @@ class Store {
     this.dirty = false;
     this.busy = false;
     this.path = null;
+    this.engines = null; // GET /api/engines: what can sing on the server, voicebanks, credits, roles
+    this.quality = ''; // render quality sent with every render ('' = the server's default)
+    try { this.quality = localStorage.getItem('synth2.quality') || ''; } catch { /* storage unavailable */ }
     this.view = { ppb: 80, scrollX: 0 };
     this._listeners = {};
     this._saveTimer = null;
@@ -2049,6 +2088,9 @@ class TrackList {
     this.host = host;
     this.guard = new PressGuard(host, () => this.render());
     for (const ev of ['project', 'tracks']) store.on(ev, () => this.render());
+    // the engine tags follow the project's engine and the server's engine status without a rebuild of the
+    // cards (a rebuild would drop what is being typed into a track's name)
+    for (const ev of ['song', 'engines']) store.on(ev, () => this.updateEngineTags());
     store.on('selection', () => this.markActive());
     $('#btn-add-track').addEventListener('click', () => this.addTrack());
   }
@@ -2089,7 +2131,15 @@ class TrackList {
         ...meta.styles.map((s) => el('option', { value: s.name, selected: s.name === t.style }, s.name)));
       if (!meta.styles.some((s) => s.name === t.style)) style.append(el('option', { value: t.style, selected: true }, t.style));
       style.addEventListener('change', () => { t.style = style.value; this.s.commit('tracks'); });
+      const rn = roleName(t.role);
+      const role = el('select', { class: 'tc-role', title: 'Role in the mix: how the neural engine sings the track and where the mixer puts it', dataset: { key: 'role-' + t.id } },
+        el('option', { value: '', selected: !t.role }, 'no role'),
+        ...Object.entries(ROLE_LABELS).map(([v, l]) => el('option', { value: v, selected: t.role === v }, l)));
+      if (t.role && !ROLE_LABELS[t.role]) role.append(el('option', { value: t.role, selected: true }, ROLE_LABELS[rn] ? `${ROLE_LABELS[rn]} of ${t.role.split(':').slice(1).join(':')}` : t.role));
+      role.addEventListener('change', () => { t.role = role.value; this.s.commit('tracks'); });
       card.append(el('div', { class: 'tc-row' }, voice, style));
+      card.append(el('div', { class: 'tc-row' }, el('span', { class: 'tc-lbl' }, 'Role'), role));
+      card.firstChild.insertBefore(this.setEngineTag(el('span'), t), mute);
 
       const commit = () => this.s.commit('tracks');
       card.append(makeSlider('Vol', t.gain_db ?? 0, { min: -36, max: 12, step: 0.5, def: 0, fmt: fmtDb, set: (v) => { t.gain_db = v; }, key: 'gain-' + t.id, onCommit: commit }));
@@ -2097,6 +2147,23 @@ class TrackList {
       this.host.append(card);
     });
     if (keepFocus) { const f = this.host.querySelector(`[data-key="${keepFocus}"]`); if (f) f.focus(); }
+  }
+  /** Fill a track's engine tag: N or F for the engine that sings it, amber when that engine is missing. */
+  setEngineTag(tag, t) {
+    const info = this.s.engines;
+    const sung = resolvedEngine(info, t.engine || this.s.project.engine || '');
+    const missing = sung === 'neural' && info && info.neural && !info.neural.available;
+    tag.className = 'tc-eng' + (sung === 'neural' ? ' neural' : '') + (missing ? ' missing' : '');
+    tag.title = missing ? 'This track asks for the neural engine, which is not installed: rendering will fail (see the engine badge)'
+      : `Sung by the ${sung} engine` + (t.engine ? ' (set on this track)' : '');
+    tag.textContent = sung === 'neural' ? 'N' : 'F';
+    return tag;
+  }
+  updateEngineTags() {
+    for (const card of this.host.querySelectorAll('.track-card')) {
+      const t = this.s.trackById(card.dataset.id), tag = card.querySelector('.tc-eng');
+      if (t && tag) this.setEngineTag(tag, t);
+    }
   }
   markActive() {
     const id = this.s.track && this.s.track.id;
@@ -2170,7 +2237,7 @@ class Inspector {
     });
     this.guard = new PressGuard(host, () => this.render());
     this._shown = { phonemes: null, history: null };
-    for (const ev of ['project', 'notes', 'tracks', 'song', 'selection']) store.on(ev, () => this.schedule());
+    for (const ev of ['project', 'notes', 'tracks', 'song', 'selection', 'engines']) store.on(ev, () => this.schedule());
     // Phoneme refreshes and history updates follow every edit; rebuild only when they change what is shown.
     store.on('phonemes', () => { if (this.phonemeKey() !== this._shown.phonemes) this.schedule(); });
     store.on('history', () => { if (this.historyKey() !== this._shown.history) this.schedule(); });
@@ -2356,6 +2423,32 @@ class Inspector {
     H.append(...this.field('Style', this.select('t-style', meta.styles.map((s) => [s.name, s.name]), t.style, (v) => { t.style = v; commit(); }),
       { desc: style ? style.description : '' }));
     H.append(...this.field('Language', this.select('t-lang', (meta.languages || [{ id: 'en', name: 'English' }]).map((l) => [l.id, l.name]), t.language, (v) => { t.language = v; commit(); })));
+    const info = this.s.engines;
+    const projEngine = this.s.project.engine || '';
+    const sung = resolvedEngine(info, t.engine || projEngine);
+    const missing = sung === 'neural' && info && info.neural && !info.neural.available;
+    H.append(...this.field('Engine', this.select('t-engine', engineOptions(info, t.engine, `Project (${engineLabel(projEngine || 'auto').toLowerCase()})`), t.engine,
+      (v) => { t.engine = v; commit(); App.transport.invalidateCache(); }),
+    { title: 'Singing engine of this track', err: missing ? 'The neural engine is not installed: rendering will fail. Click the engine badge for the install command.' : null,
+      desc: `Sung by the ${sung} engine.` }));
+    const roles = (info && info.roles) || Object.keys(ROLE_LABELS).map((id) => ({ id, description: '' }));
+    const rn = roleName(t.role);
+    const roleOpts = [['', 'None'], ...roles.map((r) => [r.id, ROLE_LABELS[r.id] || r.id])];
+    if (t.role && !roleOpts.some(([v]) => v === t.role)) roleOpts.push([t.role, t.role]);
+    const roleDoc = roles.find((r) => r.id === rn);
+    H.append(...this.field('Role', this.select('t-role', roleOpts, t.role, (v) => { t.role = v; commit(); }),
+      { title: 'The track\'s role in the mix (lead, double, harmony, answer, ad-lib, crowd)',
+        desc: roleDoc ? roleDoc.description : 'One kind of singing per track: ad-libs, doubles and harmonies each get a track of their own with that role.' }));
+    H.append(this.section('Neural voice'));
+    const nv = (key, opts, title) => this.select('nv-' + key, opts, t.voice_params[key] ?? '', (v) => {
+      if (v === '') delete t.voice_params[key]; else t.voice_params[key] = Number(v);
+      commit(); App.transport.invalidateCache();
+    });
+    H.append(...this.field('Articulation', nv('neural.dial', [['', 'Default (crisp)'], [0, 'Smooth'], [1, 'Balanced'], [2, 'Crisp']]),
+      { title: 'neural.dial: how the neural engine sings consonants' }));
+    H.append(...this.field('Breaths', nv('neural.breaths', [['', 'Default'], [0, 'Off'], [1, 'On'], [0.5, 'Quiet']]),
+      { title: 'neural.breaths: breaths between lines (off by default for doubles, harmonies and answers)',
+        desc: sung === 'neural' ? '' : 'Used when the neural engine sings this track.' }));
     H.append(this.section('Mix'));
     H.append(...this.field('Gain (dB)', this.sliderField('t-gain', t.gain_db, 0, { min: -36, max: 12, step: 0.5 }, (v) => { t.gain_db = v ?? 0; commit(); })));
     H.append(...this.field('Pan', this.sliderField('t-pan', t.pan, 0, { min: -1, max: 1, step: 0.01 }, (v) => { t.pan = v ?? 0; commit(); })));
@@ -2533,17 +2626,15 @@ class Transport {
       try {
         const body = { start_beat: start };
         if (end !== null) body.end_beat = end;
-        const { buf, report } = await Api.render(body);
+        const { buf, report } = await App.render(body);
         const buffer = await this.ctx.decodeAudioData(buf);
         entry = { version, start, end, buffer, report };
-        this.cache = [entry, ...this.cache.filter((c) => c.version === version)].slice(0, 4);
         App.showReport(report, (performance.now() - t0) / 1000);
+        this.cache = [entry, ...this.cache.filter((c) => c.version === version)].slice(0, 4);
       } catch (e) {
         this.rendering = false;
         this.updateButtons();
-        const msg = e.status === 503 || e.status === 501 ? `Render engine unavailable: ${e.message}` : `Render failed: ${e.message}`;
-        status(msg, true);
-        toast(msg, 'err', 6000);
+        App.renderFailed(e);
         return;
       }
       this.rendering = false;
@@ -2798,6 +2889,7 @@ const App = {
     s.on('notes', () => { this.updateSelInfo(); this.transport.invalidateCache(); });
     s.on('project', () => { this.syncSongProps(); this.updateSelInfo(); });
     s.on('song', () => this.syncSongProps());
+    s.on('engines', () => { this.syncEngineControls(); this.updateEngineBadge(); });
     s.isInteracting = () => !!(this.roll.drag || this.lane.drag);
     // ResizeObserver misses devicePixelRatio changes (moving between monitors, browser zoom).
     window.addEventListener('resize', () => { this.roll.resize(); this.lane.resize(); });
@@ -2814,6 +2906,7 @@ const App = {
       await s.refreshHistory();
       this.roll.centerOnNotes();
       status(`Loaded "${s.project.title}"`);
+      this.refreshEngines();
     } catch (e) {
       status('Could not load project: ' + e.message, true);
       toast('Could not reach the studio server: ' + e.message, 'err', 8000);
@@ -2885,6 +2978,102 @@ const App = {
     const title = $('#in-title');
     title.addEventListener('change', () => { s.project.title = title.value.trim() || 'Untitled'; s.commit('song'); });
     title.addEventListener('keydown', (e) => { e.stopPropagation(); if (e.key === 'Enter') title.blur(); });
+    $('#in-engine').addEventListener('change', (e) => {
+      s.project.engine = e.target.value;
+      s.commit('song');
+      this.transport.invalidateCache();
+    });
+    const quality = $('#in-quality');
+    quality.addEventListener('change', () => {
+      s.quality = quality.value;
+      try { localStorage.setItem('synth2.quality', s.quality); } catch { /* storage unavailable */ }
+      this.transport.invalidateCache();
+    });
+    $('#engine-badge').addEventListener('click', () => this.showEnginesModal());
+    $('#sb-credits').addEventListener('click', () => this.showCreditsModal());
+    this.syncEngineControls();
+  },
+
+  /* ---- engines, quality, credits */
+  async refreshEngines() {
+    try {
+      this.store.engines = await Api.engines();
+    } catch (e) {
+      this.store.engines = this.store.engines || null;
+    }
+    this.store.emit('engines');
+    return this.store.engines;
+  },
+  syncEngineControls() {
+    const s = this.store, info = s.engines;
+    const eng = $('#in-engine');
+    const current = s.project.engine || '';
+    const auto = `Auto (${resolvedEngine(info, '')})`;
+    eng.innerHTML = '';
+    for (const [v, l] of engineOptions(info, current, auto)) eng.append(el('option', { value: v }, l));
+    eng.value = current;
+    const q = $('#in-quality');
+    const def = (info && info.default_quality) || 'normal';
+    q.innerHTML = '';
+    q.append(el('option', { value: '' }, `Default (${def})`));
+    for (const name of (info && info.qualities) || QUALITIES) q.append(el('option', { value: name }, name[0].toUpperCase() + name.slice(1)));
+    if (![...q.options].some((o) => o.value === s.quality)) s.quality = '';
+    q.value = s.quality;
+    const notes = (info && info.quality_notes) || {};
+    q.title = 'Render quality of the neural engine' + (s.quality && notes[s.quality] ? `: ${notes[s.quality]}` : ': draft is fastest, high is for the final render');
+  },
+  updateEngineBadge() {
+    const b = $('#engine-badge'), info = this.store.engines;
+    const txt = $('.txt', b);
+    b.classList.remove('on', 'off');
+    txt.innerHTML = '';
+    if (!info) { txt.textContent = 'Engines'; b.title = 'Engine status unknown (server unreachable)'; return; }
+    const n = info.neural || {};
+    if (n.available) {
+      b.classList.add('on');
+      txt.append('Neural', el('span', { class: 'bank' }, `: ${n.default_bank || 'ready'}`));
+      if (n.commercial_use === false) txt.append(el('span', { class: 'nc long' }, ' \u00b7 non-commercial'), el('span', { class: 'nc short' }, ' \u00b7 NC'));
+      b.title = ['The neural engine is installed.', ...(info.licence_notes || []), 'Click for voicebanks, licences and credits.'].join('\n');
+    } else {
+      b.classList.add('off');
+      txt.append('Neural', el('span', { class: 'bank' }, ': not installed'), el('span', { class: 'nc short' }, ' off'));
+      b.title = `The neural engine is not available: ${n.reason || 'not installed'}.\nInstall it with: ${info.install_hint}\nThe formant engine sings meanwhile. Click for details.`;
+    }
+  },
+  /** POST /api/render with the chosen quality; the status bar follows the render's progress meanwhile. */
+  async render(body) {
+    const opts = { ...body };
+    if (this.store.quality) opts.quality = this.store.quality;
+    let stop = false;
+    const follow = async () => {
+      while (!stop) {
+        await new Promise((r) => setTimeout(r, 1000));
+        if (stop) break;
+        try {
+          const st = await Api.renderStatus();
+          if (stop) break;
+          if (st.active) status(`Rendering\u2026 ${Math.round((st.fraction || 0) * 100)}%${st.message ? ` \u00b7 ${st.message}` : ''}${st.elapsed_s != null ? ` \u00b7 ${Math.round(st.elapsed_s)} s` : ''}`);
+          else if (st.waiting) status('Waiting for another render to finish\u2026');
+        } catch { /* the render request itself reports failures */ }
+      }
+    };
+    follow();
+    try {
+      return await Api.render(opts);
+    } finally {
+      stop = true;
+    }
+  },
+  renderFailed(e) {
+    let msg = `Render failed: ${e.message}`;
+    if (e.status === 409 && e.data && e.data.engine_unavailable) {
+      msg = `The neural engine is not available.\n${e.message}`;
+      this.refreshEngines();
+    } else if (e.status === 503 || e.status === 501) {
+      msg = `Render engine unavailable: ${e.message}`;
+    }
+    status(msg.split('\n')[0], true);
+    toast(msg, 'err', 9000);
   },
   buildKeySelect() {
     const sel = $('#in-key');
@@ -2909,6 +3098,9 @@ const App = {
     keySel.value = p.key;
     const title = $('#in-title');
     if (document.activeElement !== title) title.value = p.title;
+    const eng = $('#in-engine');
+    if (![...eng.options].some((o) => o.value === (p.engine || ''))) this.syncEngineControls();
+    eng.value = p.engine || '';
     document.title = `${p.title} - Synth2 Vocal Studio`;
     $('#sb-path').textContent = this.store.path ? this.store.path : '';
   },
@@ -3134,16 +3326,18 @@ const App = {
     status('Rendering the full song\u2026');
     this.transport.btnPlay.classList.add('rendering');
     try {
-      const { buf, report } = await Api.render({});
+      const { buf, report } = await this.render({});
       this.showReport(report);
       downloadBlob(new Blob([buf], { type: 'audio/wav' }), `${(this.store.project.title || 'render').replace(/[^\w.-]+/g, '_')}.wav`);
-    } catch (e) { toast('Render failed: ' + e.message, 'err', 6000); status('Render failed: ' + e.message, true); }
+      this.creditsForExport();
+    } catch (e) { this.renderFailed(e); }
     this.transport.btnPlay.classList.remove('rendering');
   },
   async downloadWav() {
     try {
       const { blob } = await Api.download('/api/render/last');
       downloadBlob(blob, `${(this.store.project.title || 'render').replace(/[^\w.-]+/g, '_')}.wav`);
+      this.creditsForExport();
     } catch (e) { toast(e.status === 404 ? 'Nothing rendered yet: press play first.' : 'Download failed: ' + e.message, 'warn'); }
   },
   async save(askPath = false) {
@@ -3185,8 +3379,13 @@ const App = {
   /* ---- render report */
   showReport(report, wall) {
     this.lastReport = report;
-    const warnings = (report.tracks || []).flatMap((t) => (t.warnings || []).map((w) => `${t.name || t.id}: ${w}`));
+    const trackWarnings = (report.tracks || []).flatMap((t) => (t.warnings || []).map((w) => [w, `${t.name || t.id}: ${w}`]));
+    const seen = new Set(trackWarnings.map(([w]) => w));
+    // warnings that belong to no track: a sampled sound that fell back to the synth, the backing band
+    const warnings = [...trackWarnings.map(([, text]) => text), ...(report.warnings || []).filter((w) => !seen.has(w))];
     const parts = [];
+    const engines = report.engines || [];
+    if (engines.length) parts.push(engines.join(' + ') + (engines.includes('neural') && report.quality ? ` (${report.quality})` : ''));
     if (report.duration_s != null) parts.push(`${fmtNum(report.duration_s, 2)} s audio`);
     const rt = report.render_time_s ?? wall;
     if (rt != null) parts.push(`rendered in ${fmtNum(rt, 2)} s`);
@@ -3201,6 +3400,115 @@ const App = {
     const wkey = warnings.join('|');
     if (warnings.length && wkey !== this._lastWarnings) toast(warnings.slice(0, 3).join('\n'), 'warn', 6000);
     this._lastWarnings = wkey;
+    this.showCredits(report);
+  },
+  /** The credits and licence notes of the last render, in the status bar (click: the full text). */
+  showCredits(report) {
+    const credits = report.credits || [], notes = report.licence_notes || [];
+    const sb = $('#sb-credits');
+    sb.innerHTML = '';
+    if (!credits.length && !notes.length) { sb.title = ''; return; }
+    sb.append(el('span', {}, `Credits (${credits.length})`));
+    if (notes.length) sb.append(el('span', { class: 'warn' }, ' · licence limits use'));
+    sb.title = ['Show these when you publish the audio:', ...credits, ...(notes.length ? ['', 'Licence notes:', ...notes] : [])].join('\n');
+    const key = notes.join('|');
+    if (notes.length && key !== this._lastLicence) toast('Licence note for this render:\n' + notes.join('\n'), 'warn', 9000);
+    this._lastLicence = key;
+  },
+  /** After audio was downloaded: put the credits it must carry in front of the user. */
+  creditsForExport() {
+    const r = this.lastReport || {};
+    if ((r.credits || []).length || (r.licence_notes || []).length) this.showCreditsModal();
+  },
+  infoModal(id, title) {
+    let m = $('#' + id);
+    if (!m) {
+      m = el('div', { class: 'modal', id }, el('div', { class: 'modal-card' },
+        el('div', { class: 'modal-head' }, el('span', {}, title), el('button', { class: 'mini-btn ghost', 'data-close': '' }, icon('x'))),
+        el('div', { class: 'info-body' })));
+      m.addEventListener('click', (e) => { if (e.target === m || e.target.closest('[data-close]')) m.hidden = true; });
+      document.body.append(m);
+    }
+    const body = $('.info-body', m);
+    body.innerHTML = '';
+    m.hidden = false;
+    return body;
+  },
+  showCreditsModal() {
+    const r = this.lastReport;
+    if (!r) return;
+    const B = this.infoModal('credits-modal', 'Credits of the last render');
+    const credits = r.credits || [], notes = r.licence_notes || [], engines = r.engines || [];
+    const list = (items, cls) => el('ul', { class: cls || null }, ...items.map((x) => el('li', {}, x)));
+    B.append(el('h4', {}, 'Sung by'));
+    B.append(el('div', {}, (engines.join(' + ') || 'unknown') + ((r.voicebanks || []).length ? ` \u00b7 voicebank ${r.voicebanks.join(', ')}` : '')
+      + (engines.includes('neural') && r.quality ? ` \u00b7 quality ${r.quality}` : '')));
+    B.append(el('h4', {}, 'Credits: show these when you publish the audio'));
+    if (credits.length) {
+      B.append(list(credits, 'credit-list'));
+      B.append(el('div', { class: 'btn-row' }, el('button', {
+        class: 'mini-btn', id: 'copy-credits',
+        onclick: async () => {
+          try { await navigator.clipboard.writeText(credits.join('\n')); toast('Credits copied'); } catch { toast('Could not copy: select the text instead', 'warn'); }
+        },
+      }, 'Copy credits')));
+    } else {
+      B.append(el('div', { class: 'dim' }, 'None: this render used the built-in formant engine and synthesised instruments only.'));
+    }
+    if (notes.length) {
+      B.append(el('h4', {}, 'Licence notes'));
+      B.append(list(notes, 'licence'));
+    }
+    if ((r.warnings || []).length) {
+      B.append(el('h4', {}, 'Warnings'));
+      B.append(list(r.warnings.slice(0, 20)));
+    }
+  },
+  async showEnginesModal() {
+    const B = this.infoModal('engines-modal', 'Singing engines');
+    B.append(el('div', { class: 'dim' }, 'Loading\u2026'));
+    const [info, sounds] = await Promise.all([this.refreshEngines(), Api.sounds().catch(() => null)]);
+    B.innerHTML = '';
+    if (!info) { B.append(el('div', { class: 'licence' }, 'The server did not answer.')); return; }
+    const n = info.neural || {};
+    const list = (items, cls) => el('ul', { class: cls || null }, ...items.map((x) => el('li', {}, x)));
+    B.append(el('h4', {}, 'Engines'));
+    for (const e of info.engines || []) {
+      B.append(el('div', { class: 'row' }, el('b', {}, e.name), el('span', { class: 'state ' + (e.available ? 'ok' : 'no') }, e.available ? 'available' : 'not available'), el('span', {}, e.description)));
+      if (!e.available) {
+        B.append(el('div', { class: 'row', id: 'engine-reason' }, el('span', { class: 'licence' }, `Reason: ${e.reason}.`)));
+        B.append(el('div', { class: 'row' }, el('span', {}, 'Install it on the machine that runs the studio:'), el('code', { id: 'engine-install' }, e.install_hint || info.install_hint)));
+      }
+    }
+    B.append(el('div', { class: 'row dim' }, `Auto on this server: ${info.default_engine || 'unusable'} \u00b7 default quality: ${info.default_quality}`
+      + (n.onnxruntime ? ` \u00b7 onnxruntime ${n.onnxruntime}` : '') + (n.models_dir ? ` \u00b7 models in ${n.models_dir}` : '')));
+    const models = [...(n.banks || []), ...(n.vocoders || [])];
+    if (models.length) {
+      B.append(el('h4', {}, 'Installed voicebanks and vocoders'));
+      for (const m of models) {
+        const use = m.commercial_use === true ? 'commercial use allowed' : m.commercial_use === false ? 'no commercial use' : 'commercial use not stated';
+        B.append(el('div', { class: 'row' }, el('b', {}, m.id), el('span', {}, `${m.name}${m.version ? ' ' + m.version : ''} (${m.kind})`),
+          el('span', { class: m.commercial_use === true ? 'dim' : 'licence' }, `${m.license || 'no licence stated'} \u00b7 ${use}`)));
+        if ((m.terms || []).length) B.append(list(m.terms, 'dim'));
+      }
+    }
+    if ((info.credits || []).length) {
+      B.append(el('h4', {}, 'Credits a neural render must carry'));
+      B.append(list(info.credits));
+    }
+    if ((info.licence_notes || []).length) {
+      B.append(el('h4', {}, 'Licence notes'));
+      B.append(list(info.licence_notes, 'licence'));
+    }
+    B.append(el('h4', {}, 'Sampled sound sets for the band'));
+    if (sounds && (sounds.sets || []).length) {
+      B.append(list(sounds.sets.map((x) => `${x.id}: ${x.name} (${x.kind}${x.license ? ', ' + x.license : ''})`)));
+    } else {
+      B.append(el('div', { class: 'dim' }, 'None installed: the band plays the built-in synthesised instruments.'));
+    }
+    if (sounds && sounds.backing && (sounds.backing.warnings || []).length) B.append(list(sounds.backing.warnings, 'licence'));
+    B.append(el('div', { class: 'row' }, el('span', {}, 'Install more with:'), el('code', {}, 'synth2 sounds install <id>'), el('span', { class: 'dim' }, "('synth2 sounds list' shows what is offered)")));
+    B.append(el('div', { class: 'btn-row' }, el('button', { class: 'mini-btn', onclick: () => this.showEnginesModal() }, 'Refresh')));
   },
   showReportModal() {
     if (!this.lastReport) return;
@@ -3214,6 +3522,8 @@ const App = {
     }
     $('.report-pre', m).textContent = JSON.stringify(this.lastReport, null, 2);
     m.hidden = false;
+    // the header copy may be trimmed: show the server's full report when it has one
+    Api.renderReport().then((full) => { if (!m.hidden && full) $('.report-pre', m).textContent = JSON.stringify(full, null, 2); }).catch(() => {});
   },
   showModal(id) { $('#' + id).hidden = false; },
 

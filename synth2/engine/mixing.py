@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import math
 import os
+from collections import deque
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Sequence
@@ -77,15 +79,28 @@ def mix_threads() -> int:
 
 
 def _run_jobs(fn, items: list, threads: int) -> Iterator:
-    """``fn`` over ``items``, results in order; threaded when worthwhile."""
+    """``fn`` over ``items``, results in order; threaded when worthwhile. At most ``threads``
+    jobs are running or waiting to be read at a time, so results do not pile up behind a slow
+    job."""
     if threads <= 1 or len(items) <= 1:
         for it in items:
             yield fn(it)
         return
-    with ThreadPoolExecutor(max_workers=min(threads, len(items))) as ex:
-        futs = [ex.submit(fn, it) for it in items]
-        for f in futs:
-            yield f.result()
+    workers = min(threads, len(items))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        todo = iter(items)
+        futs: deque = deque()
+        for it in todo:
+            futs.append(ex.submit(fn, it))
+            if len(futs) >= workers:
+                break
+        while futs:
+            res = futs.popleft().result()
+            for it in todo:
+                futs.append(ex.submit(fn, it))
+                break
+            yield res
+            del res
 
 
 # =============================================================================== EQ / filters
@@ -1224,7 +1239,7 @@ class Source:
     key: str
     name: str
     kind: str
-    audio: np.ndarray
+    audio: "np.ndarray | Sparse"
     role: str = "vocal"
     gain_db: float = 0.0
     pan: float = 0.0
@@ -1233,11 +1248,179 @@ class Source:
     sidechain: bool = False
     lowest_hz: float | None = None
     overrides: dict = field(default_factory=dict)
+    # vocal sources: the engine that sang the track, the track's role in the mix ("" for none; see
+    # vocal_chain.ROLES), the dial setting it was sung at and, for a double, the role of the track its
+    # audio was copied from. A role's chain is applied to what an engine of vocal_chain.ROLE_ENGINES sang.
+    engine: str = ""
+    vocal_role: str = ""
+    dial: str = ""
+    copy_of: str | None = None
+
+
+SPARSE_BLOCK = 1024  # samples per block when audio is cut into its sounding segments
+
+
+class Sparse:
+    """Audio that is silent most of the time, held as its sounding segments.
+
+    ``segments`` is a list of ``(start, data)``: float32 arrays ``(m,)`` or ``(m, channels)``
+    that start at sample ``start``, in order and without overlap. The rest of the ``length``
+    samples is silence. ``channels`` is 0 for mono ``(n,)`` audio."""
+
+    __slots__ = ("length", "channels", "segments")
+
+    def __init__(self, length: int, channels: int = 0, segments: list | None = None):
+        self.length = int(length)
+        self.channels = int(channels)
+        self.segments = list(segments or [])
+
+    @classmethod
+    def from_dense(cls, x: np.ndarray, floor: float = 0.0, length: int | None = None) -> "Sparse":
+        """The segments of ``x`` ((n,) or (n, C)): runs of :data:`SPARSE_BLOCK`-sample blocks whose
+        peak is above ``floor`` (0: only blocks of exact zeros are left out, so :meth:`dense`
+        gives ``x`` back). ``length`` is the length it stands for (default ``len(x)``)."""
+        x = np.asarray(x)
+        n = len(x)
+        ch = 0 if x.ndim == 1 else x.shape[1]
+        out = cls(n if length is None else length, ch)
+        if n == 0:
+            return out
+        B = SPARSE_BLOCK
+        full = n // B
+        peak = np.zeros(-(-n // B))
+        if full:
+            r = x[:full * B].reshape(full, -1)
+            peak[:full] = np.maximum(r.max(axis=1), -r.min(axis=1))
+        if full * B < n:
+            peak[full] = float(np.max(np.abs(x[full * B:])))
+        edges = np.diff(np.concatenate([[0], (peak > floor).astype(np.int8), [0]]))
+        for a, b in zip(np.nonzero(edges == 1)[0], np.nonzero(edges == -1)[0]):
+            out.segments.append((int(a) * B, np.array(x[a * B:min(b * B, n)], dtype=np.float32)))
+        return out
+
+    def __len__(self) -> int:
+        return self.length
+
+    @property
+    def nbytes(self) -> int:
+        return sum(seg.nbytes for _, seg in self.segments)
+
+    def dense(self, dtype=np.float32, length: int | None = None) -> np.ndarray:
+        """The full-length array."""
+        n = self.length if length is None else int(length)
+        out = np.zeros((n, self.channels) if self.channels else n, dtype=dtype)
+        for a, seg in self.segments:
+            m = min(n, a + len(seg)) - a
+            if m > 0:
+                out[a:a + m] = seg[:m]
+        return out
+
+    def add_to(self, out: np.ndarray, gain: float | None = None) -> None:
+        """``out += self`` (times ``gain``, a float32 factor), segment by segment."""
+        n = len(out)
+        for a, seg in self.segments:
+            m = min(n, a + len(seg)) - a
+            if m > 0:
+                out[a:a + m] += seg[:m] if gain is None else seg[:m] * np.float32(gain)
+
+    def scale(self, g) -> None:
+        """Multiply in place by a factor or by a per-sample curve ``(n,)``."""
+        if np.ndim(g) == 0:
+            for _, seg in self.segments:
+                seg *= np.float32(g)
+            return
+        for a, seg in self.segments:
+            cur = np.asarray(g[a:a + len(seg)], dtype=np.float32)
+            seg[:len(cur)] *= cur[:, None] if self.channels else cur
+
+    def crop(self, a: int, b: int) -> None:
+        """Keep samples ``[a, b)``; sample ``a`` becomes sample 0."""
+        a = max(0, int(a))
+        b = min(self.length, int(b))
+        segs = []
+        for s0, seg in self.segments:
+            lo, hi = max(a, s0), min(b, s0 + len(seg))
+            if hi > lo:
+                segs.append((lo - a, seg[lo - s0:hi - s0]))
+        self.segments = segs
+        self.length = max(0, b - a)
+
+    def peak(self) -> float:
+        return max((float(max(seg.max(), -seg.min())) for _, seg in self.segments if seg.size), default=0.0)
+
+    def sum_squares(self) -> float:
+        tot = 0.0
+        for _, seg in self.segments:
+            f = seg.reshape(-1)
+            tot += float(np.einsum("i,i->", f, f, dtype=np.float64))
+        return tot
+
+
+def _dense(audio) -> np.ndarray:
+    return audio.dense() if isinstance(audio, Sparse) else np.asarray(audio)
+
+
+class StemStore(Mapping):
+    """The stems of a mix: a read-only mapping ``key -> (n, 2) float32``.
+
+    A song has many stems and most of them are silent most of the time, so the store keeps each
+    stem as its sounding segments (:class:`Sparse`; blocks under :data:`SILENCE` count as
+    silence) and builds the full-length array when the stem is read. Every read (``store[key]``,
+    ``.values()``, ``.items()``) returns a new array."""
+
+    def __init__(self, length: int = 0):
+        self.length = int(length)
+        self._stems: dict[str, Sparse] = {}
+
+    def __getitem__(self, key) -> np.ndarray:
+        return self._stems[key].dense(length=self.length)
+
+    def __iter__(self):
+        return iter(self._stems)
+
+    def __len__(self) -> int:
+        return len(self._stems)
+
+    def __contains__(self, key) -> bool:
+        return key in self._stems
+
+    def put(self, key: str, stem: "Sparse | np.ndarray") -> None:
+        self._stems[key] = stem if isinstance(stem, Sparse) else Sparse.from_dense(stem, SILENCE)
+
+    def sparse(self, key: str) -> Sparse:
+        """The stem as it is held."""
+        return self._stems[key]
+
+    def scale(self, g, keys: Iterable[str] | None = None) -> None:
+        """Multiply the stems (all, or ``keys``) in place by a factor or a per-sample curve ``(n,)``."""
+        for k in (self._stems if keys is None else keys):
+            self._stems[k].scale(g)
+
+    def crop(self, a: int, b: int | None = None) -> None:
+        """Keep samples ``[a, b)`` of every stem."""
+        b = self.length if b is None else min(self.length, int(b))
+        for st in self._stems.values():
+            st.length = self.length
+            st.crop(a, b)
+        self.length = max(0, b - max(0, int(a)))
+
+    def peak(self, key: str | None = None) -> float:
+        if key is not None:
+            return self._stems[key].peak()
+        return max((st.peak() for st in self._stems.values()), default=0.0)
+
+    def rms(self, key: str) -> float:
+        size = self.length * 2
+        return math.sqrt(self._stems[key].sum_squares() / size) if size else 0.0
+
+    @property
+    def nbytes(self) -> int:
+        return sum(st.nbytes for st in self._stems.values())
 
 
 @dataclass
 class MixResult:
-    stems: dict[str, np.ndarray]  # key -> (n, 2) float32, dry and post-bus (they sum to `dry`)
+    stems: StemStore  # key -> (n, 2) float32, dry and post-bus (they sum to `dry`)
     groups: dict[str, str]  # key -> "vocal" | "backing"
     dry: np.ndarray  # (n, 2) float32 sum of the stems
     wet: np.ndarray  # (n, 2) float64 reverb + delay returns (not in any stem)
@@ -1255,10 +1438,12 @@ def _merge(preset: dict, over: dict) -> dict:
     return out
 
 
-def _processed_vocal(src: Source, sr: int, band: bool, chain: bool, extra_eq: list) -> tuple[np.ndarray, dict]:
-    """Vocal channel strip on the mono source: EQ (+ de-harsh / de-ess dynamic bands) -> compressor.
+def _processed_vocal(src: Source, sr: int, band: bool, chain: bool, extra_eq: list,
+                     x: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+    """Vocal channel strip on the mono source (``x``: its audio as a full-length array, when the
+    caller has it): EQ (+ de-harsh / de-ess dynamic bands) -> compressor.
     Returns the processed mono signal (float32) and strip info."""
-    x = np.asarray(src.audio)
+    x = _dense(src.audio) if x is None else x
     info: dict[str, Any] = {}
     if not chain or not np.any(x):
         if extra_eq:
@@ -1332,27 +1517,41 @@ def vocal_to_band_ratio(vocal: np.ndarray, band: np.ndarray, sr: int, act: np.nd
 
 
 def _vocal_job(s: Source, sr: int, n: int, S: "_Settings", band_mode: bool, master_eq: list,
-               role: dict | None = None) -> dict:
-    scale = 1.0
-    if role is not None:  # a track with a role in the mix (vocal_chain.py) gets that role's chain, not the strip
-        from . import vocal_chain
+               role: dict | None = None, lead_env: np.ndarray | None = None) -> dict:
+    """One vocal source through its channel: the role's chain (``role``, from
+    :func:`.vocal_chain.source_role`) or the channel strip, the in-channel effects of
+    ``mix_overrides`` ``fx``, fader and pan. Returns the stem and the mono channel (for the
+    sends) as :class:`Sparse`."""
+    from . import vocal_chain
 
-        y, si = vocal_chain.apply_role(np.asarray(s.audio), sr, role["role"], role.get("dial"), role.get("lead_env"),
-                                       role.get("copy_of"), float(s.overrides.get("pan", s.pan)))
+    scale = 1.0
+    x = _dense(s.audio)
+    fx = s.overrides.get("fx") or None
+    if role is not None:  # a track with a role in the mix (vocal_chain.py) gets that role's chain, not the strip
+        y, si = vocal_chain.apply_role(x, sr, role["role"], role.get("dial"), lead_env, role.get("copy_of"),
+                                       float(s.overrides.get("pan", s.pan)), fx)
         scale = float(si.get("reverb_scale", 1.0))
         if master_eq:
             y = eq(y, master_eq, sr).astype(np.float32)
     else:
-        y, si = _processed_vocal(s, sr, band_mode, S.vocal_chain and s.overrides.get("chain", True), master_eq)
+        y, si = _processed_vocal(s, sr, band_mode, S.vocal_chain and s.overrides.get("chain", True), master_eq, x)
+        if fx:
+            y, fi = vocal_chain.apply_fx(y, sr, fx, lead_env)
+            si = {**si, **fi}
+    del x
     if len(y) < n:
         y = np.pad(y, (0, n - len(y)))
-    y = y[:n]
+    mono = Sparse.from_dense(y[:n], SILENCE)
+    del y
     gl, gr = pan_gains(s.overrides.get("pan", s.pan))
     g = 10 ** ((s.gain_db + float(s.overrides.get("gain_db", 0.0))) / 20.0)
-    st = np.empty((n, 2), dtype=np.float32)
-    np.multiply(y, np.float32(g * gl), out=st[:, 0])
-    np.multiply(y, np.float32(g * gr), out=st[:, 1])
-    return {"stem": st, "mono": y, "g": g, "info": si, "reverb_scale": scale}
+    stem = Sparse(n, 2)
+    for a, seg in mono.segments:
+        st = np.empty((len(seg), 2), dtype=np.float32)
+        np.multiply(seg, np.float32(g * gl), out=st[:, 0])
+        np.multiply(seg, np.float32(g * gr), out=st[:, 1])
+        stem.segments.append((a, st))
+    return {"stem": stem, "mono": mono, "g": g, "info": si, "reverb_scale": scale}
 
 
 def _low_end_trim(sources: list[Source], sr: int, master_eq: list, S: "_Settings") -> tuple[float, float | None]:
@@ -1367,14 +1566,17 @@ def _low_end_trim(sources: list[Source], sr: int, master_eq: list, S: "_Settings
     win = np.hanning(nfft)
     total = np.zeros(len(f))
     for s in sources:
-        x = np.asarray(s.audio)
-        mid = x.mean(axis=1) if x.ndim == 2 else x
-        n = len(mid)
+        x = _dense(s.audio)
+        n = len(x)
         if n < nfft:
             continue
         k = min(256, max(1, n // nfft))
         starts = np.linspace(0, n - nfft, k).astype(np.int64)
-        frames = mid[starts[:, None] + np.arange(nfft)[None, :]].astype(np.float64) * win
+        frames = x[starts[:, None] + np.arange(nfft)[None, :]]
+        del x
+        if frames.ndim == 3:
+            frames = frames.mean(axis=2)
+        frames = frames.astype(np.float64) * win
         P = np.mean(np.abs(np.fft.rfft(frames, axis=1)) ** 2, axis=0)
         pre = _merge(role_preset(s.role, s.name), s.overrides)
         bands = [*pre.get("eq", []), *(s.overrides.get("eq_add") or []), *master_eq]
@@ -1394,7 +1596,9 @@ def _band_job(s: Source, sr: int, n: int, S: "_Settings", band_mode: bool, maste
     nb = max(1, -(-n // hop))
     F = dense_size(sr) // 2 + 1
     pre = _merge(role_preset(s.role, s.name), s.overrides)
-    x = np.asarray(s.audio)
+    if isinstance(s.audio, Sparse) and not s.audio.segments:
+        return None
+    x = _dense(s.audio)
     if x.ndim == 1:
         x = np.stack([x, x], axis=1)
     if len(x) != n:
@@ -1472,18 +1676,22 @@ def _band_job(s: Source, sr: int, n: int, S: "_Settings", band_mode: bool, maste
     np.add(m_out, s_out, out=st[:, 0])
     np.subtract(m_out, s_out, out=st[:, 1])
     rs = float(s.overrides.get("reverb", float(pre.get("reverb", 0.0)) * S.band_reverb))
-    return {"stem": st, "send": m_out * np.float32(rs) if rs > 0 else None, "info": sinfo}
+    send = Sparse.from_dense(m_out * np.float32(rs), SILENCE) if rs > 0 else None
+    return {"stem": Sparse.from_dense(st, SILENCE), "send": send, "info": sinfo}
 
 
 def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: Any, kicks: Sequence[float] = (),
                 bpm: float = 120.0, reverb_room: float = 0.55, reverb_wet: float = 1.0,
-                progress=None, threads: int | None = None, fixed: dict | None = None) -> MixResult:
+                progress=None, threads: int | None = None, fixed: dict | None = None,
+                consume: bool = False) -> MixResult:
     """Mix vocal and backing sources into stems, a dry sum and the effect returns.
 
-    Vocal path: channel strip (``settings.vocal_chain``; for a track with a role that a voice
-    engine noted in :mod:`.vocal_chain`, the role's chain and effects instead) -> fader / pan ->
-    stem; sends to the reverb (track ``reverb_send``) and the ping-pong delay
-    (``settings.vocal_delay``).
+    Vocal path: channel strip (``settings.vocal_chain``; for a source with a role,
+    ``Source.vocal_role``, that an engine of ``vocal_chain.ROLE_ENGINES`` sang, the role's chain
+    and effects instead) -> the in-channel effects of ``mix_overrides`` ``fx`` (``eq``,
+    ``duck_db`` under the tracks with the role ``lead``, ``slap``, ``room``; for a source with a
+    role they replace the role's own, entry by entry) -> fader / pan -> stem; sends to the
+    reverb (track ``reverb_send``) and the ping-pong delay (``settings.vocal_delay``).
     Backing path (``band_mode``): balance -> mid/side -> role EQ (mid) and EQ x width with mono
     bass (side), one FFT pass -> role compressor -> kick sidechain duck (stems flagged
     ``sidechain``) -> vocal-keyed ducking and a 1.5-4 kHz carve of the mid -> gain -> instrument
@@ -1493,6 +1701,10 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
     the thread count). ``fixed`` may hold ``band_gain_db``, ``bus_threshold_db`` and
     ``low_end_trim_db`` from an earlier (full) mix to use instead of measuring them (section
     previews then match the full song); ``info`` reports the values used.
+
+    A source's ``audio`` may be a :class:`Sparse`; the stems come back in a :class:`StemStore`.
+    Only the sources being processed (one per thread) are held at full length. With ``consume``
+    the mixer lets go of each source's audio once it is mixed (``Source.audio`` is then None).
     """
     fixed = fixed or {}
     S = _Settings(settings)
@@ -1502,7 +1714,7 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
     nb = max(1, -(-n // hop))
     info: dict[str, Any] = {}
     master_eq = list(S.master_eq) if band_mode else []
-    stems: dict[str, np.ndarray] = {}
+    stems = StemStore(n)
     groups: dict[str, str] = {}
     rev_send = np.zeros(n, dtype=np.float32)  # vocal reverb send (mono)
     rev_band = np.zeros(n, dtype=np.float32)  # band reverb send, scaled by the band gain later
@@ -1513,28 +1725,38 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
     backing = [s for s in sources if s.kind != "vocal"]
     done = 0
     roles: dict = {}
-    if vocals and S.vocal_chain:
+    env = None
+    if vocals:
         from . import vocal_chain
 
-        roles = vocal_chain.mix_roles(vocals, sr)
-    role_of = lambda s: roles.get(s.key) if s.overrides.get("chain", True) else None  # noqa: E731
-    for s, r in zip(vocals, _run_jobs(lambda s: _vocal_job(s, sr, n, S, band_mode, master_eq, role_of(s)), vocals,
-                                      threads)):
+        if S.vocal_chain:
+            roles = {s.key: r for s in vocals
+                     if s.overrides.get("chain", True) and (r := vocal_chain.source_role(s)) is not None}
+        ducked = any(vocal_chain.ROLE_FX.get(r["role"], {}).get("duck_db") for r in roles.values()) \
+            or any((s.overrides.get("fx") or {}).get("duck_db") for s in vocals)
+        if ducked:  # where the lead sings: what the ad-libs, the crowd and tracks with fx.duck_db duck under
+            env = vocal_chain.leads_env(((_dense(s.audio), s.gain_db) for s in vocals
+                                         if vocal_chain.parse_role(s.vocal_role)[0] == "lead"), sr, n)
+    for s, r in zip(vocals, _run_jobs(lambda s: _vocal_job(s, sr, n, S, band_mode, master_eq, roles.get(s.key), env),
+                                      vocals, threads)):
         done += 1
         if progress:
             progress(done / max(1, len(sources)), f"mixed {s.name}")
         st, y, g = r["stem"], r["mono"], r["g"]
-        vocal_bus += st
+        st.add_to(vocal_bus)
         rs = float(s.overrides.get("reverb", s.reverb_send * r.get("reverb_scale", 1.0)))
         if rs > 0:
-            rev_send += y * np.float32(g * rs)
+            y.add_to(rev_send, g * rs)
         ds = float(s.overrides.get("delay", s.delay_send))
         if ds > 0 and S.vocal_delay > 0:
-            dly_send += y * np.float32(g * ds)
-        stems[s.key] = st
+            y.add_to(dly_send, g * ds)
+        stems.put(s.key, st)
         groups[s.key] = "vocal"
         if r["info"]:
             vinfo[s.name] = r["info"]
+        del r, st, y
+        if consume:
+            s.audio = None
     if vinfo:
         info["vocal_strips"] = vinfo
     have_vocals = bool(vocals) and bool(np.any(vocal_bus))
@@ -1561,15 +1783,18 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
         done += 1
         if progress:
             progress(done / max(1, len(sources)), f"mixed {s.name}")
+        if consume:
+            s.audio = None
         if r is None:
             continue
-        band_bus += r["stem"]
+        r["stem"].add_to(band_bus)
         if r["send"] is not None:
-            rev_band += r["send"]
-        stems[s.key] = r["stem"]
+            r["send"].add_to(rev_band)
+        stems.put(s.key, r["stem"])
         groups[s.key] = "backing"
         band_keys.append(s.key)
         binfo.append(r["info"])
+        del r
     if binfo:
         info["backing"] = binfo
 
@@ -1602,8 +1827,7 @@ def mix_sources(sources: list[Source], sr: int, *, band_mode: bool, settings: An
     if have_band:
         gb = grid_to_samples(db_to_gain(bus_env + band_gain_db), n, hop, np.float32)
         band_bus *= gb[:, None]
-        for key in band_keys:
-            stems[key] *= gb[:, None]
+        stems.scale(gb, band_keys)
         del gb
         rev_send += rev_band * np.float32(10 ** (band_gain_db / 20.0))
         if have_vocals and vbr_before is not None:

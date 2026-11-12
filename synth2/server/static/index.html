@@ -89,6 +89,8 @@
         </select>
       </label>
       <label class="prop" title="Key"><span>Key</span><select id="in-key"></select></label>
+      <label class="prop" title="Singing engine of the project (each track can choose its own in the Track tab)"><span>Engine</span><select id="in-engine"></select></label>
+      <label class="prop" title="Render quality of the neural engine: draft is fastest, high is for the final render"><span>Quality</span><select id="in-quality"></select></label>
     </div>
 
     <div class="title-box">
@@ -97,6 +99,7 @@
     </div>
 
     <div class="topbar-right">
+      <button class="engine-badge" id="engine-badge" title="Singing engines and installed voicebanks"><span class="dot"></span><span class="txt">Engines</span></button>
       <button class="tb-btn icon" id="btn-help" title="Keyboard shortcuts (?)"><svg><use href="#i-help"/></svg></button>
     </div>
   </header>
@@ -206,6 +209,7 @@
   <footer class="statusbar">
     <span class="sb-item sb-msg" id="sb-msg">Ready</span>
     <span class="sb-item sb-report" id="sb-report" title="Last render report"></span>
+    <span class="sb-item sb-credits" id="sb-credits" title="Credits of the last render"></span>
     <span class="sb-flex"></span>
     <span class="sb-item mono" id="sb-cursor"></span>
     <span class="sb-item" id="sb-sel"></span>

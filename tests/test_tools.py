@@ -1605,3 +1605,33 @@ def test_mcp_and_director_pass_engines_and_credits_through(auto_engine, monkeypa
     assert err and "voicebank 'nope' is not installed" in text
     state = _state_block(server.session)
     assert '"engine": "auto"' in state and '"sung_by": "neural"' in state and '"role": ""' in state
+
+
+# ================================================================== with installed models
+# Real renders: skipped unless onnxruntime and a voicebank are installed (SYNTH2_MODELS names the folder).
+
+def _neural_installed() -> tuple[bool, str]:
+    from synth2 import neural
+
+    return neural.available()
+
+
+needs_models = pytest.mark.skipif(not _neural_installed()[0],
+                                  reason=f"neural engine unavailable: {_neural_installed()[1]}")
+REAL_SCORE = "tempo: 120\ntrack: Lead voice=aurora style=pop lang=en\nr q  C4 q hello  E4 q world  r q\n"
+
+
+@needs_models
+def test_real_neural_render_through_the_render_tool(auto_engine, monkeypatch, tmp_path):
+    monkeypatch.setenv("SYNTH2_NEURAL_CACHE", "0")
+    s = Session()
+    call_tool(s, "new_project", {"score": REAL_SCORE})
+    info = call_tool(s, "list_engines")
+    assert info["engines"][1]["available"] and info["default_engine"].startswith("neural")
+    out = call_tool(s, "render", {"path": str(tmp_path / "real.wav"), "engine": "neural", "quality": "draft"})
+    assert out["engines"] == ["neural"] and out["quality"] == "draft" and out["credits"] == info["credits"]
+    assert out["voicebanks"] == [info["neural"]["default_bank"]]
+    assert out["licence_notes"] == info["licence_notes"]
+    assert (tmp_path / "real.wav").stat().st_size > 10000
+    analysis = call_tool(s, "analyze_render", {"include_pitch": False})
+    assert analysis["audio"]["duration_s"] > 1.0 and analysis["audio"]["peak_db"] > -30
